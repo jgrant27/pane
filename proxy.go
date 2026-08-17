@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,9 +29,26 @@ type proxy struct {
 func (p *proxy) handleMeta(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
+		"name":   "Grok Pane",
 		"cwd":    p.cwd,
 		"listen": r.Host,
 	})
+}
+
+func (p *proxy) sessionCwd(r *http.Request) string {
+	q := strings.TrimSpace(r.URL.Query().Get("cwd"))
+	if q == "" {
+		return p.cwd
+	}
+	abs, err := filepath.Abs(q)
+	if err != nil {
+		return p.cwd
+	}
+	st, err := os.Stat(abs)
+	if err != nil || !st.IsDir() {
+		return p.cwd
+	}
+	return abs
 }
 
 func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +79,7 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	s := &session{
 		browser: browser,
 		agent:   agent,
-		cwd:     p.cwd,
+		cwd:     p.sessionCwd(r),
 	}
 	if err := s.handshake(); err != nil {
 		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
@@ -97,9 +116,9 @@ func (s *session) handshake() error {
 	init, err := s.rpc("initialize", map[string]any{
 		"protocolVersion": 1,
 		"clientInfo": map[string]string{
-			"name":    "pane",
-			"title":   "Pane",
-			"version": "0.1.0",
+			"name":    "grok-pane",
+			"title":   "Grok Pane",
+			"version": "0.2.0",
 		},
 		"clientCapabilities": map[string]any{
 			"fs":       map[string]bool{"readTextFile": false, "writeTextFile": false},
@@ -118,7 +137,7 @@ func (s *session) handshake() error {
 		"mcpServers": []any{},
 		"_meta": map[string]any{
 			"yoloMode": true,
-			"rules":    "You are reached through Pane, a thin web face. Answer the user in the transcript. Do not narrate tool calls, status lines, or a tour of the working tree unless asked. No session chrome.",
+			"rules":    "You are reached through Grok Pane, a desktop face onto grok agent serve. Answer the user in the transcript. Do not narrate tool calls, status lines, or a tour of the working tree unless asked. No session chrome.",
 		},
 	})
 	if err != nil {

@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-busy="true">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pane</title>
+  <title>Grok Pane</title>
   <meta name="color-scheme" content="light">
   <script>
     (function () {
@@ -13,24 +13,40 @@
       document.querySelector('meta[name="color-scheme"]').content = t;
     })();
   </script>
-  <link rel="stylesheet" href="/vendor/xterm.css">
-  <link rel="stylesheet" href="/style.css?v=2">
+  <link rel="stylesheet" href="vendor/xterm.css">
+  <link rel="icon" href="favicon.png">
+  <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
-  <header>
-    <div class="brand">Pane</div>
-    <div id="status">connecting…</div>
-    <div id="cwd"></div>
-    <button type="button" id="thoughts" aria-pressed="false">Thoughts</button>
-    <button type="button" id="theme">Dark</button>
-  </header>
-  <main id="term"></main>
-  <footer>
-    <textarea id="in" rows="2" placeholder="Message…" autocomplete="off"></textarea>
-    <button type="button" id="send" disabled>Send</button>
-  </footer>
-  <script src="/vendor/xterm.js"></script>
-  <script src="/vendor/addon-fit.js"></script>
-  <script src="/term.js?v=2"></script>
+  <aside id="rail">
+    <div class="brand">Grok Pane</div>
+    <button type="button" id="project" title="Show project folder">Open project</button>
+    <button type="button" id="change-project" title="Choose a different folder">Change project…</button>
+    <button type="button" id="new-session">New session</button>
+    <div class="rail-label">Sessions</div>
+    <div id="sessions"></div>
+    <div class="rail-label">Files</div>
+    <div id="tree"></div>
+  </aside>
+  <div id="workspace">
+    <header>
+      <div class="state">
+        <span id="spin" aria-hidden="true"></span>
+        <div id="status" aria-live="polite">connecting…</div>
+      </div>
+      <button type="button" id="cwd" hidden title=""></button>
+      <button type="button" id="thoughts" aria-pressed="false">Thoughts</button>
+      <button type="button" id="theme">Dark</button>
+    </header>
+    <main id="terms"></main>
+    <footer>
+      <textarea id="in" rows="2" placeholder="Message…" autocomplete="off"></textarea>
+      <button type="button" id="send" disabled>Send</button>
+      <div id="hint">Enter send · Shift+Enter newline · Esc cancel · ⌘O project · ⌘N session · ⌘W close</div>
+    </footer>
+  </div>
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script src="term.js?v=8"></script>
 </body>
 </html>

@@ -1,3 +1,7 @@
 /pane
+/grok-pane
 *.secret
 .DS_Store
+/Grok Pane.app
+/desktop/build/appicon.iconset
+/desktop/build/bin

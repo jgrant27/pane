@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Grok Pane",
+  "outputfilename": "grok-pane",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "Justin Grant",
+    "email": "jgrant27@gmail.com"
+  },
+  "info": {
+    "companyName": "Grok Pane",
+    "productName": "Grok Pane",
+    "productVersion": "0.2.0",
+    "copyright": "Copyright 2026 Justin Grant",
+    "comments": "Desktop face for grok agent serve"
+  }
+}

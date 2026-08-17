@@ -1,17 +1,15 @@
-// Pane is a web window onto `grok agent serve`.
-// The binary starts the agent if needed, serves the UI, and can
-// put Tailscale in front. Bind it on the tailnet, not the public internet.
+// Grok Pane server: HTTP + ACP proxy in front of `grok agent serve`.
+// The desktop app talks to this process. Bind it on the tailnet, not
+// the public internet.
 package main
 
 import (
 	"crypto/rand"
-	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -22,18 +20,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/jgrant27/pane/web"
 )
-
-//go:embed web
-var embeddedWeb embed.FS
-
-func webFS() fs.FS {
-	sub, err := fs.Sub(embeddedWeb, "web")
-	if err != nil {
-		panic(err)
-	}
-	return sub
-}
 
 func main() {
 	log.SetFlags(0)
@@ -48,18 +37,19 @@ func main() {
 	noAgent := flag.Bool("no-agent", false, "do not start grok agent serve; only connect")
 	noOpen := flag.Bool("no-open", false, "do not open a browser")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), `Pane — web window onto a local grok agent
+		fmt.Fprintf(flag.CommandLine.Output(), `Grok Pane — local server for the Grok Pane desktop app
 
   pane
   pane -cwd ~/src/my-project
   pane -tailscale -cwd ~/src/my-project
 
 Starts grok agent serve if :2419 is free, serves the UI on :7420, opens
-the browser. Secret: -secret, $GROK_AGENT_SECRET, $PANE_SECRET, or
-~/.grok/pane.secret (created on first run).
+the browser. The desktop app talks to this process. Secret: -secret,
+$GROK_AGENT_SECRET, $PANE_SECRET, or ~/.grok/pane.secret (created on
+first run).
 
-Ctrl-C stops Pane and anything it started. It will not kill an agent that
-was already running. Never use tailscale funnel.
+Ctrl-C stops this process and anything it started. It will not kill an
+agent that was already running. Never use tailscale funnel.
 
 `)
 		flag.PrintDefaults()
@@ -120,15 +110,16 @@ was already running. Never use tailscale funnel.
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", noStore(http.FileServer(http.FS(webFS()))))
+	mux.Handle("/", noStore(http.FileServer(http.FS(web.FS))))
 	mux.HandleFunc("/ws", p.handleWS)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("/meta", p.handleMeta)
+	mux.HandleFunc("/v1/tree", handleTree)
 
-	h := http.Handler(mux)
+	h := http.Handler(withCORS(mux))
 	if *tailscaleFront {
 		if _, err := exec.LookPath("tailscale"); err != nil {
 			log.Fatal("tailscale not on PATH")
@@ -182,6 +173,19 @@ was already running. Never use tailscale funnel.
 		_ = agentCmd.Process.Signal(syscall.SIGTERM)
 		_, _ = agentCmd.Process.Wait()
 	}
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func noStore(next http.Handler) http.Handler {

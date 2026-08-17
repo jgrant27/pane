@@ -1,4 +1,4 @@
-/* xterm = transcript. Input is the footer. ACP lives in Go. */
+/* Grok Pane UI. Talks to the pane server over HTTP + WS. ACP stays in Go. */
 (function () {
   var themes = {
     light: {
@@ -21,25 +21,54 @@
     return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
   }
 
-  var term = new Terminal({
-    cursorBlink: false,
-    disableStdin: true,
-    fontSize: 14,
-    fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
-    theme: themes[currentTheme()],
-    scrollback: 8000
-  });
-  var fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(document.getElementById('term'));
-  fit.fit();
-  window.addEventListener('resize', function () { fit.fit(); });
+  function isDesktop() {
+    return !!(window.runtime || window.wails || (window.go && window.go.main));
+  }
+
+  function paneHTTP() {
+    var q = new URLSearchParams(location.search).get('pane');
+    if (q) return q.replace(/\/$/, '');
+    try {
+      var s = localStorage.getItem('pane-url');
+      if (s) return s.replace(/\/$/, '');
+    } catch (e) {}
+    if (window.__paneOrigin) return String(window.__paneOrigin).replace(/\/$/, '');
+    if (isDesktop()) return 'http://127.0.0.1:7420';
+    return location.origin;
+  }
+
+  function paneWS(cwd) {
+    var http = paneHTTP();
+    var u;
+    try { u = new URL(http); } catch (e) { u = new URL('http://127.0.0.1:7420'); }
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    u.pathname = '/ws';
+    u.search = cwd ? ('cwd=' + encodeURIComponent(cwd)) : '';
+    return u.toString();
+  }
 
   var themeBtn = document.getElementById('theme');
+  var thoughtsBtn = document.getElementById('thoughts');
+  var status = document.getElementById('status');
+  var cwdEl = document.getElementById('cwd');
+  var input = document.getElementById('in');
+  var sendBtn = document.getElementById('send');
+  var termsEl = document.getElementById('terms');
+  var sessionsEl = document.getElementById('sessions');
+  var treeEl = document.getElementById('tree');
+  var projectBtn = document.getElementById('project');
+  var changeBtn = document.getElementById('change-project');
+  var newBtn = document.getElementById('new-session');
+  var showThoughts = false;
+  var project = '';
+  var sessions = [];
+  var active = null;
+  var n = 0;
+
   function paintTheme() {
     var name = currentTheme();
     themeBtn.textContent = name === 'dark' ? 'Light' : 'Dark';
-    term.options.theme = themes[name];
+    sessions.forEach(function (s) { s.term.options.theme = themes[name]; });
   }
   paintTheme();
   themeBtn.addEventListener('click', function () {
@@ -50,155 +79,451 @@
     try { localStorage.setItem('pane-theme', next); } catch (e) {}
     paintTheme();
   });
-
-  var showThoughts = false;
-  var thoughtsBtn = document.getElementById('thoughts');
   thoughtsBtn.addEventListener('click', function () {
     showThoughts = !showThoughts;
     thoughtsBtn.setAttribute('aria-pressed', showThoughts ? 'true' : 'false');
   });
-
-  var status = document.getElementById('status');
-  var cwdEl = document.getElementById('cwd');
-  var input = document.getElementById('in');
-  var sendBtn = document.getElementById('send');
-  var busy = true;
-  var startedReply = false;
-  var tools = {};
-  var history = [];
-  var histAt = -1;
 
   function setStatus(text, cls) {
     status.textContent = text;
     status.className = cls || '';
   }
 
+  function canSend() {
+    return active && !active.busy && active.ws && active.ws.readyState === 1 && !!input.value.replace(/\s+$/, '');
+  }
+
+  function syncSend() { sendBtn.disabled = !canSend(); }
+
   function setBusy(on) {
-    busy = on;
-    sendBtn.disabled = on || !ws || ws.readyState !== 1;
+    if (active) active.busy = on;
+    document.documentElement.dataset.busy = on ? 'true' : 'false';
+    document.documentElement.setAttribute('aria-busy', on ? 'true' : 'false');
+    syncSend();
+    paintSessions();
     if (!on) input.focus();
+  }
+
+  function railLocked() {
+    return !!(active && active.busy);
+  }
+
+  function grow() {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 144) + 'px';
   }
 
   function dim(s) { return '\x1b[38;5;245m' + s + '\x1b[0m'; }
 
-  function send() {
-    var text = input.value.replace(/\s+$/, '');
-    if (!text || busy || !ws || ws.readyState !== 1) return;
-    input.value = '';
-    histAt = -1;
-    if (history[history.length - 1] !== text) history.push(text);
-    term.writeln('');
-    term.writeln(dim('you') + '  ' + text.replace(/\n/g, '\r\n    '));
-    term.writeln('');
-    startedReply = false;
-    setBusy(true);
-    setStatus('thinking…', 'busy');
-    ws.send(JSON.stringify({ type: 'in', text: text }));
+  function basename(p) {
+    if (!p) return '';
+    var parts = p.replace(/\\/g, '/').split('/');
+    return parts[parts.length - 1] || p;
   }
 
-  sendBtn.addEventListener('click', send);
-  input.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      send();
+  function paintCwd(path) {
+    if (!path) {
+      cwdEl.hidden = true;
       return;
     }
-    if (e.key === 'Escape' && busy) {
-      ws.send(JSON.stringify({ type: 'cancel' }));
-      return;
-    }
-    if (e.key === 'ArrowUp' && !e.shiftKey && input.selectionStart === 0) {
-      if (!history.length) return;
-      if (histAt < 0) histAt = history.length;
-      if (histAt > 0) histAt--;
-      input.value = history[histAt] || '';
-      e.preventDefault();
-    }
-    if (e.key === 'ArrowDown' && !e.shiftKey) {
-      if (histAt < 0) return;
-      histAt++;
-      if (histAt >= history.length) {
-        histAt = -1;
-        input.value = '';
-      } else {
-        input.value = history[histAt];
-      }
-      e.preventDefault();
-    }
-  });
+    cwdEl.hidden = false;
+    cwdEl.textContent = path;
+    cwdEl.title = 'copy ' + path;
+  }
 
-  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var ws = null;
-  var reconnects = 0;
+  function paintSessions() {
+    sessionsEl.textContent = '';
+    sessions.forEach(function (s) {
+      var row = document.createElement('div');
+      row.className = 'sess-row' + (s.busy ? ' locked' : '');
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'sess' + (s === active ? ' active' : '');
+      b.textContent = s.busy ? s.title + ' ·' : s.title;
+      b.title = s.busy ? 'working…' : (s.cwd || '');
+      b.disabled = s.busy;
+      b.addEventListener('click', function () {
+        if (s.busy || railLocked()) return;
+        activate(s);
+      });
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'sess-close';
+      x.title = s.busy ? 'working…' : 'Close session';
+      x.textContent = '×';
+      x.disabled = s.busy;
+      x.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        if (s.busy || railLocked()) return;
+        closeSession(s);
+      });
+      row.appendChild(b);
+      row.appendChild(x);
+      sessionsEl.appendChild(row);
+    });
+  }
 
-  function connect() {
-    setStatus(reconnects ? 'reconnecting…' : 'connecting…');
-    ws = new WebSocket(proto + '//' + location.host + '/ws');
-    ws.onopen = function () { setStatus('handshaking…'); };
-    ws.onerror = function () { setStatus('socket error', 'err'); };
+  function activate(s) {
+    if (!s || (railLocked() && s !== active)) return;
+    active = s;
+    sessions.forEach(function (x) {
+      if (x.el) x.el.classList.toggle('active', x === s);
+    });
+    paintSessions();
+    paintCwd(s.cwd);
+    setBusy(s.busy);
+    setStatus(s.statusText || (s.busy ? 'working…' : 'ready'), s.statusCls || (s.busy ? 'busy' : 'ok'));
+    if (s.fit) s.fit.fit();
+    input.focus();
+  }
+
+  function Session(cwd) {
+    this.localId = ++n;
+    this.id = '';
+    this.cwd = cwd || project || '';
+    this.title = 'Session ' + this.localId;
+    this.dead = false;
+    this.busy = true;
+    this.statusText = 'connecting…';
+    this.statusCls = '';
+    this.reconnects = 0;
+    this.startedReply = false;
+    this.tools = {};
+    this.ws = null;
+    this.el = document.createElement('div');
+    this.el.className = 'term-slot';
+    termsEl.appendChild(this.el);
+    this.term = new Terminal({
+      cursorBlink: false,
+      disableStdin: true,
+      fontSize: 14,
+      fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+      theme: themes[currentTheme()],
+      scrollback: 8000
+    });
+    this.fit = new FitAddon.FitAddon();
+    this.term.loadAddon(this.fit);
+    this.term.open(this.el);
+    this.fit.fit();
+    if (window.ResizeObserver) {
+      var self = this;
+      new ResizeObserver(function () { self.fit.fit(); }).observe(this.el);
+    }
+  }
+
+  Session.prototype.setChrome = function (text, cls) {
+    this.statusText = text;
+    this.statusCls = cls || '';
+    if (this === active) setStatus(text, cls);
+  };
+
+  Session.prototype.connect = function () {
+    var s = this;
+    s.busy = true;
+    if (s === active) setBusy(true);
+    s.setChrome(s.reconnects ? 'reconnecting…' : 'connecting…');
+    var ws = new WebSocket(paneWS(s.cwd));
+    s.ws = ws;
+    ws.onopen = function () { s.setChrome('handshaking…', 'busy'); };
+    ws.onerror = function () { s.setChrome('socket error', 'err'); };
     ws.onclose = function () {
-      setBusy(true);
-      setStatus('disconnected', 'err');
-      reconnects++;
-      var wait = Math.min(8000, 400 * reconnects);
-      setTimeout(connect, wait);
+      if (s.dead || s.ws !== this) return;
+      s.busy = true;
+      if (s === active) setBusy(true);
+      s.setChrome('disconnected', 'err');
+      s.reconnects++;
+      setTimeout(function () { s.connect(); }, Math.min(8000, 400 * s.reconnects));
     };
     ws.onmessage = function (ev) {
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       switch (msg.type) {
         case 'ready':
-          reconnects = 0;
-          cwdEl.textContent = msg.cwd || '';
-          cwdEl.title = msg.cwd || '';
-          setStatus('ready', 'ok');
-          setBusy(false);
+          s.reconnects = 0;
+          s.id = msg.session || s.id;
+          if (msg.cwd) s.cwd = msg.cwd;
+          if (s === active) paintCwd(s.cwd);
+          s.busy = false;
+          s.setChrome('ready', 'ok');
+          if (s === active) setBusy(false);
           break;
         case 'out':
-          if (!startedReply) startedReply = true;
-          if (msg.text) term.write(String(msg.text).replace(/\n/g, '\r\n'));
+          if (!s.startedReply) s.startedReply = true;
+          if (msg.text) s.term.write(String(msg.text).replace(/\n/g, '\r\n'));
+          s.term.scrollToBottom();
           break;
         case 'thought':
           if (showThoughts && msg.text) {
-            term.write('\x1b[38;5;240m' + String(msg.text).replace(/\n/g, '\r\n') + '\x1b[0m');
+            s.term.write('\x1b[38;5;240m' + String(msg.text).replace(/\n/g, '\r\n') + '\x1b[0m');
+            s.term.scrollToBottom();
           }
           break;
         case 'tool':
-          renderTool(msg);
+          renderTool(s, msg);
+          s.term.scrollToBottom();
           break;
         case 'err':
-          term.writeln('');
-          term.writeln('\x1b[31m' + (msg.text || 'error') + '\x1b[0m');
-          setStatus(msg.text || 'error', 'err');
+          s.term.writeln('');
+          s.term.writeln('\x1b[31m' + (msg.text || 'error') + '\x1b[0m');
+          s.term.scrollToBottom();
+          s.setChrome(msg.text || 'error', 'err');
           break;
         case 'busy':
-          setBusy(true);
-          setStatus('thinking…', 'busy');
-          startedReply = false;
-          tools = {};
+          s.busy = true;
+          s.startedReply = false;
+          s.tools = {};
+          s.setChrome('working…', 'busy');
+          if (s === active) setBusy(true);
           break;
         case 'idle':
-          if (startedReply) term.writeln('');
-          setStatus('ready', 'ok');
-          setBusy(false);
+          if (s.startedReply) s.term.writeln('');
+          s.busy = false;
+          s.setChrome('ready', 'ok');
+          if (s === active) setBusy(false);
           break;
       }
     };
-  }
-  connect();
+  };
 
-  function renderTool(msg) {
+  function renderTool(s, msg) {
     var id = msg.id || msg.text || 'tool';
-    var prev = tools[id];
-    var status = msg.status || '';
+    var prev = s.tools[id];
+    var st = msg.status || '';
     var title = msg.text || 'tool';
     if (!prev) {
-      tools[id] = { title: title, status: status };
-      term.writeln(dim('· ' + title));
+      s.tools[id] = { title: title, status: st };
+      s.term.writeln(dim('· ' + title));
       return;
     }
-    if (status && status !== prev.status && (status === 'completed' || status === 'failed' || status === 'cancelled')) {
-      prev.status = status;
+    if (st && st !== prev.status && (st === 'completed' || st === 'failed' || st === 'cancelled')) {
+      prev.status = st;
     }
   }
+
+  function newSession(cwd) {
+    if (railLocked()) return;
+    var s = new Session(cwd || project);
+    sessions.push(s);
+    s.connect();
+    activate(s);
+    return s;
+  }
+
+  Session.prototype.shutdown = function () {
+    this.dead = true;
+    var w = this.ws;
+    this.ws = null;
+    if (w) {
+      try { w.close(); } catch (e) {}
+    }
+    try { this.term.dispose(); } catch (e) {}
+    if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
+  };
+
+  function closeSession(s) {
+    s = s || active;
+    if (!s || s.busy) return;
+    var i = sessions.indexOf(s);
+    if (i < 0) return;
+    sessions.splice(i, 1);
+    s.shutdown();
+    if (s === active) active = null;
+    if (sessions.length) activate(sessions[Math.min(i, sessions.length - 1)]);
+    else newSession(project);
+    paintSessions();
+  }
+
+  function send() {
+    var text = input.value.replace(/\s+$/, '');
+    if (!text || !active || active.busy || !active.ws || active.ws.readyState !== 1) return;
+    input.value = '';
+    grow();
+    if (active.title.indexOf('Session ') === 0) {
+      active.title = text.length > 28 ? text.slice(0, 28) + '…' : text;
+      paintSessions();
+    }
+    active.term.writeln('');
+    active.term.writeln(dim('you') + '  ' + text.replace(/\n/g, '\r\n    '));
+    active.term.writeln('');
+    active.term.scrollToBottom();
+    active.startedReply = false;
+    active.busy = true;
+    setBusy(true);
+    active.setChrome('working…', 'busy');
+    active.ws.send(JSON.stringify({ type: 'in', text: text }));
+  }
+
+  sendBtn.addEventListener('click', send);
+  input.addEventListener('input', function () { grow(); syncSend(); });
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+      return;
+    }
+    if (e.key === 'Escape' && active && active.busy && active.ws && active.ws.readyState === 1) {
+      active.ws.send(JSON.stringify({ type: 'cancel' }));
+      active.setChrome('cancelling…', 'busy');
+    }
+  });
+
+  function desktopAPI() {
+    return window.go && window.go.main && window.go.main.App ? window.go.main.App : null;
+  }
+
+  function copyPath(path) {
+    if (!path) return;
+    var api = desktopAPI();
+    if (api && api.CopyText) {
+      Promise.resolve(api.CopyText(path));
+      return;
+    }
+    if (navigator.clipboard) navigator.clipboard.writeText(path).catch(function () {});
+  }
+
+  function reveal(path) {
+    if (!path) return;
+    var api = desktopAPI();
+    if (api && api.Reveal) {
+      Promise.resolve(api.Reveal(path)).catch(function () {});
+      return true;
+    }
+    return false;
+  }
+
+  cwdEl.addEventListener('click', function () {
+    var path = active && active.cwd;
+    if (!path) return;
+    copyPath(path);
+    if (!reveal(path)) {
+      setStatus('copied path', 'ok');
+    }
+  });
+
+  function setProject(path) {
+    if (!path) return;
+    project = path;
+    projectBtn.textContent = basename(path) || path;
+    projectBtn.title = path + ' — click to show in Finder';
+    try { localStorage.setItem('pane-project', path); } catch (e) {}
+    loadTree(path, treeEl, 0);
+    if (!active || active.cwd !== path) newSession(path);
+    else paintCwd(path);
+  }
+
+  function loadTree(path, into, depth) {
+    if (depth === 0) into.textContent = '';
+    fetch(paneHTTP() + '/v1/tree?path=' + encodeURIComponent(path))
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (ents) {
+        ents.forEach(function (e) {
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'file' + (e.dir ? ' dir' : '');
+          b.style.paddingLeft = (0.35 + depth * 0.7) + 'rem';
+          b.textContent = (e.dir ? '▸ ' : '') + e.name;
+          b.title = e.path;
+          b.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            if (e.dir) {
+              if (b.dataset.open === '1') {
+                b.dataset.open = '';
+                b.textContent = '▸ ' + e.name;
+                while (b.nextSibling && b.nextSibling.dataset && b.nextSibling.dataset.parent === e.path) {
+                  b.parentNode.removeChild(b.nextSibling);
+                }
+              } else {
+                b.dataset.open = '1';
+                b.textContent = '▾ ' + e.name;
+                var wrap = document.createElement('div');
+                wrap.dataset.parent = e.path;
+                b.after(wrap);
+                loadTree(e.path, wrap, depth + 1);
+              }
+              return;
+            }
+            var rel = project && e.path.indexOf(project) === 0 ? e.path.slice(project.length).replace(/^[/\\]/, '') : e.path;
+            input.value = (input.value ? input.value.replace(/\s+$/, '') + ' ' : '') + rel;
+            grow();
+            syncSend();
+            input.focus();
+          });
+          into.appendChild(b);
+        });
+      })
+      .catch(function () {});
+  }
+
+  function openProject() {
+    if (railLocked()) return;
+    if (window.runtime && typeof window.runtime.EventsEmit === 'function') {
+      window.runtime.EventsEmit('request-open-project');
+      return;
+    }
+    var api = desktopAPI();
+    if (api && typeof api.OpenProject === 'function') {
+      Promise.resolve(api.OpenProject()).then(function (path) {
+        if (path) setProject(path);
+      }).catch(function () {});
+      return;
+    }
+    var path = window.prompt('Project folder', project || '');
+    if (path) setProject(path.trim());
+  }
+
+  projectBtn.addEventListener('click', function () {
+    if (project && reveal(project)) return;
+    openProject();
+  });
+  if (changeBtn) changeBtn.addEventListener('click', openProject);
+  newBtn.addEventListener('click', function () { newSession(project); });
+  if (window.runtime && window.runtime.EventsOn) {
+    window.runtime.EventsOn('project', function (path) { if (path) setProject(path); });
+    window.runtime.EventsOn('new-session', function () { newSession(project); });
+    window.runtime.EventsOn('close-session', function () { closeSession(active); });
+  }
+
+  window.addEventListener('keydown', function (e) {
+    var key = (e.code === 'KeyO' || e.key === 'o' || e.key === 'O');
+    var n = (e.code === 'KeyN' || e.key === 'n' || e.key === 'N');
+    var w = (e.code === 'KeyW' || e.key === 'w' || e.key === 'W');
+    if (isDesktop()) {
+      // Native File menu owns ⌘O / ⌘N / ⌘W. Do not steal them here.
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && n && !e.shiftKey) {
+      e.preventDefault();
+      newSession(project);
+    }
+    if ((e.metaKey || e.ctrlKey) && w && !e.shiftKey) {
+      e.preventDefault();
+      closeSession(active);
+    }
+    if ((e.metaKey || e.ctrlKey) && key && !e.shiftKey) {
+      e.preventDefault();
+      openProject();
+    }
+  });
+
+  window.addEventListener('resize', function () {
+    sessions.forEach(function (s) { s.fit.fit(); });
+  });
+
+  function boot() {
+    var saved = '';
+    try { saved = localStorage.getItem('pane-project') || ''; } catch (e) {}
+    fetch(paneHTTP() + '/meta')
+      .then(function (r) { return r.json(); })
+      .then(function (meta) {
+        if (!saved) saved = meta.cwd || '';
+        if (saved) setProject(saved);
+        else newSession('');
+      })
+      .catch(function () {
+        if (saved) setProject(saved);
+        else newSession('');
+      });
+    input.focus();
+  }
+  boot();
 })();
