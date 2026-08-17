@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="desktop/build/appicon.png" width="112" alt="Grok Pane">
+</p>
+
 # Grok Pane
 
 A desktop window onto [`grok agent serve`](https://grok.com). The agent runs on **this machine**. Grok Pane is a face, not a second computer.
