@@ -1,0 +1,4 @@
+Vendored browser libraries:
+
+- xterm.js — MIT License, https://github.com/xtermjs/xterm.js
+- @xterm/addon-fit — MIT License, https://github.com/xtermjs/xterm.js
