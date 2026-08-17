@@ -1,0 +1,6 @@
+Iosevka (https://github.com/be5invis/Iosevka)
+Copyright (c) 2015-2026, Renzhi Li (Belleve Invis)
+Licensed under the SIL Open Font License 1.1 — see OFL.txt.
+
+Latin Regular/Bold/Italic woff2 faces are embedded so Grok Pane
+does not depend on a system install (macOS, Linux, Windows, browser).

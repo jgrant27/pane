@@ -210,4 +210,4 @@ pane/
 
 ## License
 
-MIT. xterm.js in `web/vendor/` is MIT. marked is MIT. DOMPurify is Apache-2.0 / MPL-2.0. Wails is MIT.
+MIT. Iosevka in `web/fonts/` is SIL OFL 1.1. xterm.js in `web/vendor/` is MIT. marked is MIT. DOMPurify is Apache-2.0 / MPL-2.0. Wails is MIT.
