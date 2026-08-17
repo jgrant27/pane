@@ -11,6 +11,8 @@ Two programs:
 
 Light theme is the default.
 
+![Grok Pane — sessions, file tree, and transcript](docs/screenshot.jpg)
+
 ---
 
 ## 1. What you need
