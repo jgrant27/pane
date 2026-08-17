@@ -15,7 +15,13 @@ Two programs:
 
 Light theme is the default.
 
-![Grok Pane — sessions, file tree, and transcript](docs/screenshot.jpg)
+**Light**
+
+![Grok Pane — light theme](docs/screenshot.jpg)
+
+**Dark**
+
+![Grok Pane — dark theme](docs/screenshot-dark.jpg)
 
 ---
 
