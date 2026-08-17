@@ -77,9 +77,11 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer agent.Close()
 
 	s := &session{
-		browser: browser,
-		agent:   agent,
-		cwd:     p.sessionCwd(r),
+		browser:  browser,
+		agent:    agent,
+		cwd:      p.sessionCwd(r),
+		resumeID: strings.TrimSpace(r.URL.Query().Get("sid")),
+		replay:   r.URL.Query().Get("replay") == "1",
 	}
 	if err := s.handshake(); err != nil {
 		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
@@ -91,10 +93,12 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 type session struct {
-	browser *websocket.Conn
-	agent   *websocket.Conn
-	cwd     string
-	id      string
+	browser  *websocket.Conn
+	agent    *websocket.Conn
+	cwd      string
+	id       string
+	resumeID string
+	replay   bool
 
 	mu      sync.Mutex
 	bmu     sync.Mutex
@@ -132,14 +136,21 @@ func (s *session) handshake() error {
 		return err
 	}
 
-	res, err := s.rpc("session/new", map[string]any{
+	meta := map[string]any{
+		"yoloMode": true,
+		"rules":    "You are reached through Grok Pane, a desktop face onto grok agent serve. Answer the user in the transcript. Do not narrate tool calls, status lines, or a tour of the working tree unless asked. No session chrome.",
+	}
+	params := map[string]any{
 		"cwd":        s.cwd,
 		"mcpServers": []any{},
-		"_meta": map[string]any{
-			"yoloMode": true,
-			"rules":    "You are reached through Grok Pane, a desktop face onto grok agent serve. Answer the user in the transcript. Do not narrate tool calls, status lines, or a tour of the working tree unless asked. No session chrome.",
-		},
-	})
+		"_meta":      meta,
+	}
+	method := "session/new"
+	if s.resumeID != "" {
+		method = "session/load"
+		params["sessionId"] = s.resumeID
+	}
+	res, err := s.rpc(method, params)
 	if err != nil {
 		return err
 	}
@@ -152,8 +163,21 @@ func (s *session) handshake() error {
 	if err := json.Unmarshal(res, &out); err != nil {
 		return err
 	}
-	s.id = out.SessionID
+	if out.SessionID != "" {
+		s.id = out.SessionID
+	} else if s.resumeID != "" {
+		s.id = s.resumeID
+	}
+	if s.resumeID != "" && s.replay {
+		s.replayHistory()
+	}
 	return nil
+}
+
+func (s *session) replayHistory() {
+	for _, ev := range replayUpdates(s.cwd, s.id, 400) {
+		_ = s.toBrowser(map[string]string{"type": ev.Type, "text": ev.Text})
+	}
 }
 
 func (s *session) loop() {

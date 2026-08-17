@@ -38,13 +38,16 @@
     return location.origin;
   }
 
-  function paneWS(cwd) {
+  function paneWS(cwd, sid, replay) {
     var http = paneHTTP();
     var u;
     try { u = new URL(http); } catch (e) { u = new URL('http://127.0.0.1:7420'); }
     u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
     u.pathname = '/ws';
-    u.search = cwd ? ('cwd=' + encodeURIComponent(cwd)) : '';
+    u.search = '';
+    if (cwd) u.searchParams.set('cwd', cwd);
+    if (sid) u.searchParams.set('sid', sid);
+    if (replay) u.searchParams.set('replay', '1');
     return u.toString();
   }
 
@@ -54,9 +57,10 @@
   var cwdEl = document.getElementById('cwd');
   var input = document.getElementById('in');
   var sendBtn = document.getElementById('send');
+  var queueEl = document.getElementById('queue');
   var logRoot = document.getElementById('log');
   var sessionsEl = document.getElementById('sessions');
-  var treeEl = document.getElementById('tree');
+  var historyEl = document.getElementById('history');
   var projectBtn = document.getElementById('project');
   var changeBtn = document.getElementById('change-project');
   var newBtn = document.getElementById('new-session');
@@ -96,18 +100,29 @@
   }
 
   function canSend() {
-    return active && !active.busy && active.ws && active.ws.readyState === 1 && !!input.value.replace(/\s+$/, '');
+    return active && !active.dead && active.ws && active.ws.readyState === 1 && !!input.value.replace(/\s+$/, '');
   }
 
-  function syncSend() { sendBtn.disabled = !canSend(); }
+  function syncSend() {
+    var ok = canSend();
+    sendBtn.disabled = !ok;
+    sendBtn.textContent = (active && active.busy) ? 'Queue' : 'Send';
+    input.placeholder = (active && active.busy) ? 'Queue a follow-up…' : 'Message…';
+  }
 
-  function setBusy(on) {
-    if (active) active.busy = on;
+  function syncBusyChrome() {
+    var on = !!(active && active.busy);
     document.documentElement.dataset.busy = on ? 'true' : 'false';
     document.documentElement.setAttribute('aria-busy', on ? 'true' : 'false');
     syncSend();
     paintSessions();
+    paintQueue();
     if (!on) input.focus();
+  }
+
+  function setBusy(on) {
+    if (active) active.busy = on;
+    syncBusyChrome();
   }
 
   function railLocked() {
@@ -189,12 +204,10 @@
       var b = document.createElement('button');
       b.type = 'button';
       b.className = 'sess' + (s === active ? ' active' : '');
-      b.textContent = s.busy ? s.title + ' ·' : s.title;
-      b.title = (s.busy ? 'working… — ' : '') + 'double-click to rename';
-      b.disabled = s.busy && s !== active;
+      b.textContent = s.title + (s.busy ? ' ·' : '') + (s.queue && s.queue.length ? ' +' + s.queue.length : '');
+      b.title = (s.busy ? 'working… — ' : '') + (s.queue && s.queue.length ? s.queue.length + ' queued — ' : '') + 'double-click to rename';
       b.addEventListener('click', function () {
         if (s === active) return;
-        if (s.busy || railLocked()) return;
         activate(s);
       });
       b.addEventListener('dblclick', function (ev) {
@@ -205,13 +218,11 @@
       var x = document.createElement('button');
       x.type = 'button';
       x.className = 'sess-close';
-      x.title = s.busy ? 'working…' : 'Close session';
+      x.title = 'Delete session permanently';
       x.textContent = '×';
-      x.disabled = s.busy;
       x.addEventListener('click', function (ev) {
         ev.stopPropagation();
-        if (s.busy || railLocked()) return;
-        closeSession(s);
+        wipeSession(s.cwd || project, s.id || s.resumeID, s.title, s);
       });
       row.appendChild(b);
       row.appendChild(x);
@@ -220,15 +231,15 @@
   }
 
   function activate(s) {
-    if (!s || (railLocked() && s !== active)) return;
+    if (!s) return;
     active = s;
     sessions.forEach(function (x) {
       if (x.el) x.el.classList.toggle('active', x === s);
     });
-    paintSessions();
     paintCwd(s.cwd);
-    setBusy(s.busy);
     setStatus(s.statusText || (s.busy ? 'working…' : 'ready'), s.statusCls || (s.busy ? 'busy' : 'ok'));
+    syncBusyChrome();
+    paintQueue();
     s.scroll();
     input.focus();
   }
@@ -239,6 +250,8 @@
     this.cwd = cwd || project || '';
     this.title = 'Session ' + this.localId;
     this.named = false;
+    this.resumeID = '';
+    this.seenReady = false;
     this.dead = false;
     this.busy = true;
     this.statusText = 'connecting…';
@@ -251,6 +264,7 @@
     this.agentEl = null;
     this.thoughtBuf = '';
     this.thoughtEl = null;
+    this.queue = [];
     this.el = document.createElement('div');
     this.el.className = 'log-slot';
     this.el.setAttribute('role', 'log');
@@ -372,7 +386,8 @@
     s.busy = true;
     if (s === active) setBusy(true);
     s.setChrome(s.reconnects ? 'reconnecting…' : 'connecting…');
-    var ws = new WebSocket(paneWS(s.cwd));
+    var replay = !!(s.resumeID && !s.seenReady);
+    var ws = new WebSocket(paneWS(s.cwd, s.resumeID, replay));
     s.ws = ws;
     ws.onopen = function () { s.setChrome('handshaking…', 'busy'); };
     ws.onerror = function () { s.setChrome('socket error', 'err'); };
@@ -390,12 +405,20 @@
       switch (msg.type) {
         case 'ready':
           s.reconnects = 0;
+          s.seenReady = true;
           s.id = msg.session || s.id;
+          if (s.id) s.resumeID = s.id;
           if (msg.cwd) s.cwd = msg.cwd;
           if (s === active) paintCwd(s.cwd);
           s.busy = false;
           s.setChrome('ready', 'ok');
           if (s === active) setBusy(false);
+          else paintSessions();
+          loadHistory(s.cwd);
+          flushQueue(s);
+          break;
+        case 'you':
+          s.addYou(msg.text || '');
           break;
         case 'out':
           if (!s.startedReply) s.startedReply = true;
@@ -426,6 +449,8 @@
           s.busy = false;
           s.setChrome('ready', 'ok');
           if (s === active) setBusy(false);
+          else paintSessions();
+          flushQueue(s);
           break;
       }
     };
@@ -446,13 +471,155 @@
     }
   }
 
-  function newSession(cwd) {
-    if (railLocked()) return;
+  function newSession(cwd, opts) {
+    opts = opts || {};
+    if (opts.sid) {
+      var existing = sessions.filter(function (x) { return x.id === opts.sid || x.resumeID === opts.sid; })[0];
+      if (existing) {
+        activate(existing);
+        return existing;
+      }
+    }
     var s = new Session(cwd || project);
+    if (opts.sid) s.resumeID = opts.sid;
+    if (opts.title) {
+      s.title = opts.title;
+      s.named = true;
+    }
     sessions.push(s);
     s.connect();
     activate(s);
     return s;
+  }
+
+  function loadHistory(cwd) {
+    if (!historyEl || !cwd) return;
+    fetch(paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd))
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (list) {
+        historyEl.textContent = '';
+        var open = {};
+        sessions.forEach(function (s) {
+          if (s.id) open[s.id] = true;
+          if (s.resumeID) open[s.resumeID] = true;
+        });
+        (list || []).forEach(function (h) {
+          if (!h || !h.id || open[h.id]) return;
+          var row = document.createElement('div');
+          row.className = 'sess-row';
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'hist';
+          var title = h.title || h.id;
+          b.textContent = title;
+          var when = (h.updated || '').replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+          b.title = (h.id || '') + (when ? '\n' + when : '');
+          b.addEventListener('click', function () {
+            newSession(h.cwd || cwd, { sid: h.id, title: title });
+          });
+          var x = document.createElement('button');
+          x.type = 'button';
+          x.className = 'sess-close';
+          x.title = 'Delete from history permanently';
+          x.textContent = '×';
+          x.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            wipeSession(h.cwd || cwd, h.id, title, null);
+          });
+          row.appendChild(b);
+          row.appendChild(x);
+          historyEl.appendChild(row);
+        });
+        if (!historyEl.childNodes.length) {
+          var empty = document.createElement('div');
+          empty.className = 'hist';
+          empty.style.cursor = 'default';
+          empty.textContent = 'no past sessions';
+          historyEl.appendChild(empty);
+        }
+      })
+      .catch(function () {});
+  }
+
+  var modalEl = document.getElementById('modal');
+  var modalText = document.getElementById('modal-text');
+  var modalOk = document.getElementById('modal-ok');
+  var modalCancel = document.getElementById('modal-cancel');
+  var modalDone = null;
+
+  function closeModal(ok) {
+    if (!modalEl) return;
+    modalEl.hidden = true;
+    var fn = modalDone;
+    modalDone = null;
+    if (fn) fn(!!ok);
+  }
+
+  function askConfirm(message, fn) {
+    if (!modalEl || !modalText) {
+      fn(false);
+      return;
+    }
+    if (modalDone) closeModal(false);
+    modalText.textContent = message;
+    modalEl.hidden = false;
+    modalDone = fn;
+    if (modalOk) modalOk.focus();
+  }
+
+  if (modalOk) modalOk.addEventListener('click', function () { closeModal(true); });
+  if (modalCancel) modalCancel.addEventListener('click', function () { closeModal(false); });
+  if (modalEl) {
+    modalEl.addEventListener('click', function (e) {
+      if (e.target === modalEl) closeModal(false);
+    });
+  }
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && modalEl && !modalEl.hidden) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeModal(false);
+    }
+  }, true);
+
+  function dropTab(s) {
+    if (!s) return;
+    var i = sessions.indexOf(s);
+    if (i >= 0) sessions.splice(i, 1);
+    if (s === active) active = null;
+    s.shutdown();
+  }
+
+  function wipeSession(cwd, id, title, tab) {
+    cwd = cwd || project;
+    id = id || (tab && (tab.id || tab.resumeID)) || '';
+    var label = title || id || 'this session';
+    if (!cwd) return;
+    askConfirm('Delete “' + label + '” permanently?\nThis removes it from Grok’s history on disk.', function (ok) {
+      if (!ok) return;
+      var doomed = [];
+      sessions.forEach(function (s) {
+        if (s === tab || (id && (s.id === id || s.resumeID === id))) doomed.push(s);
+      });
+      doomed.forEach(dropTab);
+      if (!sessions.length) newSession(project || cwd);
+      else if (!active) activate(sessions[0]);
+      paintSessions();
+      if (!id) {
+        loadHistory(cwd);
+        return;
+      }
+      fetch(paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), { method: 'DELETE' })
+        .then(function (r) {
+          if (!r.ok) throw new Error('delete failed');
+          setStatus('deleted', 'ok');
+          loadHistory(cwd);
+        })
+        .catch(function () {
+          setStatus('could not delete session', 'err');
+          loadHistory(cwd);
+        });
+    });
   }
 
   Session.prototype.shutdown = function () {
@@ -476,27 +643,109 @@
     if (sessions.length) activate(sessions[Math.min(i, sessions.length - 1)]);
     else newSession(project);
     paintSessions();
+    if (s.cwd) loadHistory(s.cwd);
+  }
+
+  function paintQueue() {
+    if (!queueEl) return;
+    queueEl.textContent = '';
+    var q = (active && active.queue) ? active.queue : [];
+    if (!q.length) {
+      queueEl.hidden = true;
+      return;
+    }
+    queueEl.hidden = false;
+    q.forEach(function (text, i) {
+      var row = document.createElement('div');
+      row.className = 'q-row';
+      var mark = document.createElement('span');
+      mark.className = 'q-mark';
+      mark.textContent = 'queued';
+      var t = document.createElement('button');
+      t.type = 'button';
+      t.className = 'q-text';
+      t.textContent = text;
+      t.title = 'Edit — put back in the composer';
+      t.addEventListener('click', function () {
+        if (!active) return;
+        var cur = input.value.replace(/\s+$/, '');
+        active.queue.splice(i, 1);
+        if (cur) active.queue.splice(i, 0, cur);
+        input.value = text;
+        grow();
+        paintQueue();
+        paintSessions();
+        syncSend();
+        input.focus();
+      });
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'q-x';
+      x.title = 'Remove from queue';
+      x.textContent = '×';
+      x.addEventListener('click', function () {
+        if (!active) return;
+        active.queue.splice(i, 1);
+        paintQueue();
+        paintSessions();
+      });
+      row.appendChild(mark);
+      row.appendChild(t);
+      row.appendChild(x);
+      queueEl.appendChild(row);
+    });
+  }
+
+  function dispatch(s, text) {
+    if (!s || s.dead || !s.ws || s.ws.readyState !== 1) return false;
+    if (!s.named && s.title.indexOf('Session ') === 0) {
+      s.title = text.length > 28 ? text.slice(0, 28) + '…' : text;
+    }
+    s.addYou(text);
+    s.startedReply = false;
+    s.agentBuf = '';
+    s.agentEl = null;
+    s.thoughtBuf = '';
+    s.thoughtEl = null;
+    s.busy = true;
+    if (s === active) setBusy(true);
+    else paintSessions();
+    s.setChrome('working…', 'busy');
+    s.ws.send(JSON.stringify({ type: 'in', text: text }));
+    return true;
+  }
+
+  function flushQueue(s) {
+    if (!s || s.dead || s.busy || !s.ws || s.ws.readyState !== 1) return;
+    if (!s.queue.length) {
+      if (s === active) paintQueue();
+      return;
+    }
+    var text = s.queue.shift();
+    if (s === active) paintQueue();
+    dispatch(s, text);
   }
 
   function send() {
     var text = input.value.replace(/\s+$/, '');
-    if (!text || !active || active.busy || !active.ws || active.ws.readyState !== 1) return;
+    if (!text || !active || active.dead || !active.ws || active.ws.readyState !== 1) return;
     input.value = '';
     grow();
-    if (!active.named && active.title.indexOf('Session ') === 0) {
-      active.title = text.length > 28 ? text.slice(0, 28) + '…' : text;
+    if (active.busy) {
+      if (active.queue.length >= 20) {
+        setStatus('queue full (20)', 'err');
+        input.value = text;
+        grow();
+        syncSend();
+        return;
+      }
+      active.queue.push(text);
+      paintQueue();
       paintSessions();
+      syncSend();
+      return;
     }
-    active.addYou(text);
-    active.startedReply = false;
-    active.agentBuf = '';
-    active.agentEl = null;
-    active.thoughtBuf = '';
-    active.thoughtEl = null;
-    active.busy = true;
-    setBusy(true);
-    active.setChrome('working…', 'busy');
-    active.ws.send(JSON.stringify({ type: 'in', text: text }));
+    dispatch(active, text);
   }
 
   sendBtn.addEventListener('click', send);
@@ -507,9 +756,16 @@
       send();
       return;
     }
-    if (e.key === 'Escape' && active && active.busy && active.ws && active.ws.readyState === 1) {
+    if (e.key !== 'Escape' || !active) return;
+    if (active.busy && active.ws && active.ws.readyState === 1) {
       active.ws.send(JSON.stringify({ type: 'cancel' }));
       active.setChrome('cancelling…', 'busy');
+      return;
+    }
+    if (!input.value.replace(/\s+$/, '') && active.queue.length) {
+      active.queue.pop();
+      paintQueue();
+      paintSessions();
     }
   });
 
@@ -552,52 +808,9 @@
     projectBtn.textContent = basename(path) || path;
     projectBtn.title = path + ' — click to show in Finder';
     try { localStorage.setItem('pane-project', path); } catch (e) {}
-    loadTree(path, treeEl, 0);
+    loadHistory(path);
     if (!active || active.cwd !== path) newSession(path);
     else paintCwd(path);
-  }
-
-  function loadTree(path, into, depth) {
-    if (depth === 0) into.textContent = '';
-    fetch(paneHTTP() + '/v1/tree?path=' + encodeURIComponent(path))
-      .then(function (r) { return r.ok ? r.json() : []; })
-      .then(function (ents) {
-        ents.forEach(function (e) {
-          var b = document.createElement('button');
-          b.type = 'button';
-          b.className = 'file' + (e.dir ? ' dir' : '');
-          b.style.paddingLeft = (0.35 + depth * 0.7) + 'rem';
-          b.textContent = (e.dir ? '▸ ' : '') + e.name;
-          b.title = e.path;
-          b.addEventListener('click', function (ev) {
-            ev.stopPropagation();
-            if (e.dir) {
-              if (b.dataset.open === '1') {
-                b.dataset.open = '';
-                b.textContent = '▸ ' + e.name;
-                while (b.nextSibling && b.nextSibling.dataset && b.nextSibling.dataset.parent === e.path) {
-                  b.parentNode.removeChild(b.nextSibling);
-                }
-              } else {
-                b.dataset.open = '1';
-                b.textContent = '▾ ' + e.name;
-                var wrap = document.createElement('div');
-                wrap.dataset.parent = e.path;
-                b.after(wrap);
-                loadTree(e.path, wrap, depth + 1);
-              }
-              return;
-            }
-            var rel = project && e.path.indexOf(project) === 0 ? e.path.slice(project.length).replace(/^[/\\]/, '') : e.path;
-            input.value = (input.value ? input.value.replace(/\s+$/, '') + ' ' : '') + rel;
-            grow();
-            syncSend();
-            input.focus();
-          });
-          into.appendChild(b);
-        });
-      })
-      .catch(function () {});
   }
 
   function openProject() {

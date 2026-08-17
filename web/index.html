@@ -14,7 +14,7 @@
     })();
   </script>
   <link rel="icon" href="favicon.png">
-  <link rel="stylesheet" href="style.css?v=10">
+  <link rel="stylesheet" href="style.css?v=17">
 </head>
 <body>
   <aside id="rail">
@@ -24,8 +24,8 @@
     <button type="button" id="new-session">New session</button>
     <div class="rail-label">Sessions</div>
     <div id="sessions"></div>
-    <div class="rail-label">Files</div>
-    <div id="tree"></div>
+    <div class="rail-label">History</div>
+    <div id="history"></div>
   </aside>
   <div id="workspace">
     <header>
@@ -39,13 +39,23 @@
     </header>
     <main id="log"></main>
     <footer>
+      <div id="queue" hidden></div>
       <textarea id="in" rows="2" placeholder="Message…" autocomplete="off"></textarea>
       <button type="button" id="send" disabled>Send</button>
-      <div id="hint">Enter send · Shift+Enter newline · Esc cancel · double-click session to rename · ⌘O project · ⌘N session · ⌘W close</div>
+      <div id="hint">Enter send · busy Enter queues · Shift+Enter newline · Esc cancel · Esc again drops last queued · × deletes a session · ⌘W closes the tab · double-click to rename · ⌘O project · ⌘N session</div>
     </footer>
+  </div>
+  <div id="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-text">
+      <p id="modal-text"></p>
+      <div class="modal-actions">
+        <button type="button" id="modal-cancel">Cancel</button>
+        <button type="button" id="modal-ok">Delete</button>
+      </div>
+    </div>
   </div>
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="term.js?v=10"></script>
+  <script src="term.js?v=17"></script>
 </body>
 </html>

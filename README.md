@@ -11,7 +11,7 @@ Two programs:
 | | |
 | --- | --- |
 | **`pane`** | Local server. Starts Grok’s agent if needed, proxies the session, serves the UI. |
-| **Grok Pane** | Native desktop app. Talks to `pane`. Sessions, project folder, file tree, transcript. |
+| **Grok Pane** | Native desktop app. Talks to `pane`. Sessions, history, transcript. |
 
 Light theme is the default.
 
@@ -84,10 +84,9 @@ On Linux you also need GTK + WebKit (`libgtk-3-dev` and `libwebkit2gtk-4.1-dev` 
 
 ### Linux via Docker / QEMU (amd64 and arm64)
 
-Needs Docker Buildx. On a Mac or mismatched CPU, install QEMU user emulation once:
+Needs Docker running (Buildx). `make desktop-linux` installs QEMU binfmt itself, then builds both architectures:
 
 ```bash
-docker run --privileged --rm tonistiigi/binfmt --install all
 make desktop-linux           # dist/linux-amd64 and dist/linux-arm64
 make desktop-linux-amd64
 make desktop-linux-arm64
@@ -97,17 +96,23 @@ Windows WebView apps cannot be built that way (no licensed Windows image in the 
 
 ### GitHub Actions
 
-Pushes and PRs to `main` run `.github/workflows/build.yml`:
+Pushes and PRs to `main` run `.github/workflows/build.yml`. Each job uploads a `grok-pane-<os>-<arch>` artifact (`pane` + `grok-pane`; macOS also packs `Grok-Pane.app.zip`).
 
 | Artifact | Runner |
 | --- | --- |
 | `darwin-arm64` | macos-14 |
-| `darwin-amd64` | macos-13 |
 | `linux-amd64` / `linux-arm64` | ubuntu-24.04 / ubuntu-24.04-arm |
 | `windows-amd64` / `windows-arm64` | windows-latest / windows-11-arm |
 | QEMU Linux amd64 + arm64 | ubuntu-24.04 + `docker/setup-qemu-action` |
 
-Tag `v*` to attach zip files to a GitHub Release. Windows ARM is `continue-on-error` if that runner is missing from the org.
+Push a `v*` tag to publish those zips plus `SHA256SUMS` on a GitHub Release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Linux desktop builds use Wails’ `webkit2_41` tag (Ubuntu 24.04 has WebKit 4.1, not 4.0). Windows ARM is `continue-on-error` if that runner is missing. Intel Macs are not in CI — build locally with `make desktop-app`.
 
 ---
 
@@ -116,13 +121,12 @@ Tag `v*` to attach zip files to a GitHub Release. Windows ARM is `continue-on-er
 The app looks for `pane` on `http://127.0.0.1:7420`. If nothing is listening, it starts `pane` for you. `pane` starts `grok agent serve` on `:2419` if that port is free.
 
 1. **Open a project** — File → Open Project (⌘O / Ctrl+O), or the **Open project** button. After a folder is chosen, the left rail shows its name. Click the name to show the folder in Finder / Explorer / your file manager. Open Project again to switch trees.
-2. **Talk** — type in the box at the bottom. **Enter** sends, **Shift+Enter** is a newline, **Esc** cancels the turn. Send is locked and a spinner runs while Grok is working.
-3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder.
-4. **Close a session** — the **×** on the session row, or ⌘W / Ctrl+W. Closing the last one opens a fresh session.
-5. **Files** — click a file in the tree to drop its path into the message box. Click a folder to expand it. This is a tree, not an editor.
-6. **Thoughts** — off by default. Click **Thoughts** so it reads **Thoughts on**; the current turn’s reasoning appears above the reply. Click again to hide it.
-7. Replies render as markdown (headings, lists, tables, code).
-8. **Theme** — light by default; **Dark** in the header.
+2. **Talk** — type in the box at the bottom. **Enter** sends, **Shift+Enter** is a newline, **Esc** cancels the turn. While Grok is working, Enter **queues** a follow-up.
+3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder. **History** lists Grok’s saved sessions for this folder; click one to resume it (transcript + context).
+4. **Delete a session** — the **×** on a session or history row, then confirm. That wipes it from Grok’s on-disk history. **⌘W** / File → Close Session only closes the tab.
+5. **Thoughts** — off by default. Click **Thoughts** so it reads **Thoughts on**; the current turn’s reasoning appears above the reply. Click again to hide it.
+6. Replies render as markdown (headings, lists, tables, code).
+7. **Theme** — light by default; **Dark** in the header.
 
 Leave the app running. Quit with ⌘Q / Alt+F4, or close the window.
 
@@ -173,7 +177,7 @@ Puts `tailscale serve` in front and requires `Tailscale-User-Login`. Hits straig
 ## What it is (and is not)
 
 - Auto-approves tool permission prompts (`yoloMode`). Treat it like a local shell with a window attached.
-- Parallel sessions, each with its own cwd. The file tree inserts a path into the composer — it is not an IDE.
+- Parallel sessions, each with its own cwd.
 - Not a clone of Claude’s diff viewer, in-app browser, or git-isolated worktrees. The agent already does the coding.
 
 ---
@@ -199,7 +203,7 @@ Puts `tailscale serve` in front and requires `Tailscale-User-Login`. Hits straig
 pane/
   main.go          server CLI, HTTP, agent, Tailscale
   proxy.go         browser WS ↔ ACP (cwd per connection)
-  tree.go          GET /v1/tree
+  history.go       GET/DELETE /v1/sessions, transcript replay
   web/             UI (browser and desktop)
   desktop/         Grok Pane (Wails)
 ```

@@ -5,8 +5,14 @@ UNAME  := $(shell uname)
 ifeq ($(UNAME),Darwin)
 CGO_LDFLAGS += -framework UniformTypeIdentifiers
 endif
+DESKTOP_TAGS := production
+ifeq ($(UNAME),Linux)
+  ifeq ($(shell pkg-config --exists webkit2gtk-4.1 && echo yes),yes)
+    DESKTOP_TAGS := production,webkit2_41
+  endif
+endif
 
-.PHONY: all build install run desktop desktop-app icon test clean desktop-linux desktop-linux-amd64 desktop-linux-arm64
+.PHONY: all build install run desktop desktop-app icon test clean desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt
 
 all: build
 
@@ -28,7 +34,7 @@ test:
 	go test $(shell go list ./... | grep -v '/desktop$$')
 
 desktop: icon build
-	CGO_ENABLED=1 CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -tags production -o $(APP) ./desktop
+	CGO_ENABLED=1 CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -tags "$(DESKTOP_TAGS)" -o $(APP) ./desktop
 
 desktop-app: desktop
 	rm -rf "Grok Pane.app"
@@ -57,15 +63,25 @@ desktop-app: desktop
 	@echo "built Grok Pane.app"
 
 # Linux binaries via Docker Buildx + QEMU (amd64 and arm64).
-# First time: docker run --privileged --rm tonistiigi/binfmt --install all
-desktop-linux: desktop-linux-amd64 desktop-linux-arm64
+# Installs QEMU binfmt and a buildx builder; needs Docker with --privileged.
+desktop-linux: qemu-binfmt desktop-linux-amd64 desktop-linux-arm64
 
-desktop-linux-amd64:
-	docker buildx build --platform linux/amd64 -f ci/Dockerfile.linux \
+qemu-binfmt:
+	@command -v docker >/dev/null || { echo "pane: docker is required for desktop-linux"; exit 1; }
+	@docker info >/dev/null 2>&1 || { echo "pane: start Docker first"; exit 1; }
+	@docker buildx version >/dev/null 2>&1 || { echo "pane: docker buildx is required"; exit 1; }
+	@docker buildx inspect pane >/dev/null 2>&1 || docker buildx create --name pane --driver docker-container --use >/dev/null
+	@docker buildx use pane >/dev/null
+	@docker buildx inspect --bootstrap >/dev/null
+	@docker run --privileged --rm tonistiigi/binfmt --install amd64,arm64 >/dev/null
+	@echo "pane: qemu/binfmt ready"
+
+desktop-linux-amd64: qemu-binfmt
+	docker buildx build --builder pane --platform linux/amd64 -f ci/Dockerfile.linux \
 		--output type=local,dest=dist/linux-amd64 .
 
-desktop-linux-arm64:
-	docker buildx build --platform linux/arm64 -f ci/Dockerfile.linux \
+desktop-linux-arm64: qemu-binfmt
+	docker buildx build --builder pane --platform linux/arm64 -f ci/Dockerfile.linux \
 		--output type=local,dest=dist/linux-arm64 .
 
 clean:

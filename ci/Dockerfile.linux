@@ -20,7 +20,7 @@ RUN go mod download
 COPY . .
 RUN mkdir -p /out \
  && go build -o /out/pane . \
- && go build -tags production -o /out/grok-pane ./desktop
+ && go build -tags production,webkit2_41 -o /out/grok-pane ./desktop
 
 FROM scratch AS export
 COPY --from=build /out/pane /pane

@@ -74,18 +74,39 @@ body {
   text-transform: uppercase;
   padding: 0.55rem 0.2rem 0.15rem;
 }
-#sessions, #tree {
+#sessions, #history {
   overflow: auto;
   min-height: 0;
 }
-#sessions { flex: 0 1 auto; max-height: 34%; }
-#tree { flex: 1 1 auto; }
+#sessions { flex: 0 1 auto; max-height: 42%; }
+#history { flex: 1 1 auto; }
+.hist {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--dim);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 0.28rem 0.35rem;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 3px;
+}
+.hist:hover { color: var(--fg); background: var(--bg); }
+.hist .when { display: block; font-size: 10px; opacity: 0.75; }
 .sess-row {
   display: flex;
   align-items: stretch;
   gap: 0.1rem;
 }
-.sess, .file, .sess-close {
+.sess, .sess-close {
   appearance: none;
   background: transparent;
   border: 0;
@@ -107,15 +128,10 @@ body {
   opacity: 0.55;
 }
 .sess-row:hover .sess-close { opacity: 1; }
-.sess.active, .file:hover, .sess:hover, .sess-close:hover { color: var(--fg); background: var(--bg); }
-html[data-busy="true"] #change-project,
-html[data-busy="true"] #new-session,
-html[data-busy="true"] #tree {
+.sess.active, .sess:hover, .sess-close:hover { color: var(--fg); background: var(--bg); }
+html[data-busy="true"] #change-project {
   pointer-events: none;
   opacity: 0.45;
-}
-html[data-busy="true"] #sessions .sess-close {
-  pointer-events: none;
 }
 .sess-edit {
   flex: 1 1 auto;
@@ -134,7 +150,6 @@ html[data-busy="true"] #sessions .sess-close {
   opacity: 0.7;
 }
 .sess:disabled, .sess-close:disabled { cursor: default; }
-.file.dir { color: var(--fg); }
 #workspace {
   flex: 1 1 auto;
   min-width: 0;
@@ -304,6 +319,56 @@ footer {
   border-top: 1px solid var(--line);
   background: var(--bg);
 }
+#queue {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  max-height: 7.5rem;
+  overflow: auto;
+}
+#queue[hidden] { display: none; }
+.q-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.1rem;
+  border: 1px dashed var(--line);
+  border-radius: 3px;
+  background: var(--rail);
+}
+.q-mark {
+  flex: 0 0 auto;
+  color: var(--warn);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.28rem 0.35rem 0.28rem 0.45rem;
+  align-self: center;
+}
+.q-text, .q-x {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--dim);
+  font: inherit;
+  cursor: pointer;
+}
+.q-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  text-align: left;
+  padding: 0.28rem 0.35rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.q-text:hover, .q-x:hover { color: var(--fg); }
+.q-x {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0.28rem 0.45rem;
+}
 #in {
   resize: none;
   border: 1px solid var(--line);
@@ -342,6 +407,53 @@ html[data-busy="true"] #in { border-color: var(--warn); }
   font-size: 11px;
   letter-spacing: 0.03em;
 }
+#modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 1rem;
+}
+#modal[hidden] { display: none; }
+.modal-card {
+  width: min(28rem, 100%);
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1rem 1.05rem 0.85rem;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+}
+#modal-text {
+  margin: 0 0 0.9rem;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+.modal-actions button {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+}
+#modal-ok {
+  border-color: var(--err);
+  color: var(--err);
+}
+#modal-ok:hover, #modal-cancel:hover { background: var(--rail); }
 @media (max-width: 720px) {
   #rail { display: none; }
 }
