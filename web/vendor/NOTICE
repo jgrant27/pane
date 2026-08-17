@@ -2,3 +2,5 @@ Vendored browser libraries:
 
 - xterm.js — MIT License, https://github.com/xtermjs/xterm.js
 - @xterm/addon-fit — MIT License, https://github.com/xtermjs/xterm.js
+- marked — MIT License, https://github.com/markedjs/marked
+- DOMPurify — Apache-2.0 / MPL-2.0, https://github.com/cure53/DOMPurify

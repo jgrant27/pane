@@ -1,24 +1,25 @@
 /* Grok Pane UI. Talks to the pane server over HTTP + WS. ACP stays in Go. */
 (function () {
-  var themes = {
-    light: {
-      background: '#f4f1ea',
-      foreground: '#1c1914',
-      cursor: '#f4f1ea',
-      cursorAccent: '#f4f1ea',
-      selectionBackground: '#d4cfc3'
-    },
-    dark: {
-      background: '#111111',
-      foreground: '#e8e4d9',
-      cursor: '#111111',
-      cursorAccent: '#111111',
-      selectionBackground: '#3a3428'
-    }
-  };
-
   function currentTheme() {
     return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+  }
+
+  function renderMd(src) {
+    var raw = String(src || '');
+    var html;
+    try {
+      var lib = window.marked;
+      var parse = lib && (typeof lib.parse === 'function' ? lib.parse : (typeof lib.marked === 'function' ? lib.marked : (typeof lib === 'function' ? lib : null)));
+      if (parse) {
+        html = parse.call(lib, raw, { gfm: true, breaks: true });
+      } else {
+        html = '<p>' + raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') + '</p>';
+      }
+    } catch (e) {
+      html = '<p>' + raw.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</p>';
+    }
+    if (window.DOMPurify) return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    return html;
   }
 
   function isDesktop() {
@@ -53,7 +54,7 @@
   var cwdEl = document.getElementById('cwd');
   var input = document.getElementById('in');
   var sendBtn = document.getElementById('send');
-  var termsEl = document.getElementById('terms');
+  var logRoot = document.getElementById('log');
   var sessionsEl = document.getElementById('sessions');
   var treeEl = document.getElementById('tree');
   var projectBtn = document.getElementById('project');
@@ -66,9 +67,12 @@
   var n = 0;
 
   function paintTheme() {
-    var name = currentTheme();
-    themeBtn.textContent = name === 'dark' ? 'Light' : 'Dark';
-    sessions.forEach(function (s) { s.term.options.theme = themes[name]; });
+    themeBtn.textContent = currentTheme() === 'dark' ? 'Light' : 'Dark';
+  }
+
+  function paintThoughtsBtn() {
+    thoughtsBtn.setAttribute('aria-pressed', showThoughts ? 'true' : 'false');
+    thoughtsBtn.textContent = showThoughts ? 'Thoughts on' : 'Thoughts';
   }
   paintTheme();
   themeBtn.addEventListener('click', function () {
@@ -79,9 +83,11 @@
     try { localStorage.setItem('pane-theme', next); } catch (e) {}
     paintTheme();
   });
+  paintThoughtsBtn();
   thoughtsBtn.addEventListener('click', function () {
     showThoughts = !showThoughts;
-    thoughtsBtn.setAttribute('aria-pressed', showThoughts ? 'true' : 'false');
+    paintThoughtsBtn();
+    sessions.forEach(function (s) { s.showThoughts(showThoughts); });
   });
 
   function setStatus(text, cls) {
@@ -113,8 +119,6 @@
     input.style.height = Math.min(input.scrollHeight, 144) + 'px';
   }
 
-  function dim(s) { return '\x1b[38;5;245m' + s + '\x1b[0m'; }
-
   function basename(p) {
     if (!p) return '';
     var parts = p.replace(/\\/g, '/').split('/');
@@ -131,20 +135,72 @@
     cwdEl.title = 'copy ' + path;
   }
 
+  var renaming = null;
+
+  function commitRename(s, val) {
+    val = String(val || '').replace(/\s+/g, ' ').trim();
+    if (val) {
+      s.title = val;
+      s.named = true;
+    }
+    renaming = null;
+    paintSessions();
+  }
+
+  function startRename(s) {
+    if (!s || renaming === s) return;
+    renaming = s;
+    paintSessions();
+  }
+
   function paintSessions() {
+    if (renaming && sessionsEl.querySelector('.sess-edit')) return;
     sessionsEl.textContent = '';
     sessions.forEach(function (s) {
       var row = document.createElement('div');
       row.className = 'sess-row' + (s.busy ? ' locked' : '');
+      if (renaming === s) {
+        var inp = document.createElement('input');
+        inp.type = 'text';
+        inp.className = 'sess-edit';
+        inp.value = s.title;
+        inp.setAttribute('aria-label', 'Session name');
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            commitRename(s, inp.value);
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            renaming = null;
+            paintSessions();
+          }
+          e.stopPropagation();
+        });
+        inp.addEventListener('blur', function () { commitRename(s, inp.value); });
+        row.appendChild(inp);
+        sessionsEl.appendChild(row);
+        setTimeout(function () {
+          inp.focus();
+          inp.select();
+        }, 0);
+        return;
+      }
       var b = document.createElement('button');
       b.type = 'button';
       b.className = 'sess' + (s === active ? ' active' : '');
       b.textContent = s.busy ? s.title + ' ·' : s.title;
-      b.title = s.busy ? 'working…' : (s.cwd || '');
-      b.disabled = s.busy;
+      b.title = (s.busy ? 'working… — ' : '') + 'double-click to rename';
+      b.disabled = s.busy && s !== active;
       b.addEventListener('click', function () {
+        if (s === active) return;
         if (s.busy || railLocked()) return;
         activate(s);
+      });
+      b.addEventListener('dblclick', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        startRename(s);
       });
       var x = document.createElement('button');
       x.type = 'button';
@@ -173,7 +229,7 @@
     paintCwd(s.cwd);
     setBusy(s.busy);
     setStatus(s.statusText || (s.busy ? 'working…' : 'ready'), s.statusCls || (s.busy ? 'busy' : 'ok'));
-    if (s.fit) s.fit.fit();
+    s.scroll();
     input.focus();
   }
 
@@ -182,6 +238,7 @@
     this.id = '';
     this.cwd = cwd || project || '';
     this.title = 'Session ' + this.localId;
+    this.named = false;
     this.dead = false;
     this.busy = true;
     this.statusText = 'connecting…';
@@ -190,26 +247,119 @@
     this.startedReply = false;
     this.tools = {};
     this.ws = null;
+    this.agentBuf = '';
+    this.agentEl = null;
+    this.thoughtBuf = '';
+    this.thoughtEl = null;
     this.el = document.createElement('div');
-    this.el.className = 'term-slot';
-    termsEl.appendChild(this.el);
-    this.term = new Terminal({
-      cursorBlink: false,
-      disableStdin: true,
-      fontSize: 14,
-      fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
-      theme: themes[currentTheme()],
-      scrollback: 8000
-    });
-    this.fit = new FitAddon.FitAddon();
-    this.term.loadAddon(this.fit);
-    this.term.open(this.el);
-    this.fit.fit();
-    if (window.ResizeObserver) {
-      var self = this;
-      new ResizeObserver(function () { self.fit.fit(); }).observe(this.el);
-    }
+    this.el.className = 'log-slot';
+    this.el.setAttribute('role', 'log');
+    logRoot.appendChild(this.el);
   }
+
+  Session.prototype.scroll = function () {
+    this.el.scrollTop = this.el.scrollHeight;
+  };
+
+  Session.prototype.addYou = function (text) {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg you';
+    var who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = 'you';
+    var body = document.createElement('div');
+    body.className = 'body';
+    body.textContent = text;
+    wrap.appendChild(who);
+    wrap.appendChild(body);
+    this.el.appendChild(wrap);
+    this.agentBuf = '';
+    this.agentEl = null;
+    this.scroll();
+  };
+
+  Session.prototype.addOut = function (text) {
+    if (!text) return;
+    if (!this.agentEl) {
+      var wrap = document.createElement('div');
+      wrap.className = 'msg agent';
+      var who = document.createElement('div');
+      who.className = 'who';
+      who.textContent = 'grok';
+      var body = document.createElement('div');
+      body.className = 'body md';
+      wrap.appendChild(who);
+      wrap.appendChild(body);
+      this.el.appendChild(wrap);
+      this.agentEl = body;
+      this.agentBuf = '';
+    }
+    this.agentBuf += text;
+    this.agentEl.innerHTML = renderMd(this.agentBuf);
+    this.scroll();
+  };
+
+  Session.prototype.addThought = function (text) {
+    if (!text) return;
+    this.thoughtBuf += text;
+    if (!showThoughts) return;
+    if (!this.thoughtEl) {
+      var wrap = document.createElement('div');
+      wrap.className = 'msg thought';
+      var who = document.createElement('div');
+      who.className = 'who';
+      who.textContent = 'thoughts';
+      var body = document.createElement('div');
+      body.className = 'body';
+      wrap.appendChild(who);
+      wrap.appendChild(body);
+      if (this.agentEl && this.agentEl.parentNode) {
+        this.el.insertBefore(wrap, this.agentEl.parentNode);
+      } else {
+        this.el.appendChild(wrap);
+      }
+      this.thoughtEl = body;
+    }
+    this.thoughtEl.textContent = this.thoughtBuf;
+    this.scroll();
+  };
+
+  Session.prototype.showThoughts = function (on) {
+    var existing = this.el.querySelector('.msg.thought');
+    if (!on) {
+      if (existing) existing.hidden = true;
+      return;
+    }
+    if (!this.thoughtBuf) return;
+    if (existing) {
+      existing.hidden = false;
+      var body = existing.querySelector('.body');
+      if (body) body.textContent = this.thoughtBuf;
+      this.thoughtEl = body;
+      this.scroll();
+      return;
+    }
+    var saved = this.thoughtBuf;
+    this.thoughtBuf = '';
+    this.thoughtEl = null;
+    this.addThought(saved);
+  };
+
+  Session.prototype.addTool = function (title) {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg tool';
+    wrap.textContent = '· ' + title;
+    this.el.appendChild(wrap);
+    this.scroll();
+  };
+
+  Session.prototype.addErr = function (text) {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg err';
+    wrap.textContent = text || 'error';
+    this.el.appendChild(wrap);
+    this.scroll();
+  };
 
   Session.prototype.setChrome = function (text, cls) {
     this.statusText = text;
@@ -249,34 +399,30 @@
           break;
         case 'out':
           if (!s.startedReply) s.startedReply = true;
-          if (msg.text) s.term.write(String(msg.text).replace(/\n/g, '\r\n'));
-          s.term.scrollToBottom();
+          s.addOut(msg.text || '');
           break;
         case 'thought':
-          if (showThoughts && msg.text) {
-            s.term.write('\x1b[38;5;240m' + String(msg.text).replace(/\n/g, '\r\n') + '\x1b[0m');
-            s.term.scrollToBottom();
-          }
+          s.addThought(msg.text || '');
           break;
         case 'tool':
           renderTool(s, msg);
-          s.term.scrollToBottom();
           break;
         case 'err':
-          s.term.writeln('');
-          s.term.writeln('\x1b[31m' + (msg.text || 'error') + '\x1b[0m');
-          s.term.scrollToBottom();
+          s.addErr(msg.text || 'error');
           s.setChrome(msg.text || 'error', 'err');
           break;
         case 'busy':
           s.busy = true;
           s.startedReply = false;
           s.tools = {};
+          s.agentBuf = '';
+          s.agentEl = null;
+          s.thoughtBuf = '';
+          s.thoughtEl = null;
           s.setChrome('working…', 'busy');
           if (s === active) setBusy(true);
           break;
         case 'idle':
-          if (s.startedReply) s.term.writeln('');
           s.busy = false;
           s.setChrome('ready', 'ok');
           if (s === active) setBusy(false);
@@ -292,7 +438,7 @@
     var title = msg.text || 'tool';
     if (!prev) {
       s.tools[id] = { title: title, status: st };
-      s.term.writeln(dim('· ' + title));
+      s.addTool(title);
       return;
     }
     if (st && st !== prev.status && (st === 'completed' || st === 'failed' || st === 'cancelled')) {
@@ -316,7 +462,6 @@
     if (w) {
       try { w.close(); } catch (e) {}
     }
-    try { this.term.dispose(); } catch (e) {}
     if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
   };
 
@@ -338,15 +483,16 @@
     if (!text || !active || active.busy || !active.ws || active.ws.readyState !== 1) return;
     input.value = '';
     grow();
-    if (active.title.indexOf('Session ') === 0) {
+    if (!active.named && active.title.indexOf('Session ') === 0) {
       active.title = text.length > 28 ? text.slice(0, 28) + '…' : text;
       paintSessions();
     }
-    active.term.writeln('');
-    active.term.writeln(dim('you') + '  ' + text.replace(/\n/g, '\r\n    '));
-    active.term.writeln('');
-    active.term.scrollToBottom();
+    active.addYou(text);
     active.startedReply = false;
+    active.agentBuf = '';
+    active.agentEl = null;
+    active.thoughtBuf = '';
+    active.thoughtEl = null;
     active.busy = true;
     setBusy(true);
     active.setChrome('working…', 'busy');
@@ -506,7 +652,7 @@
   });
 
   window.addEventListener('resize', function () {
-    sessions.forEach(function (s) { s.fit.fit(); });
+    if (active) active.scroll();
   });
 
   function boot() {

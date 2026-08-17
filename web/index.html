@@ -13,9 +13,8 @@
       document.querySelector('meta[name="color-scheme"]').content = t;
     })();
   </script>
-  <link rel="stylesheet" href="vendor/xterm.css">
   <link rel="icon" href="favicon.png">
-  <link rel="stylesheet" href="style.css?v=8">
+  <link rel="stylesheet" href="style.css?v=10">
 </head>
 <body>
   <aside id="rail">
@@ -38,15 +37,15 @@
       <button type="button" id="thoughts" aria-pressed="false">Thoughts</button>
       <button type="button" id="theme">Dark</button>
     </header>
-    <main id="terms"></main>
+    <main id="log"></main>
     <footer>
       <textarea id="in" rows="2" placeholder="Message…" autocomplete="off"></textarea>
       <button type="button" id="send" disabled>Send</button>
-      <div id="hint">Enter send · Shift+Enter newline · Esc cancel · ⌘O project · ⌘N session · ⌘W close</div>
+      <div id="hint">Enter send · Shift+Enter newline · Esc cancel · double-click session to rename · ⌘O project · ⌘N session · ⌘W close</div>
     </footer>
   </div>
-  <script src="vendor/xterm.js"></script>
-  <script src="vendor/addon-fit.js"></script>
-  <script src="term.js?v=8"></script>
+  <script src="vendor/marked.min.js"></script>
+  <script src="vendor/purify.min.js"></script>
+  <script src="term.js?v=10"></script>
 </body>
 </html>

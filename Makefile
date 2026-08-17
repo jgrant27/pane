@@ -6,7 +6,7 @@ ifeq ($(UNAME),Darwin)
 CGO_LDFLAGS += -framework UniformTypeIdentifiers
 endif
 
-.PHONY: all build install run desktop desktop-app icon test clean
+.PHONY: all build install run desktop desktop-app icon test clean desktop-linux desktop-linux-amd64 desktop-linux-arm64
 
 all: build
 
@@ -56,6 +56,18 @@ desktop-app: desktop
 	codesign --force --deep -s - "Grok Pane.app" 2>/dev/null || true
 	@echo "built Grok Pane.app"
 
+# Linux binaries via Docker Buildx + QEMU (amd64 and arm64).
+# First time: docker run --privileged --rm tonistiigi/binfmt --install all
+desktop-linux: desktop-linux-amd64 desktop-linux-arm64
+
+desktop-linux-amd64:
+	docker buildx build --platform linux/amd64 -f ci/Dockerfile.linux \
+		--output type=local,dest=dist/linux-amd64 .
+
+desktop-linux-arm64:
+	docker buildx build --platform linux/arm64 -f ci/Dockerfile.linux \
+		--output type=local,dest=dist/linux-arm64 .
+
 clean:
 	rm -f $(BIN) $(APP)
-	rm -rf "Grok Pane.app" desktop/build/appicon.iconset
+	rm -rf "Grok Pane.app" desktop/build/appicon.iconset dist

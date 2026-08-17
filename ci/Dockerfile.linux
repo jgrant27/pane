@@ -1,0 +1,27 @@
+# Linux desktop + server build. Used by `make desktop-linux` and CI QEMU/buildx.
+#   docker buildx build --platform linux/amd64 -f ci/Dockerfile.linux --output type=local,dest=dist/linux-amd64 .
+ARG GO_VERSION=1.25.0
+FROM ubuntu:24.04 AS build
+ARG GO_VERSION
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gcc pkg-config \
+      libgtk-3-dev libwebkit2gtk-4.1-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" \
+      | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:$PATH \
+    CGO_ENABLED=1 \
+    GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN mkdir -p /out \
+ && go build -o /out/pane . \
+ && go build -tags production -o /out/grok-pane ./desktop
+
+FROM scratch AS export
+COPY --from=build /out/pane /pane
+COPY --from=build /out/grok-pane /grok-pane

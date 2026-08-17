@@ -1,0 +1,8 @@
+.git
+pane
+grok-pane
+Grok Pane.app
+dist
+docs
+*.md
+.DS_Store

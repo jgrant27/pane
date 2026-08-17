@@ -80,9 +80,34 @@ make desktop
 ./grok-pane          # Windows: grok-pane.exe
 ```
 
-Build on the OS you will run. The window uses the system WebView (WebKit on Mac/Linux, WebView2 on Windows), so cross-compiling from another OS is not supported.
+On Linux you also need GTK + WebKit (`libgtk-3-dev` and `libwebkit2gtk-4.1-dev` on Debian/Ubuntu). On Windows, install [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) if the app will not start.
 
-On Linux you also need GTK + WebKit dev packages (the names vary; on Debian/Ubuntu that is typically `libgtk-3-dev` and `libwebkit2gtk-4.1-dev` or `4.0`). On Windows, install [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) if the app will not start.
+### Linux via Docker / QEMU (amd64 and arm64)
+
+Needs Docker Buildx. On a Mac or mismatched CPU, install QEMU user emulation once:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install all
+make desktop-linux           # dist/linux-amd64 and dist/linux-arm64
+make desktop-linux-amd64
+make desktop-linux-arm64
+```
+
+Windows WebView apps cannot be built that way (no licensed Windows image in the repo). Build on a Windows box, or take the GitHub Actions artifacts.
+
+### GitHub Actions
+
+Pushes and PRs to `main` run `.github/workflows/build.yml`:
+
+| Artifact | Runner |
+| --- | --- |
+| `darwin-arm64` | macos-14 |
+| `darwin-amd64` | macos-13 |
+| `linux-amd64` / `linux-arm64` | ubuntu-24.04 / ubuntu-24.04-arm |
+| `windows-amd64` / `windows-arm64` | windows-latest / windows-11-arm |
+| QEMU Linux amd64 + arm64 | ubuntu-24.04 + `docker/setup-qemu-action` |
+
+Tag `v*` to attach zip files to a GitHub Release. Windows ARM is `continue-on-error` if that runner is missing from the org.
 
 ---
 
@@ -95,8 +120,9 @@ The app looks for `pane` on `http://127.0.0.1:7420`. If nothing is listening, it
 3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder.
 4. **Close a session** — the **×** on the session row, or ⌘W / Ctrl+W. Closing the last one opens a fresh session.
 5. **Files** — click a file in the tree to drop its path into the message box. Click a folder to expand it. This is a tree, not an editor.
-6. **Thoughts** — off by default. Flip the header toggle to stream reasoning.
-7. **Theme** — light by default; **Dark** in the header.
+6. **Thoughts** — off by default. Click **Thoughts** so it reads **Thoughts on**; the current turn’s reasoning appears above the reply. Click again to hide it.
+7. Replies render as markdown (headings, lists, tables, code).
+8. **Theme** — light by default; **Dark** in the header.
 
 Leave the app running. Quit with ⌘Q / Alt+F4, or close the window.
 
@@ -180,4 +206,4 @@ pane/
 
 ## License
 
-MIT. xterm.js in `web/vendor/` is MIT (xterm.js authors). Wails is MIT.
+MIT. xterm.js in `web/vendor/` is MIT. marked is MIT. DOMPurify is Apache-2.0 / MPL-2.0. Wails is MIT.
