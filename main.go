@@ -119,6 +119,7 @@ agent that was already running. Never use tailscale funnel.
 	mux.HandleFunc("/meta", p.handleMeta)
 	mux.HandleFunc("/v1/sessions", handleSessions)
 	mux.HandleFunc("/v1/transcript", handleTranscript)
+	mux.HandleFunc("/v1/usage", handleUsage)
 
 	h := http.Handler(withCORS(mux))
 	if *tailscaleFront {

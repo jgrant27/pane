@@ -48,7 +48,18 @@
     if (cwd) u.searchParams.set('cwd', cwd);
     if (sid) u.searchParams.set('sid', sid);
     if (replay) u.searchParams.set('replay', '1');
+    var model = stored('pane-model');
+    var effort = stored('pane-effort');
+    if (model) u.searchParams.set('model', model);
+    if (effort) u.searchParams.set('effort', effort);
     return u.toString();
+  }
+
+  function stored(k) {
+    try { return localStorage.getItem(k) || ''; } catch (e) { return ''; }
+  }
+  function store(k, v) {
+    try { if (v) localStorage.setItem(k, v); } catch (e) {}
   }
 
   var themeBtn = document.getElementById('theme');
@@ -58,6 +69,10 @@
   var input = document.getElementById('in');
   var sendBtn = document.getElementById('send');
   var queueEl = document.getElementById('queue');
+  var modelEl = document.getElementById('model');
+  var effortEl = document.getElementById('effort');
+  var usageEl = document.getElementById('usage');
+  var usageRing = document.getElementById('usage-ring');
   var logRoot = document.getElementById('log');
   var sessionsEl = document.getElementById('sessions');
   var historyEl = document.getElementById('history');
@@ -240,6 +255,8 @@
     setStatus(s.statusText || (s.busy ? 'working…' : 'ready'), s.statusCls || (s.busy ? 'busy' : 'ok'));
     syncBusyChrome();
     paintQueue();
+    paintCatalog();
+    paintUsage();
     s.scroll();
     input.focus();
   }
@@ -265,6 +282,11 @@
     this.thoughtBuf = '';
     this.thoughtEl = null;
     this.queue = [];
+    this.model = stored('pane-model');
+    this.effort = stored('pane-effort');
+    this.models = [];
+    this.used = 0;
+    this.context = 0;
     this.el = document.createElement('div');
     this.el.className = 'log-slot';
     this.el.setAttribute('role', 'log');
@@ -414,6 +436,9 @@
           s.setChrome('ready', 'ok');
           if (s === active) setBusy(false);
           else paintSessions();
+          applyCatalog(s, msg);
+          if (s === active) paintCatalog();
+          refreshUsage(s);
           loadHistory(s.cwd);
           flushQueue(s);
           break;
@@ -450,7 +475,21 @@
           s.setChrome('ready', 'ok');
           if (s === active) setBusy(false);
           else paintSessions();
+          refreshUsage(s);
           flushQueue(s);
+          break;
+        case 'usage':
+          s.used = +msg.used || 0;
+          if (msg.size) s.context = +msg.size;
+          if (s === active) paintUsage();
+          break;
+        case 'model':
+          applyCatalog(s, msg);
+          if (s === active) paintCatalog();
+          break;
+        case 'effort':
+          s.effort = msg.id || s.effort;
+          if (s === active) paintCatalog();
           break;
       }
     };
@@ -644,6 +683,134 @@
     else newSession(project);
     paintSessions();
     if (s.cwd) loadHistory(s.cwd);
+  }
+
+  function applyCatalog(s, msg) {
+    if (!s || !msg) return;
+    if (msg.models && msg.models.length) s.models = msg.models;
+    if (msg.model) s.model = msg.model;
+    if (msg.id && msg.type === 'model') s.model = msg.id;
+    if (msg.effort) s.effort = msg.effort;
+    if (msg.context) s.context = +msg.context;
+  }
+
+  function paintCatalog() {
+    if (!modelEl || !effortEl) return;
+    var s = active;
+    var models = (s && s.models) ? s.models : [];
+    var cur = s && s.model ? s.model : stored('pane-model');
+    var eff = s && s.effort ? s.effort : stored('pane-effort');
+    modelEl.textContent = '';
+    if (!models.length) {
+      var o = document.createElement('option');
+      o.value = cur || '';
+      o.textContent = cur || 'Model';
+      modelEl.appendChild(o);
+    } else {
+      models.forEach(function (m) {
+        var o = document.createElement('option');
+        o.value = m.id;
+        o.textContent = m.name || m.id;
+        if (m.id === cur) o.selected = true;
+        modelEl.appendChild(o);
+      });
+    }
+    var efforts = [];
+    models.forEach(function (m) {
+      if (m.id === (modelEl.value || cur) && m.efforts) efforts = m.efforts;
+    });
+    if (!efforts.length) {
+      efforts = [
+        { id: 'xhigh', label: 'Extra High' },
+        { id: 'high', label: 'High' },
+        { id: 'medium', label: 'Medium' },
+        { id: 'low', label: 'Low' }
+      ];
+    }
+    effortEl.textContent = '';
+    efforts.forEach(function (e) {
+      var o = document.createElement('option');
+      o.value = e.id;
+      o.textContent = shortEffort(e.label || e.id);
+      if (e.id === eff) o.selected = true;
+      effortEl.appendChild(o);
+    });
+    if (eff && effortEl.value !== eff) {
+      var extra = document.createElement('option');
+      extra.value = eff;
+      extra.textContent = shortEffort(eff);
+      extra.selected = true;
+      effortEl.appendChild(extra);
+    }
+  }
+
+  function shortEffort(label) {
+    var t = String(label || '');
+    if (/extra|xhigh/i.test(t)) return 'XHigh';
+    if (/high/i.test(t)) return 'High';
+    if (/medium/i.test(t)) return 'Med';
+    if (/low/i.test(t)) return 'Low';
+    return t;
+  }
+
+  function paintUsage() {
+    if (!usageRing || !usageEl) return;
+    var used = active ? (active.used || 0) : 0;
+    var size = active ? (active.context || 0) : 0;
+    var pct = size > 0 ? Math.max(0, Math.min(1, used / size)) : 0;
+    var circ = 2 * Math.PI * 7;
+    usageRing.style.strokeDasharray = String(circ);
+    usageRing.style.strokeDashoffset = String(circ * (1 - pct));
+    usageEl.classList.toggle('warn', pct >= 0.7 && pct < 0.9);
+    usageEl.classList.toggle('hot', pct >= 0.9);
+    var title = size ? (Math.round(pct * 100) + '% · ' + fmtNum(used) + ' / ' + fmtNum(size)) : 'Context usage';
+    usageEl.title = title;
+    usageEl.setAttribute('aria-label', title);
+  }
+
+  function fmtNum(n) {
+    n = Math.round(n || 0);
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
+    return String(n);
+  }
+
+  function refreshUsage(s) {
+    if (!s || !s.id || !s.cwd) {
+      if (s === active) paintUsage();
+      return;
+    }
+    fetch(paneHTTP() + '/v1/usage?cwd=' + encodeURIComponent(s.cwd) + '&id=' + encodeURIComponent(s.id))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (u) {
+        if (!u) return;
+        if (u.used) s.used = +u.used;
+        if (u.size) s.context = +u.size;
+        if (s === active) paintUsage();
+      })
+      .catch(function () {});
+  }
+
+  if (modelEl) {
+    modelEl.addEventListener('change', function () {
+      var id = modelEl.value;
+      store('pane-model', id);
+      if (active) active.model = id;
+      if (active && active.ws && active.ws.readyState === 1) {
+        active.ws.send(JSON.stringify({ type: 'model', id: id }));
+      }
+      paintCatalog();
+    });
+  }
+  if (effortEl) {
+    effortEl.addEventListener('change', function () {
+      var id = effortEl.value;
+      store('pane-effort', id);
+      if (active) active.effort = id;
+      if (active && active.ws && active.ws.readyState === 1) {
+        active.ws.send(JSON.stringify({ type: 'effort', id: id }));
+      }
+    });
   }
 
   function paintQueue() {

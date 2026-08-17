@@ -15,7 +15,7 @@
   </script>
   <link rel="icon" href="favicon.png">
   <link rel="preload" href="fonts/iosevka-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css?v=18">
+  <link rel="stylesheet" href="style.css?v=23">
 </head>
 <body>
   <aside id="rail">
@@ -41,9 +41,20 @@
     <main id="log"></main>
     <footer>
       <div id="queue" hidden></div>
-      <textarea id="in" rows="2" placeholder="Message…" autocomplete="off"></textarea>
-      <button type="button" id="send" disabled>Send</button>
-      <div id="hint">Enter send · busy Enter queues · Shift+Enter newline · Esc cancel · Esc again drops last queued · × deletes a session · ⌘W closes the tab · double-click to rename · ⌘O project · ⌘N session</div>
+      <div class="composer">
+        <textarea id="in" rows="2" placeholder="Message…" autocomplete="off"></textarea>
+        <div class="composer-bar">
+          <div id="usage" class="usage" title="Context usage" aria-label="Context usage">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <circle class="usage-track" cx="10" cy="10" r="7"></circle>
+              <circle id="usage-ring" class="usage-ring" cx="10" cy="10" r="7" transform="rotate(-90 10 10)"></circle>
+            </svg>
+          </div>
+          <select id="model" aria-label="Model"></select>
+          <select id="effort" aria-label="Effort"></select>
+          <button type="button" id="send" disabled>Send</button>
+        </div>
+      </div>
     </footer>
   </div>
   <div id="modal" hidden>
@@ -57,6 +68,6 @@
   </div>
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="term.js?v=18"></script>
+  <script src="term.js?v=23"></script>
 </body>
 </html>

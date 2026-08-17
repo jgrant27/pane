@@ -77,28 +77,36 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer agent.Close()
 
 	s := &session{
-		browser:  browser,
-		agent:    agent,
-		cwd:      p.sessionCwd(r),
-		resumeID: strings.TrimSpace(r.URL.Query().Get("sid")),
-		replay:   r.URL.Query().Get("replay") == "1",
+		browser:    browser,
+		agent:      agent,
+		cwd:        p.sessionCwd(r),
+		resumeID:   strings.TrimSpace(r.URL.Query().Get("sid")),
+		replay:     r.URL.Query().Get("replay") == "1",
+		wantModel:  strings.TrimSpace(r.URL.Query().Get("model")),
+		wantEffort: strings.TrimSpace(r.URL.Query().Get("effort")),
 	}
 	if err := s.handshake(); err != nil {
 		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
 		return
 	}
-	log.Printf("session %s cwd=%s", s.id, s.cwd)
-	_ = s.toBrowser(map[string]any{"type": "ready", "cwd": s.cwd, "session": s.id})
+	log.Printf("session %s cwd=%s model=%s effort=%s", s.id, s.cwd, s.model, s.effort)
+	_ = s.toBrowser(s.readyPayload())
 	s.loop()
 }
 
 type session struct {
-	browser  *websocket.Conn
-	agent    *websocket.Conn
-	cwd      string
-	id       string
-	resumeID string
-	replay   bool
+	browser    *websocket.Conn
+	agent      *websocket.Conn
+	cwd        string
+	id         string
+	resumeID   string
+	replay     bool
+	wantModel  string
+	wantEffort string
+	model      string
+	effort     string
+	contextN   int
+	models     []modelInfo
 
 	mu      sync.Mutex
 	bmu     sync.Mutex
@@ -171,7 +179,53 @@ func (s *session) handshake() error {
 	if s.resumeID != "" && s.replay {
 		s.replayHistory()
 	}
+	s.applyModelState(res)
+	s.applyWantedModel()
 	return nil
+}
+
+func (s *session) applyModelState(res json.RawMessage) {
+	st := parseSessionModels(res)
+	if len(st.Models) > 0 {
+		s.models = st.Models
+	}
+	if st.Current != "" {
+		s.model = st.Current
+	}
+	if st.Effort != "" {
+		s.effort = st.Effort
+	}
+	if st.Context > 0 {
+		s.contextN = st.Context
+	}
+}
+
+func (s *session) applyWantedModel() {
+	if s.wantModel != "" && s.wantModel != s.model {
+		if raw, err := s.rpc("session/set_model", map[string]any{"sessionId": s.id, "modelId": s.wantModel}); err == nil && rpcError(raw) == nil {
+			s.model = s.wantModel
+		}
+	}
+	effort := s.wantEffort
+	if effort == "" {
+		effort = s.effort
+	}
+	if effort != "" {
+		_, _ = s.rpc("session/set_mode", map[string]any{"sessionId": s.id, "modeId": effort})
+		s.effort = effort
+	}
+}
+
+func (s *session) readyPayload() map[string]any {
+	return map[string]any{
+		"type":    "ready",
+		"cwd":     s.cwd,
+		"session": s.id,
+		"model":   s.model,
+		"effort":  s.effort,
+		"context": s.contextN,
+		"models":  s.models,
+	}
 }
 
 func (s *session) replayHistory() {
@@ -190,6 +244,7 @@ func (s *session) loop() {
 			Type string `json:"type"`
 			Text string `json:"text"`
 			Cwd  string `json:"cwd"`
+			ID   string `json:"id"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
@@ -202,6 +257,26 @@ func (s *session) loop() {
 			go s.prompt(msg.Text)
 		case "cancel":
 			s.notify("session/cancel", map[string]any{"sessionId": s.id})
+		case "model":
+			id := strings.TrimSpace(firstNonEmpty(msg.ID, msg.Text))
+			if id == "" {
+				continue
+			}
+			if raw, err := s.rpc("session/set_model", map[string]any{"sessionId": s.id, "modelId": id}); err == nil && rpcError(raw) == nil {
+				s.model = id
+				_ = s.toBrowser(map[string]any{"type": "model", "id": id, "models": s.models, "effort": s.effort, "context": s.contextFor(id)})
+			} else if err != nil {
+				_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
+			}
+		case "effort":
+			id := strings.TrimSpace(firstNonEmpty(msg.ID, msg.Text))
+			if id == "" {
+				continue
+			}
+			if _, err := s.rpc("session/set_mode", map[string]any{"sessionId": s.id, "modeId": id}); err == nil {
+				s.effort = id
+				_ = s.toBrowser(map[string]any{"type": "effort", "id": id})
+			}
 		}
 	}
 }
@@ -366,9 +441,15 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 		Title         string `json:"title"`
 		Status        string `json:"status"`
 		Content       any    `json:"content"`
+		Meta          struct {
+			TotalTokens int `json:"totalTokens"`
+		} `json:"_meta"`
 	}
 	if err := json.Unmarshal(wrap.Update, &u); err != nil {
 		return
+	}
+	if u.Meta.TotalTokens > 0 {
+		_ = s.toBrowser(map[string]any{"type": "usage", "used": u.Meta.TotalTokens, "size": s.contextN})
 	}
 	text := contentText(u.Content)
 	switch u.SessionUpdate {
@@ -390,6 +471,16 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 			"status": u.Status,
 		})
 	}
+}
+
+func (s *session) contextFor(id string) int {
+	for _, m := range s.models {
+		if m.ID == id && m.Context > 0 {
+			s.contextN = m.Context
+			return m.Context
+		}
+	}
+	return s.contextN
 }
 
 func contentText(v any) string {
