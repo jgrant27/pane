@@ -119,6 +119,18 @@ func TestAskHelpers(t *testing.T) {
 	if len(askFromTitle("Ask: hello there")) != 1 || askFromTitle("ask_user_question") != nil || askFromTitle("Ask: ") != nil || askFromTitle("") != nil {
 		t.Fatal("title")
 	}
+	if askFromTitle("Execute `git push origin main && git status`") != nil {
+		t.Fatal("execute title is not an ask")
+	}
+	if permissionAutoAllow("read", "Read file") == false || permissionAutoAllow("execute", "Execute git") == true {
+		t.Fatal("perm auto")
+	}
+	if permissionAutoAllow("", "Execute `git push`") || permissionAutoAllow("", "git push origin") {
+		t.Fatal("push must wait")
+	}
+	if !permissionAutoAllow("other", "ask_user_question") || !permissionAutoAllow("", "Grep foo") {
+		t.Fatal("safe auto")
+	}
 
 	ans := parseAskAnswers([]byte(`[{"question":"Q?","selected":["A"]}]`))
 	if len(ans) != 1 || ans[0].Selected[0] != "A" {
@@ -162,6 +174,23 @@ func TestAskHelpers(t *testing.T) {
 	s.forwardUpdate([]byte(`{"update":{"sessionUpdate":"tool_call","title":"ask_user_question","rawInput":{"questions":[{"question":"Live?","options":["Y","N"]}]}}}`))
 	if len(s.askQ) != 1 || s.askQ[0].Question != "Live?" {
 		t.Fatalf("forward %+v", s.askQ)
+	}
+	s.askQ = nil
+	s.forwardUpdate([]byte(`{"update":{"sessionUpdate":"tool_call","title":"Execute ` + "`git push origin main`" + `","kind":"execute","rawInput":{"command":"git push origin main"}}}`))
+	if len(s.askQ) != 0 {
+		t.Fatalf("execute became ask %+v", s.askQ)
+	}
+	s.replyPermission([]byte("9"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"Execute git push","kind":"execute","rawInput":{"command":"git push"}}}}`))
+	if !rpcIDSet(s.permID) || s.permAllow != "allow_once" {
+		t.Fatalf("execute should wait %+v", s.permID)
+	}
+	s.completePerm("allow")
+	if rpcIDSet(s.permID) {
+		t.Fatal("perm cleared")
+	}
+	s.replyPermission([]byte("10"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"}],"toolCall":{"title":"Read file","kind":"read"}}}`))
+	if rpcIDSet(s.permID) {
+		t.Fatal("read should auto-allow")
 	}
 	s.offerAsk([]byte("3"), "x.ai/ask_user_question", qs)
 	s.completeAsk("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}})

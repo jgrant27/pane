@@ -791,6 +791,64 @@
     }
   };
 
+  Session.prototype.addPerm = function (msg) {
+    var s = this;
+    if (s.askEl && s.askEl.parentNode) {
+      s.askEl.parentNode.removeChild(s.askEl);
+    }
+    s.asking = true;
+    var wrap = document.createElement('div');
+    wrap.className = 'msg ask perm';
+    var who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = 'allow this?';
+    wrap.appendChild(who);
+    var title = document.createElement('div');
+    title.className = 'ask-title';
+    title.textContent = (msg && msg.title) || 'run a command';
+    wrap.appendChild(title);
+    if (msg && msg.command && String(msg.command) && title.textContent.indexOf(msg.command) < 0) {
+      var pre = document.createElement('pre');
+      pre.className = 'ask-cmd';
+      pre.textContent = msg.command;
+      wrap.appendChild(pre);
+    }
+    var actions = document.createElement('div');
+    actions.className = 'ask-actions';
+    var allow = document.createElement('button');
+    allow.type = 'button';
+    allow.className = 'ask-submit';
+    allow.textContent = 'Allow';
+    allow.addEventListener('click', function () { finish('allow'); });
+    var deny = document.createElement('button');
+    deny.type = 'button';
+    deny.className = 'ask-skip';
+    deny.textContent = 'Deny';
+    deny.addEventListener('click', function () { finish('deny'); });
+    actions.appendChild(allow);
+    actions.appendChild(deny);
+    wrap.appendChild(actions);
+    s.el.appendChild(wrap);
+    s.askEl = wrap;
+    s.scroll();
+
+    function finish(action) {
+      if (!s.asking) return;
+      s.asking = false;
+      wrap.classList.add('done');
+      var buttons = wrap.querySelectorAll('button');
+      for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+      if (s.ws && s.ws.readyState === 1) {
+        s.ws.send(JSON.stringify({ type: 'perm', action: action }));
+      }
+      var note = document.createElement('div');
+      note.className = 'ask-picked';
+      note.textContent = action === 'deny' ? 'denied' : 'allowed';
+      wrap.appendChild(note);
+      s.setChrome('working…', 'busy');
+    }
+  };
+
   Session.prototype.addErr = function (text) {
     var wrap = document.createElement('div');
     wrap.className = 'msg err';
@@ -857,6 +915,11 @@
           break;
         case 'ask':
           s.addAsk(msg);
+          s.setChrome('waiting for you…', 'busy');
+          if (s === active) setBusy(true);
+          break;
+        case 'perm':
+          s.addPerm(msg);
           s.setChrome('waiting for you…', 'busy');
           if (s === active) setBusy(true);
           break;

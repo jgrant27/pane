@@ -96,6 +96,9 @@ func TestToolCallsUseDetails(t *testing.T) {
 	if strings.Contains(src, "Grok has a question.") {
 		t.Fatal("ask card must not fall back to an empty skip-only stub")
 	}
+	if !strings.Contains(src, "Session.prototype.addPerm") || !strings.Contains(src, "allow this?") {
+		t.Fatal("term.js must wait on execute permissions")
+	}
 	css, err := FS.ReadFile("style.css")
 	if err != nil {
 		t.Fatal(err)

@@ -116,6 +116,9 @@ type session struct {
 	askMethod string
 	askQ      []askQuestion
 	askReply  any
+	permID    json.RawMessage
+	permAllow string
+	permDeny  string
 }
 
 func (s *session) toBrowser(v any) error {
@@ -152,7 +155,7 @@ func (s *session) handshake() error {
 	s.imageCap = parsePromptCaps(init)
 
 	meta := map[string]any{
-		"yoloMode": true,
+		"yoloMode": false,
 		"rules":    "You are reached through Grok Pane, a desktop face onto grok agent serve. Answer the user in the transcript. Do not narrate tool calls, status lines, or a tour of the working tree unless asked. No session chrome.",
 	}
 	params := map[string]any{
@@ -267,7 +270,10 @@ func (s *session) loop() {
 			go s.prompt(msg.Text, msg.Files)
 		case "ask":
 			s.completeAsk(msg.Action, parseAskAnswers(msg.Answers))
+		case "perm":
+			s.completePerm(msg.Action)
 		case "cancel":
+			s.completePerm("deny")
 			s.completeAsk("skip", nil)
 			s.notify("session/cancel", map[string]any{"sessionId": s.id})
 		case "model":
@@ -304,6 +310,7 @@ func (s *session) prompt(text string, files []promptFile) {
 	})
 	s.busy.Store(false)
 	s.clearAsk()
+	s.clearPerm()
 	if err != nil {
 		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
 	} else if err := rpcError(res); err != nil {
@@ -424,31 +431,26 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte) {
 		} `json:"params"`
 	}
 	_ = json.Unmarshal(raw, &req)
-	option := ""
-	for _, o := range req.Params.Options {
-		if o.Kind == "allow_once" || o.OptionID == "allow_once" || o.Kind == "allow_always" {
-			option = o.OptionID
-			break
+	var tc struct {
+		Title    string          `json:"title"`
+		Kind     string          `json:"kind"`
+		RawInput json.RawMessage `json:"rawInput"`
+	}
+	_ = json.Unmarshal(req.Params.ToolCall, &tc)
+	allow := pickPermOption(req.Params.Options, "allow_once", "allow_always", "allow")
+	deny := pickPermOption(req.Params.Options, "reject_once", "reject_always", "reject", "deny")
+	if permissionAutoAllow(tc.Kind, tc.Title) || !rpcIDSet(id) {
+		if allow == "" && len(req.Params.Options) > 0 {
+			allow = req.Params.Options[0].OptionID
 		}
-	}
-	if option == "" && len(req.Params.Options) > 0 {
-		option = req.Params.Options[0].OptionID
-	}
-	if !rpcIDSet(id) {
+		s.writePermResult(id, allow)
 		return
 	}
-	s.mu.Lock()
-	_ = s.agent.WriteJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"result": map[string]any{
-			"outcome": map[string]any{
-				"outcome":  "selected",
-				"optionId": option,
-			},
-		},
-	})
-	s.mu.Unlock()
+	var in struct {
+		Command string `json:"command"`
+	}
+	_ = json.Unmarshal(tc.RawInput, &in)
+	s.offerPerm(id, tc.Title, strings.TrimSpace(in.Command), allow, deny)
 }
 
 func (s *session) forwardUpdate(params json.RawMessage) {
@@ -479,14 +481,11 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	if !s.live.Load() {
 		return
 	}
+	askTool := isAskTool(u.Title) || isAskTool(u.Kind)
 	askQ := parseAskQuestions(u.RawInput)
-	if len(askQ) == 0 {
-		askQ = parseAskQuestions(wrap.Update)
-	}
-	if len(askQ) == 0 {
+	if askTool && len(askQ) == 0 {
 		askQ = askFromTitle(u.Title)
 	}
-	askTool := len(askQ) > 0 || isAskTool(u.Title) || isAskTool(u.Kind)
 	// session/load dumps the whole transcript as updates. We already
 	// painted a short chat tail — ignore the flood until the user talks.
 	// Mid-turn asks still have to land, or the agent sits on working….
@@ -502,7 +501,7 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	case "user_message_chunk":
 		// already echoed
 	case "tool_call", "tool_call_update":
-		if len(askQ) > 0 || (askTool && s.busy.Load()) {
+		if askTool && (s.busy.Load() || len(askQ) > 0) {
 			s.offerAsk(nil, "", askQ)
 		}
 		title := u.Title
@@ -700,17 +699,51 @@ func isAskTool(title string) bool {
 
 func askFromTitle(title string) []askQuestion {
 	t := strings.TrimSpace(title)
-	if t == "" || isAskTool(t) && !strings.Contains(t, ":") {
+	if !strings.HasPrefix(strings.ToLower(t), "ask:") {
 		return nil
 	}
-	low := strings.ToLower(t)
-	if strings.HasPrefix(low, "ask:") {
-		t = strings.TrimSpace(t[4:])
-	}
+	t = strings.TrimSpace(t[4:])
 	if t == "" || isAskTool(t) {
 		return nil
 	}
 	return []askQuestion{{Question: t}}
+}
+
+func permissionAutoAllow(kind, title string) bool {
+	if isAskTool(kind) || isAskTool(title) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "execute", "edit", "write", "delete", "move", "remove":
+		return false
+	case "read", "search", "fetch":
+		return true
+	}
+	t := strings.ToLower(title)
+	switch {
+	case strings.HasPrefix(t, "execute"), strings.HasPrefix(t, "run "),
+		strings.HasPrefix(t, "edit"), strings.HasPrefix(t, "write"),
+		strings.HasPrefix(t, "delete"), strings.Contains(t, "git push"),
+		strings.Contains(t, "git commit"):
+		return false
+	}
+	return true
+}
+
+func pickPermOption(opts []struct {
+	OptionID string `json:"optionId"`
+	Kind     string `json:"kind"`
+	Name     string `json:"name"`
+}, want ...string) string {
+	for _, w := range want {
+		wl := strings.ToLower(w)
+		for _, o := range opts {
+			if strings.ToLower(o.Kind) == wl || strings.ToLower(o.OptionID) == wl {
+				return o.OptionID
+			}
+		}
+	}
+	return ""
 }
 
 func rpcIDSet(id json.RawMessage) bool {
@@ -1100,6 +1133,90 @@ func (s *session) clearAsk() {
 	if rpcIDSet(id) {
 		s.writeAskResult(id, buildAskResult("skip", nil, method))
 	}
+}
+
+func (s *session) offerPerm(id json.RawMessage, title, command, allow, deny string) {
+	if !rpcIDSet(id) {
+		return
+	}
+	s.mu.Lock()
+	if rpcIDSet(s.permID) && string(s.permID) != string(id) {
+		old := append(json.RawMessage(nil), s.permID...)
+		oldDeny := s.permDeny
+		if oldDeny == "" {
+			oldDeny = s.permAllow
+		}
+		s.mu.Unlock()
+		s.writePermResult(old, oldDeny)
+		s.mu.Lock()
+	}
+	s.permID = append(json.RawMessage(nil), id...)
+	s.permAllow = allow
+	s.permDeny = deny
+	s.mu.Unlock()
+	if title == "" {
+		title = "run a command"
+	}
+	_ = s.toBrowser(map[string]any{
+		"type":    "perm",
+		"title":   title,
+		"command": command,
+	})
+}
+
+func (s *session) completePerm(action string) {
+	s.mu.Lock()
+	id := s.permID
+	allow := s.permAllow
+	deny := s.permDeny
+	s.permID = nil
+	s.permAllow = ""
+	s.permDeny = ""
+	s.mu.Unlock()
+	if !rpcIDSet(id) {
+		return
+	}
+	opt := allow
+	if strings.EqualFold(strings.TrimSpace(action), "deny") || strings.EqualFold(action, "skip") {
+		if deny != "" {
+			opt = deny
+		}
+	}
+	s.writePermResult(id, opt)
+}
+
+func (s *session) clearPerm() {
+	s.mu.Lock()
+	id := s.permID
+	deny := s.permDeny
+	if deny == "" {
+		deny = s.permAllow
+	}
+	s.permID = nil
+	s.permAllow = ""
+	s.permDeny = ""
+	s.mu.Unlock()
+	if rpcIDSet(id) {
+		s.writePermResult(id, deny)
+	}
+}
+
+func (s *session) writePermResult(id json.RawMessage, option string) {
+	if s == nil || s.agent == nil || !rpcIDSet(id) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.agent.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result": map[string]any{
+			"outcome": map[string]any{
+				"outcome":  "selected",
+				"optionId": option,
+			},
+		},
+	})
 }
 
 func (s *session) writeAskResult(id json.RawMessage, result any) {
