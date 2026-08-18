@@ -112,9 +112,10 @@ type session struct {
 	live     atomic.Bool
 	prompted atomic.Bool
 
-	askID    json.RawMessage
-	askQ     []askQuestion
-	askReply any
+	askID     json.RawMessage
+	askMethod string
+	askQ      []askQuestion
+	askReply  any
 }
 
 func (s *session) toBrowser(v any) error {
@@ -385,7 +386,7 @@ func (s *session) readAgent() {
 			continue
 		}
 		if isAskMethod(env.Method) {
-			s.offerAsk(env.ID, parseAskQuestions(env.Params))
+			s.offerAsk(env.ID, env.Method, parseAskQuestions(env.Params))
 			continue
 		}
 		if env.Method == "session/update" || env.Method == "x.ai/session/update" {
@@ -479,6 +480,12 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 		return
 	}
 	askQ := parseAskQuestions(u.RawInput)
+	if len(askQ) == 0 {
+		askQ = parseAskQuestions(wrap.Update)
+	}
+	if len(askQ) == 0 {
+		askQ = askFromTitle(u.Title)
+	}
 	askTool := len(askQ) > 0 || isAskTool(u.Title) || isAskTool(u.Kind)
 	// session/load dumps the whole transcript as updates. We already
 	// painted a short chat tail — ignore the flood until the user talks.
@@ -495,8 +502,8 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	case "user_message_chunk":
 		// already echoed
 	case "tool_call", "tool_call_update":
-		if askTool && s.busy.Load() {
-			s.offerAsk(nil, askQ)
+		if len(askQ) > 0 || (askTool && s.busy.Load()) {
+			s.offerAsk(nil, "", askQ)
 		}
 		title := u.Title
 		if title == "" {
@@ -678,7 +685,8 @@ type askAnswer struct {
 
 func isAskMethod(m string) bool {
 	m = strings.ToLower(m)
-	return strings.Contains(m, "ask_user") || strings.Contains(m, "askuserquestion")
+	return strings.Contains(m, "ask_user") || strings.Contains(m, "askuserquestion") ||
+		strings.Contains(m, "elicitation")
 }
 
 func isAskTool(title string) bool {
@@ -688,6 +696,21 @@ func isAskTool(title string) bool {
 	}
 	return strings.Contains(t, "ask_user") || strings.Contains(t, "ask user") ||
 		strings.HasPrefix(t, "ask:") || t == "askuserquestion"
+}
+
+func askFromTitle(title string) []askQuestion {
+	t := strings.TrimSpace(title)
+	if t == "" || isAskTool(t) && !strings.Contains(t, ":") {
+		return nil
+	}
+	low := strings.ToLower(t)
+	if strings.HasPrefix(low, "ask:") {
+		t = strings.TrimSpace(t[4:])
+	}
+	if t == "" || isAskTool(t) {
+		return nil
+	}
+	return []askQuestion{{Question: t}}
 }
 
 func rpcIDSet(id json.RawMessage) bool {
@@ -710,53 +733,242 @@ func parseAskQuestions(raw json.RawMessage) []askQuestion {
 	if !rpcIDSet(raw) {
 		return nil
 	}
-	var wrap struct {
-		Questions []askQuestion   `json:"questions"`
-		RawInput  json.RawMessage `json:"rawInput"`
-		Input     json.RawMessage `json:"input"`
-		Params    json.RawMessage `json:"params"`
-		Update    json.RawMessage `json:"update"`
-	}
-	if err := json.Unmarshal(raw, &wrap); err != nil {
-		var arr []askQuestion
-		if json.Unmarshal(raw, &arr) == nil {
-			return cleanAskQuestions(arr)
-		}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
 		return nil
 	}
-	if qs := cleanAskQuestions(wrap.Questions); len(qs) > 0 {
-		return qs
+	return extractAskQuestions(v, 0)
+}
+
+var askSkipKeys = map[string]bool{
+	"old_string": true, "new_string": true, "oldText": true, "newText": true,
+	"command": true, "content": true, "text": true, "patch": true, "diff": true,
+	"stdout": true, "stderr": true,
+}
+
+func extractAskQuestions(v any, depth int) []askQuestion {
+	if depth > 8 || v == nil {
+		return nil
 	}
-	for _, inner := range []json.RawMessage{wrap.RawInput, wrap.Input, wrap.Params, wrap.Update} {
-		if qs := parseAskQuestions(inner); len(qs) > 0 {
+	switch t := v.(type) {
+	case []any:
+		if qs := questionsFromArray(t); usefulAsk(qs) {
 			return qs
+		}
+		for _, item := range t {
+			if qs := extractAskQuestions(item, depth+1); usefulAsk(qs) {
+				return qs
+			}
+		}
+	case map[string]any:
+		if raw, ok := t["questions"]; ok {
+			if arr, ok := raw.([]any); ok {
+				if qs := questionsFromArray(arr); usefulAsk(qs) {
+					return qs
+				}
+			}
+		}
+		if qs := questionsFromElicitation(t); usefulAsk(qs) {
+			return qs
+		}
+		for _, k := range []string{"rawInput", "input", "params", "update", "request", "payload", "data", "body"} {
+			if qs := extractAskQuestions(t[k], depth+1); usefulAsk(qs) {
+				return qs
+			}
+		}
+		for k, inner := range t {
+			if askSkipKeys[k] {
+				continue
+			}
+			if qs := extractAskQuestions(inner, depth+1); usefulAsk(qs) {
+				return qs
+			}
 		}
 	}
 	return nil
 }
 
-func cleanAskQuestions(in []askQuestion) []askQuestion {
-	var out []askQuestion
-	for _, q := range in {
-		q.Question = strings.TrimSpace(q.Question)
-		if q.Question == "" {
-			q.Question = strings.TrimSpace(q.Header)
+func usefulAsk(qs []askQuestion) bool {
+	if len(qs) == 0 {
+		return false
+	}
+	for _, q := range qs {
+		if len(q.Options) > 0 || q.Question != "" {
+			return true
 		}
-		var opts []askOption
-		for _, o := range q.Options {
-			o.Label = strings.TrimSpace(o.Label)
-			if o.Label == "" {
+	}
+	return false
+}
+
+func questionsFromArray(arr []any) []askQuestion {
+	var out []askQuestion
+	optOnly := true
+	for _, item := range arr {
+		switch q := item.(type) {
+		case string:
+			s := strings.TrimSpace(q)
+			if s == "" {
 				continue
 			}
-			opts = append(opts, o)
+			out = append(out, askQuestion{Question: s})
+			optOnly = false
+		case map[string]any:
+			qq := questionFromMap(q)
+			if qq.Question == "" && len(qq.Options) == 0 {
+				continue
+			}
+			if qq.Question != "" {
+				optOnly = false
+			}
+			out = append(out, qq)
 		}
-		q.Options = opts
-		if q.Question == "" && len(q.Options) == 0 {
-			continue
-		}
-		out = append(out, q)
+	}
+	if optOnly {
+		return nil
 	}
 	return out
+}
+
+func questionFromMap(m map[string]any) askQuestion {
+	q := askQuestion{
+		Question:    firstAskString(m, "question", "header", "text", "prompt", "title", "message"),
+		MultiSelect: askBool(m, "multiSelect", "multi_select"),
+	}
+	for _, key := range []string{"options", "choices", "answers", "items"} {
+		arr, ok := m[key].([]any)
+		if !ok {
+			continue
+		}
+		for _, o := range arr {
+			if opt, ok := optionFromAny(o); ok {
+				q.Options = append(q.Options, opt)
+			}
+		}
+		if len(q.Options) > 0 {
+			break
+		}
+	}
+	return q
+}
+
+func optionFromAny(v any) (askOption, bool) {
+	switch t := v.(type) {
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" {
+			return askOption{}, false
+		}
+		return askOption{Label: s}, true
+	case map[string]any:
+		lab := firstAskString(t, "label", "text", "title", "value", "name", "id")
+		if lab == "" {
+			return askOption{}, false
+		}
+		return askOption{
+			Label:       lab,
+			Description: firstAskString(t, "description", "detail", "desc"),
+			Preview:     firstAskString(t, "preview"),
+		}, true
+	default:
+		return askOption{}, false
+	}
+}
+
+func questionsFromElicitation(m map[string]any) []askQuestion {
+	msg := firstAskString(m, "message")
+	schema, _ := m["requestedSchema"].(map[string]any)
+	if schema == nil {
+		schema, _ = m["requested_schema"].(map[string]any)
+	}
+	if schema == nil {
+		if msg == "" {
+			return nil
+		}
+		return []askQuestion{{Question: msg}}
+	}
+	if props, ok := schema["properties"].(map[string]any); ok && len(props) > 0 {
+		var out []askQuestion
+		for _, p := range props {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			title := firstAskString(pm, "title", "description")
+			if title == "" {
+				title = msg
+			}
+			opts := enumsFromSchema(pm)
+			if title != "" || len(opts) > 0 {
+				out = append(out, askQuestion{Question: title, Options: opts})
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	opts := enumsFromSchema(schema)
+	if msg == "" && len(opts) == 0 {
+		return nil
+	}
+	return []askQuestion{{Question: msg, Options: opts}}
+}
+
+func enumsFromSchema(m map[string]any) []askOption {
+	if m == nil {
+		return nil
+	}
+	names := stringList(m["enumNames"])
+	if len(names) == 0 {
+		names = stringList(m["enum_names"])
+	}
+	vals := stringList(m["enum"])
+	if len(vals) == 0 {
+		return nil
+	}
+	var out []askOption
+	for i, v := range vals {
+		lab := v
+		if i < len(names) && names[i] != "" {
+			lab = names[i]
+		}
+		out = append(out, askOption{Label: lab})
+	}
+	return out
+}
+
+func stringList(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, x := range arr {
+		if s, ok := x.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
+}
+
+func firstAskString(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		switch t := m[k].(type) {
+		case string:
+			if s := strings.TrimSpace(t); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func askBool(m map[string]any, keys ...string) bool {
+	for _, k := range keys {
+		if b, ok := m[k].(bool); ok && b {
+			return true
+		}
+	}
+	return false
 }
 
 func parseAskAnswers(raw json.RawMessage) []askAnswer {
@@ -774,7 +986,34 @@ func parseAskAnswers(raw json.RawMessage) []askAnswer {
 	return nil
 }
 
-func buildAskResult(action string, answers []askAnswer) any {
+func buildAskResult(action string, answers []askAnswer, method string) any {
+	if strings.Contains(strings.ToLower(method), "elicitation") {
+		if strings.EqualFold(action, "skip") || strings.EqualFold(action, "dismiss") {
+			return map[string]any{"action": "cancel"}
+		}
+		content := map[string]any{}
+		var first []string
+		for i, a := range answers {
+			key := strings.TrimSpace(a.Question)
+			if key == "" {
+				key = "answer"
+			}
+			if len(a.Selected) == 1 {
+				content[key] = a.Selected[0]
+			} else {
+				content[key] = a.Selected
+			}
+			if i == 0 {
+				first = a.Selected
+			}
+		}
+		if len(first) == 1 {
+			content["answer"] = first[0]
+		} else if len(first) > 0 {
+			content["answer"] = first
+		}
+		return map[string]any{"action": "accept", "content": content}
+	}
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "skip", "skip_interview", "dismiss":
 		return map[string]any{"type": "skip_interview"}
@@ -797,16 +1036,20 @@ func buildAskResult(action string, answers []askAnswer) any {
 	}
 }
 
-func (s *session) offerAsk(id json.RawMessage, qs []askQuestion) {
+func (s *session) offerAsk(id json.RawMessage, method string, qs []askQuestion) {
 	s.mu.Lock()
 	if rpcIDSet(id) {
 		if rpcIDSet(s.askID) && string(s.askID) != string(id) {
 			old := append(json.RawMessage(nil), s.askID...)
+			oldMethod := s.askMethod
 			s.mu.Unlock()
-			s.writeAskResult(old, buildAskResult("skip", nil))
+			s.writeAskResult(old, buildAskResult("skip", nil, oldMethod))
 			s.mu.Lock()
 		}
 		s.askID = append(json.RawMessage(nil), id...)
+		if method != "" {
+			s.askMethod = method
+		}
 		if s.askReply != nil {
 			reply := s.askReply
 			s.askReply = nil
@@ -822,11 +1065,17 @@ func (s *session) offerAsk(id json.RawMessage, qs []askQuestion) {
 	}
 	out := s.askQ
 	s.mu.Unlock()
+	if len(out) == 0 {
+		return
+	}
 	_ = s.toBrowser(map[string]any{"type": "ask", "questions": out})
 }
 
 func (s *session) completeAsk(action string, answers []askAnswer) {
-	result := buildAskResult(action, answers)
+	s.mu.Lock()
+	method := s.askMethod
+	s.mu.Unlock()
+	result := buildAskResult(action, answers, method)
 	s.mu.Lock()
 	id := s.askID
 	s.askID = nil
@@ -842,12 +1091,14 @@ func (s *session) completeAsk(action string, answers []askAnswer) {
 func (s *session) clearAsk() {
 	s.mu.Lock()
 	id := s.askID
+	method := s.askMethod
 	s.askID = nil
+	s.askMethod = ""
 	s.askQ = nil
 	s.askReply = nil
 	s.mu.Unlock()
 	if rpcIDSet(id) {
-		s.writeAskResult(id, buildAskResult("skip", nil))
+		s.writeAskResult(id, buildAskResult("skip", nil, method))
 	}
 }
 

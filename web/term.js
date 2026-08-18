@@ -644,9 +644,7 @@
   Session.prototype.addAsk = function (msg) {
     var s = this;
     var questions = (msg && msg.questions) || [];
-    if (!questions.length) {
-      questions = [{ question: 'Grok has a question.', options: [] }];
-    }
+    if (!questions.length) return;
     if (s.askEl && s.askEl.parentNode) {
       s.askEl.parentNode.removeChild(s.askEl);
     }
@@ -658,6 +656,7 @@
     who.textContent = 'grok asks';
     wrap.appendChild(who);
     var chosen = questions.map(function () { return []; });
+    var free = questions.map(function () { return ''; });
     var multiFlags = [];
     questions.forEach(function (q, qi) {
       var block = document.createElement('div');
@@ -672,14 +671,16 @@
       multiFlags[qi] = multi;
       var optionList = q.options || [];
       optionList.forEach(function (o, oi) {
+        var label = (o && o.label) || (typeof o === 'string' ? o : '');
+        if (!label) return;
         var b = document.createElement('button');
         b.type = 'button';
         b.className = 'ask-opt';
         var lab = document.createElement('div');
         lab.className = 'ask-label';
-        lab.textContent = (oi + 1) + '. ' + (o.label || 'option');
+        lab.textContent = (oi + 1) + '. ' + label;
         b.appendChild(lab);
-        if (o.description) {
+        if (o && o.description) {
           var d = document.createElement('div');
           d.className = 'ask-desc';
           d.textContent = o.description;
@@ -688,13 +689,13 @@
         b.addEventListener('click', function () {
           if (!s.asking) return;
           if (multi) {
-            var i = chosen[qi].indexOf(o.label);
+            var i = chosen[qi].indexOf(label);
             if (i >= 0) chosen[qi].splice(i, 1);
-            else chosen[qi].push(o.label);
+            else chosen[qi].push(label);
             b.classList.toggle('on', i < 0);
             return;
           }
-          chosen[qi] = [o.label];
+          chosen[qi] = [label];
           var siblings = opts.querySelectorAll('.ask-opt');
           for (var j = 0; j < siblings.length; j++) siblings[j].classList.toggle('on', siblings[j] === b);
           if (questions.length === 1) finish(collect(), 'accept');
@@ -702,11 +703,29 @@
         opts.appendChild(b);
       });
       block.appendChild(opts);
+      if (!optionList.length) {
+        var inp = document.createElement('textarea');
+        inp.className = 'ask-free';
+        inp.rows = 2;
+        inp.placeholder = 'Type an answer…';
+        inp.addEventListener('input', function () { free[qi] = inp.value; });
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            e.stopPropagation();
+            free[qi] = inp.value;
+            var answers = collect();
+            if (answers[qi] && answers[qi].selected.length) finish(answers, 'accept');
+          }
+        });
+        block.appendChild(inp);
+      }
       wrap.appendChild(block);
     });
     var actions = document.createElement('div');
     actions.className = 'ask-actions';
-    var needsSubmit = questions.length > 1 || multiFlags.some(function (m) { return m; });
+    var needsSubmit = questions.length > 1 || multiFlags.some(function (m) { return m; }) ||
+      questions.some(function (q) { return !(q.options && q.options.length); });
     if (needsSubmit) {
       var submit = document.createElement('button');
       submit.type = 'button';
@@ -736,7 +755,10 @@
 
     function collect() {
       return questions.map(function (q, i) {
-        return { question: q.question || '', selected: (chosen[i] || []).slice() };
+        var sel = (chosen[i] || []).slice();
+        var typed = String(free[i] || '').replace(/\s+$/, '');
+        if (!sel.length && typed) sel = [typed];
+        return { question: q.question || q.header || '', selected: sel };
       });
     }
 

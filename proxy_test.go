@@ -46,8 +46,11 @@ func TestParsePromptCaps(t *testing.T) {
 }
 
 func TestAskHelpers(t *testing.T) {
-	if !isAskMethod("GrokBuild:ask_user_question") || !isAskMethod("ask_user_question") {
+	if !isAskMethod("GrokBuild:ask_user_question") || !isAskMethod("ask_user_question") || !isAskMethod("x.ai/ask_user_question") {
 		t.Fatal("method")
+	}
+	if !isAskMethod("elicitation/create") {
+		t.Fatal("elicitation")
 	}
 	if isAskMethod("session/update") || isAskMethod("") {
 		t.Fatal("not ask")
@@ -77,8 +80,44 @@ func TestAskHelpers(t *testing.T) {
 	if len(qs) != 1 || qs[0].Question != "bare" {
 		t.Fatalf("array %+v", qs)
 	}
+	qs = parseAskQuestions([]byte(`{"sessionId":"s","request":{"questions":[{"question":"Which?","options":["Alpha","Beta"]}]}}`))
+	if len(qs) != 1 || qs[0].Question != "Which?" || len(qs[0].Options) != 2 || qs[0].Options[0].Label != "Alpha" {
+		t.Fatalf("wrapped strings %+v", qs)
+	}
+	qs = parseAskQuestions([]byte(`{"questions":[{"text":"Pick","choices":[{"title":"One","description":"d"}]}]}`))
+	if len(qs) != 1 || qs[0].Question != "Pick" || qs[0].Options[0].Label != "One" {
+		t.Fatalf("aliases %+v", qs)
+	}
+	qs = parseAskQuestions([]byte(`{"message":"Go?","requestedSchema":{"type":"object","properties":{"a":{"title":"Go?","enum":["yes","no"],"enumNames":["Yes","No"]}}}}`))
+	if len(qs) != 1 || len(qs[0].Options) != 2 || qs[0].Options[0].Label != "Yes" {
+		t.Fatalf("elicitation %+v", qs)
+	}
 	if parseAskQuestions(nil) != nil || parseAskQuestions([]byte("nope")) != nil {
 		t.Fatal("empty")
+	}
+	if parseAskQuestions([]byte(`{"questions":[{"options":[{"label":"only"}]}]}`)) != nil {
+		t.Fatal("option-only array is not a question list")
+	}
+	qs = parseAskQuestions([]byte(`{"payload":{"questions":[{"question":"Deep","options":[{"name":"N"}]}]}}`))
+	if len(qs) != 1 || qs[0].Options[0].Label != "N" {
+		t.Fatalf("payload nest %+v", qs)
+	}
+	qs = parseAskQuestions([]byte(`{"requested_schema":{"enum":["a","b"],"enum_names":["A",""]},"message":"M?"}`))
+	if len(qs) != 1 || qs[0].Question != "M?" || qs[0].Options[1].Label != "b" {
+		t.Fatalf("snake elicitation %+v", qs)
+	}
+	qs = parseAskQuestions([]byte(`{"new_string":"{\"questions\":[{\"question\":\"nope\"}]}","params":{"questions":[{"question":"Yes","options":["1"]}]}}`))
+	if len(qs) != 1 || qs[0].Question != "Yes" {
+		t.Fatalf("skip new_string %+v", qs)
+	}
+	if _, ok := optionFromAny(3); ok {
+		t.Fatal("bad option")
+	}
+	if !usefulAsk([]askQuestion{{Question: "x"}}) || usefulAsk(nil) || usefulAsk([]askQuestion{{}}) {
+		t.Fatal("useful")
+	}
+	if len(askFromTitle("Ask: hello there")) != 1 || askFromTitle("ask_user_question") != nil || askFromTitle("Ask: ") != nil || askFromTitle("") != nil {
+		t.Fatal("title")
 	}
 
 	ans := parseAskAnswers([]byte(`[{"question":"Q?","selected":["A"]}]`))
@@ -93,27 +132,44 @@ func TestAskHelpers(t *testing.T) {
 		t.Fatal("nil answers")
 	}
 
-	skip := buildAskResult("skip", nil).(map[string]any)
+	skip := buildAskResult("skip", nil, "").(map[string]any)
 	if skip["type"] != "skip_interview" {
 		t.Fatal(skip)
 	}
-	chat := buildAskResult("chat", nil).(map[string]any)
+	chat := buildAskResult("chat", nil, "").(map[string]any)
 	if chat["type"] != "chat_about_this" {
 		t.Fatal(chat)
 	}
-	acc := buildAskResult("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}}).(map[string]any)
+	acc := buildAskResult("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}}, "").(map[string]any)
 	if acc["type"] != "accepted" {
 		t.Fatal(acc)
 	}
+	el := buildAskResult("accept", []askAnswer{{Question: "Go?", Selected: []string{"Yes"}}}, "elicitation/create").(map[string]any)
+	if el["action"] != "accept" {
+		t.Fatal(el)
+	}
+	if buildAskResult("skip", nil, "elicitation/create").(map[string]any)["action"] != "cancel" {
+		t.Fatal("elicit skip")
+	}
+	multi := buildAskResult("accept", []askAnswer{{Selected: []string{"a", "b"}}}, "elicitation").(map[string]any)
+	if multi["action"] != "accept" {
+		t.Fatal(multi)
+	}
 
 	s := &session{}
-	s.offerAsk([]byte("3"), qs)
+	s.live.Store(true)
+	s.busy.Store(true)
+	s.forwardUpdate([]byte(`{"update":{"sessionUpdate":"tool_call","title":"ask_user_question","rawInput":{"questions":[{"question":"Live?","options":["Y","N"]}]}}}`))
+	if len(s.askQ) != 1 || s.askQ[0].Question != "Live?" {
+		t.Fatalf("forward %+v", s.askQ)
+	}
+	s.offerAsk([]byte("3"), "x.ai/ask_user_question", qs)
 	s.completeAsk("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}})
-	s.offerAsk([]byte("4"), qs)
-	s.offerAsk([]byte("5"), qs)
+	s.offerAsk([]byte("4"), "", qs)
+	s.offerAsk([]byte("5"), "", qs)
 	s.clearAsk()
 	s.completeAsk("skip", nil)
-	s.offerAsk([]byte("6"), qs)
+	s.offerAsk([]byte("6"), "", qs)
 	s.replyMethodNotFound(nil, "x")
 	s.writeAskResult(nil, skip)
 }
