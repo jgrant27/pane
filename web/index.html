@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-busy="true">
+<html lang="en" data-busy="false">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -15,7 +15,7 @@
   </script>
   <link rel="icon" href="favicon.png">
   <link rel="preload" href="fonts/iosevka-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css?v=45">
+  <link rel="stylesheet" href="style.css?v=48">
 </head>
 <body>
   <div id="shell">
@@ -40,9 +40,9 @@
     <main id="log"></main>
     <footer>
       <div id="queue" hidden></div>
-      <div id="live">
+      <div id="live" hidden>
         <span id="spin" aria-hidden="true"></span>
-        <div id="status" aria-live="polite">connecting…</div>
+        <div id="status" aria-live="polite"></div>
       </div>
       <div class="composer">
         <div id="chips" hidden></div>
@@ -89,6 +89,6 @@
   </div>
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="term.js?v=48"></script>
+  <script src="term.js?v=53"></script>
 </body>
 </html>

@@ -44,6 +44,11 @@ func grokHome() string {
 }
 
 func sessionGroupDir(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if abs, err := filepath.Abs(cwd); err == nil {
+		cwd = abs
+	}
+	cwd = strings.TrimRight(cwd, `/\`)
 	return filepath.Join(grokHome(), "sessions", url.PathEscape(cwd))
 }
 
@@ -481,7 +486,11 @@ func listGrokSessions(cwd string, limit int) []sessionInfo {
 		}
 		info, ok := readSummary(filepath.Join(dir, e.Name(), "summary.json"))
 		if !ok {
-			continue
+			id := e.Name()
+			if !validSessionID(id) {
+				continue
+			}
+			info = sessionInfo{ID: id, Cwd: cwd, Title: id}
 		}
 		out = append(out, info)
 	}

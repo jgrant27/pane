@@ -51,6 +51,21 @@
     return !!(window.runtime || window.wails || (window.go && window.go.main));
   }
 
+  function fetchJSON(url, tries) {
+    tries = tries == null ? 16 : tries;
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error(String(r.status));
+      return r.json();
+    }).catch(function (err) {
+      if (tries <= 1) throw err;
+      return new Promise(function (resolve, reject) {
+        setTimeout(function () {
+          fetchJSON(url, tries - 1).then(resolve, reject);
+        }, 400);
+      });
+    });
+  }
+
   function paneHTTP() {
     var q = new URLSearchParams(location.search).get('pane');
     if (q) return q.replace(/\/$/, '');
@@ -164,8 +179,10 @@
   }
 
   function canSend() {
-    return active && !active.dead && active.ws && active.ws.readyState === 1 &&
-      (!!input.value.replace(/\s+$/, '') || pending.length > 0);
+    var has = !!(input.value.replace(/\s+$/, '') || pending.length > 0);
+    if (!has) return false;
+    if (active && !active.dead && active.ws && active.ws.readyState === 1) return true;
+    return !!project;
   }
 
   function syncSend() {
@@ -220,16 +237,25 @@
   function paintCwd(path) {
     if (!path) {
       cwdEl.hidden = true;
+      cwdEl.textContent = '';
       return;
     }
     cwdEl.hidden = false;
-    cwdEl.textContent = path;
     cwdEl.title = 'copy ' + path;
+    cwdEl.textContent = '';
+    var span = document.createElement('span');
+    span.className = 'cwd-path';
+    span.textContent = path;
+    cwdEl.appendChild(span);
   }
 
   var renaming = null;
   var renamingProject = null;
   var projectNames = {};
+  var projectListCache = [];
+  var composerHistIdx = -1;
+  var composerHold = '';
+  var composerHistApplying = false;
 
   function projectLabel(cwd) {
     return projectNames[normPath(cwd)] || basename(cwd);
@@ -898,7 +924,7 @@
           else paintSessions();
           applyCatalog(s, msg);
           if (s === active) paintCatalog();
-          if (s.id && s.cwd) store('pane-last-sid:' + s.cwd, s.id);
+          if (s.id && s.cwd) store('pane-last-sid:' + normPath(s.cwd), s.id);
           refreshUsage(s);
           scheduleHistory(s.cwd);
           flushQueue(s);
@@ -1082,10 +1108,9 @@
       url += '&prune=1';
       if (keep.length) url += '&keep=' + keep.map(encodeURIComponent).join(',');
     }
-    fetch(url)
-      .then(function (r) { return r.ok ? r.json() : []; })
+    fetchJSON(url)
       .then(function (list) {
-        diskSessions = list || [];
+        diskSessions = Array.isArray(list) ? list : [];
         sessPaintKey = '';
         applyGrokTitles(diskSessions);
         paintSessions();
@@ -1097,6 +1122,9 @@
         sessPaintKey = '';
         paintSessions();
         if (opts.resume) resumeLatest(cwd, []);
+        var opened = sessions.some(function (s) { return !s.dead && samePath(s.cwd, cwd); });
+        if (!opened) setStatus('pane not reachable', 'err');
+        loadProjects();
       });
   }
 
@@ -1151,94 +1179,97 @@
     loadProjects();
   }
 
+  function paintProjectList(list) {
+    list = Array.isArray(list) ? list.slice() : [];
+    list.forEach(function (p) {
+      if (p && p.cwd && p.name) projectNames[normPath(p.cwd)] = p.name;
+    });
+    if (project) {
+      var seen = list.some(function (p) { return p && samePath(p.cwd, project); });
+      if (!seen) {
+        list = [{ cwd: project, name: projectLabel(project), sessions: 0 }].concat(list);
+      }
+    }
+    projectListCache = list.map(function (p) { return p && p.cwd ? normPath(p.cwd) : ''; }).filter(Boolean);
+    if (!projectsEl) return;
+    if (renamingProject && projectsEl.querySelector('.sess-edit')) return;
+    projectsEl.textContent = '';
+    list.forEach(function (p) {
+      if (!p || !p.cwd) return;
+      var row = document.createElement('div');
+      row.className = 'sess-row';
+      if (renamingProject && samePath(p.cwd, renamingProject)) {
+        var inp = document.createElement('input');
+        inp.type = 'text';
+        inp.className = 'sess-edit';
+        inp.value = p.name || projectLabel(p.cwd);
+        inp.setAttribute('aria-label', 'Project name');
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            commitProjectRename(p.cwd, inp.value);
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            renamingProject = null;
+            loadProjects();
+          }
+          e.stopPropagation();
+        });
+        inp.addEventListener('blur', function () { commitProjectRename(p.cwd, inp.value); });
+        row.appendChild(inp);
+        projectsEl.appendChild(row);
+        setTimeout(function () {
+          inp.focus();
+          inp.select();
+        }, 0);
+        return;
+      }
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'hist' + (samePath(p.cwd, project) ? ' active' : '');
+      b.textContent = p.name || projectLabel(p.cwd);
+      b.title = p.cwd + (p.sessions ? '\n' + p.sessions + ' Grok sessions' : '') + '\ndouble-click to rename';
+      b.addEventListener('click', function () {
+        if (samePath(p.cwd, project)) {
+          startProjectRename(p.cwd);
+          return;
+        }
+        setProject(p.cwd);
+      });
+      b.addEventListener('dblclick', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        startProjectRename(p.cwd);
+      });
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'sess-close';
+      x.title = 'Delete this Grok project (all its sessions)';
+      x.textContent = '×';
+      x.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        wipeProject(p);
+      });
+      row.appendChild(b);
+      row.appendChild(x);
+      projectsEl.appendChild(row);
+    });
+    if (!projectsEl.childNodes.length) {
+      var empty = document.createElement('div');
+      empty.className = 'hist';
+      empty.style.cursor = 'default';
+      empty.textContent = 'no grok projects';
+      projectsEl.appendChild(empty);
+    }
+    if (project && projectBtn) projectBtn.textContent = projectLabel(project);
+  }
+
   function loadProjects() {
     if (!projectsEl) return;
-    fetch(paneHTTP() + '/v1/projects')
-      .then(function (r) { return r.ok ? r.json() : []; })
-      .then(function (list) {
-        list = list || [];
-        list.forEach(function (p) {
-          if (p && p.cwd && p.name) projectNames[normPath(p.cwd)] = p.name;
-        });
-        if (project) {
-          var seen = list.some(function (p) { return p && samePath(p.cwd, project); });
-          if (!seen) {
-            list = [{ cwd: project, name: projectLabel(project), sessions: 0 }].concat(list);
-          }
-        }
-        if (renamingProject && projectsEl.querySelector('.sess-edit')) return;
-        projectsEl.textContent = '';
-        list.forEach(function (p) {
-          if (!p || !p.cwd) return;
-          var row = document.createElement('div');
-          row.className = 'sess-row';
-          if (renamingProject && samePath(p.cwd, renamingProject)) {
-            var inp = document.createElement('input');
-            inp.type = 'text';
-            inp.className = 'sess-edit';
-            inp.value = p.name || projectLabel(p.cwd);
-            inp.setAttribute('aria-label', 'Project name');
-            inp.addEventListener('keydown', function (e) {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                commitProjectRename(p.cwd, inp.value);
-              }
-              if (e.key === 'Escape') {
-                e.preventDefault();
-                renamingProject = null;
-                loadProjects();
-              }
-              e.stopPropagation();
-            });
-            inp.addEventListener('blur', function () { commitProjectRename(p.cwd, inp.value); });
-            row.appendChild(inp);
-            projectsEl.appendChild(row);
-            setTimeout(function () {
-              inp.focus();
-              inp.select();
-            }, 0);
-            return;
-          }
-          var b = document.createElement('button');
-          b.type = 'button';
-          b.className = 'hist' + (samePath(p.cwd, project) ? ' active' : '');
-          b.textContent = p.name || projectLabel(p.cwd);
-          b.title = p.cwd + (p.sessions ? '\n' + p.sessions + ' Grok sessions' : '') + '\ndouble-click to rename';
-          b.addEventListener('click', function () {
-            if (samePath(p.cwd, project)) {
-              startProjectRename(p.cwd);
-              return;
-            }
-            setProject(p.cwd);
-          });
-          b.addEventListener('dblclick', function (ev) {
-            ev.preventDefault();
-            ev.stopPropagation();
-            startProjectRename(p.cwd);
-          });
-          var x = document.createElement('button');
-          x.type = 'button';
-          x.className = 'sess-close';
-          x.title = 'Delete this Grok project (all its sessions)';
-          x.textContent = '×';
-          x.addEventListener('click', function (ev) {
-            ev.stopPropagation();
-            wipeProject(p);
-          });
-          row.appendChild(b);
-          row.appendChild(x);
-          projectsEl.appendChild(row);
-        });
-        if (!projectsEl.childNodes.length) {
-          var empty = document.createElement('div');
-          empty.className = 'hist';
-          empty.style.cursor = 'default';
-          empty.textContent = 'no grok projects';
-          projectsEl.appendChild(empty);
-        }
-        if (project && projectBtn) projectBtn.textContent = projectLabel(project);
-      })
-      .catch(function () {});
+    fetchJSON(paneHTTP() + '/v1/projects')
+      .then(paintProjectList)
+      .catch(function () { paintProjectList([]); });
   }
 
   var histSoon = {};
@@ -1264,6 +1295,7 @@
         }
       }
     }
+    if (!pick && lastSid) pick = { id: lastSid, cwd: cwd, title: lastSid };
     if (!pick && list[0] && list[0].id) pick = list[0];
     if (pick && pick.id) {
       var existing = sessions.filter(function (s) {
@@ -1277,11 +1309,8 @@
       return;
     }
     var open = sessions.filter(function (s) { return !s.dead && samePath(s.cwd, cwd); })[0];
-    if (open) {
-      activate(open);
-      return;
-    }
-    newSession(cwd);
+    if (open) activate(open);
+    else if (!active || active.dead) setStatus('', 'ok');
   }
 
   function loadRemote() {
@@ -1614,6 +1643,26 @@
     if (usagePop && !usagePop.hidden) fillUsagePop();
   }
 
+  function fmtUSD(n) {
+    n = Number(n) || 0;
+    if (!n) return '$0.00';
+    if (Math.round(n) === n) return '$' + n;
+    return '$' + n.toFixed(2);
+  }
+
+  function fmtReset(s) {
+    var d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+    }
+    return String(s || '').replace('T', ' ').replace(/\+00:00$/, ' UTC').replace(/\.\d+Z$/, 'Z');
+  }
+
+  function productUsageLabel(name) {
+    var map = { GrokBuild: 'Grok Build', GrokChat: 'Grok Chat', GrokImagine: 'Grok Imagine' };
+    return map[name] || String(name || 'Grok');
+  }
+
   function fmtDur(sec) {
     sec = Math.round(sec || 0);
     if (sec < 60) return sec + 's';
@@ -1627,7 +1676,7 @@
     var used = (active && active.used) || u.used || 0;
     var size = (active && active.context) || u.size || 0;
     var pct = size > 0 ? Math.round(used * 100 / size) : (u.pct || 0);
-    var left = size > used ? size - used : 0;
+    var left = (u.left != null && u.left >= 0) ? u.left : (size > used ? size - used : 0);
     var model = (active && active.model) || u.model || '—';
     var effort = (active && active.effort) || '—';
     var tools = (u.tools && u.tools.length) ? u.tools.join(', ') : '—';
@@ -1635,17 +1684,17 @@
     var calls = u.toolCalls != null ? u.toolCalls : '—';
     var dur = u.duration ? fmtDur(u.duration) : '—';
     usagePop.innerHTML = '';
-    var h = document.createElement('h3');
-    h.textContent = 'Context';
-    usagePop.appendChild(h);
-    var big = document.createElement('p');
-    big.className = 'u-big';
-    big.textContent = size ? (fmtNum(used) + ' / ' + fmtNum(size) + ' tokens') : 'No usage yet';
-    usagePop.appendChild(big);
-    var sub = document.createElement('p');
-    sub.className = 'u-sub';
-    sub.textContent = size ? (pct + '% used · ' + fmtNum(left) + ' left') : 'Send a message to start counting.';
-    usagePop.appendChild(sub);
+    function heading(text) {
+      var h = document.createElement('h3');
+      h.textContent = text;
+      usagePop.appendChild(h);
+    }
+    function para(cls, text) {
+      var p = document.createElement('p');
+      p.className = cls;
+      p.textContent = text;
+      usagePop.appendChild(p);
+    }
     var dl = document.createElement('dl');
     function row(k, v) {
       var dt = document.createElement('dt');
@@ -1655,11 +1704,55 @@
       dl.appendChild(dt);
       dl.appendChild(dd);
     }
+    heading('Context');
+    para('u-big', size ? (fmtNum(used) + ' / ' + fmtNum(size) + ' tokens') : 'No usage yet');
+    para('u-sub', size ? (pct + '% used · ' + fmtNum(left) + ' left') : 'Send a message to start counting.');
+    if (u.compactAt) {
+      para('u-sub', 'Auto-compact around ' + fmtNum(u.compactAt) + ' (80%)');
+    }
+    heading('Usage limits');
+    if (u.limitKind === 'credits' || u.limitWeekly) {
+      var weekPct = u.limitPct != null ? u.limitPct : 0;
+      para('u-big', weekPct + '% of weekly included');
+      para('u-sub', weekPct >= 100
+        ? 'Weekly included credits used up'
+        : ((100 - weekPct) + '% remaining this week'));
+      if (u.limitProducts && u.limitProducts.length) {
+        para('u-sub', u.limitProducts.map(function (p) {
+          return productUsageLabel(p.product) + ' ' + p.pct + '%';
+        }).join(' · '));
+      }
+      if (u.limitReset) para('u-sub', 'Resets ' + fmtReset(u.limitReset));
+      if (u.limitPrepaid != null) para('u-sub', 'Extra credits ' + fmtUSD(u.limitPrepaid));
+      if (u.limitOnDemand) row('On-demand cap', fmtUSD(u.limitOnDemand));
+      if (u.limitNote && weekPct < 100) para('u-sub', u.limitNote);
+    } else if (u.limitMonthly) {
+      para('u-big', fmtUSD(u.limitUsed) + ' / ' + fmtUSD(u.limitMonthly) + ' this month');
+      var remain = u.limitMonthly - u.limitUsed;
+      para('u-sub', remain >= 0
+        ? (fmtUSD(remain) + ' included remaining')
+        : (fmtUSD(-remain) + ' over included limit'));
+      if (u.limitReset) para('u-sub', 'Resets ' + fmtReset(u.limitReset));
+      if (u.limitOnDemand) row('On-demand cap', fmtUSD(u.limitOnDemand));
+      if (u.limitNote) para('u-sub', u.limitNote);
+    } else {
+      para('u-sub', 'Account limits load from grok when you are signed in.');
+    }
+    var manage = document.createElement('button');
+    manage.type = 'button';
+    manage.className = 'u-link';
+    manage.textContent = 'Manage on grok.com';
+    manage.addEventListener('click', function (e) {
+      e.stopPropagation();
+      openExternal('https://grok.com/?_s=usage');
+    });
+    usagePop.appendChild(manage);
+    heading('Session');
     row('Model', model);
     row('Effort', shortEffort(effort));
     row('Turns', String(turns));
     row('Tools', String(calls) + (tools !== '—' ? ' · ' + tools : ''));
-    row('Session', dur);
+    row('Duration', dur);
     usagePop.appendChild(dl);
   }
 
@@ -1859,11 +1952,96 @@
     dispatch(s, item);
   }
 
+  function composerHistKey() {
+    return 'pane-composer:' + normPath(project || '');
+  }
+
+  function composerHistList() {
+    try {
+      var raw = localStorage.getItem(composerHistKey());
+      var list = raw ? JSON.parse(raw) : [];
+      return Array.isArray(list) ? list.filter(function (x) { return typeof x === 'string' && x; }) : [];
+    } catch (e) { return []; }
+  }
+
+  function rememberComposer(text) {
+    text = String(text || '').replace(/\s+$/, '');
+    if (!text || !project) return;
+    var list = composerHistList();
+    if (list.length && list[list.length - 1] === text) {
+      composerHistIdx = -1;
+      composerHold = '';
+      return;
+    }
+    list.push(text);
+    if (list.length > 200) list = list.slice(-200);
+    try { localStorage.setItem(composerHistKey(), JSON.stringify(list)); } catch (e) {}
+    composerHistIdx = -1;
+    composerHold = '';
+  }
+
+  function composerCaret() {
+    var v = input.value;
+    var start = input.selectionStart;
+    var end = input.selectionEnd;
+    if (start !== end) return { collapsed: false };
+    return {
+      collapsed: true,
+      firstLine: v.lastIndexOf('\n', start - 1) === -1,
+      lastLine: v.indexOf('\n', start) === -1
+    };
+  }
+
+  function stepComposerHistory(dir) {
+    var list = composerHistList();
+    if (!list.length) return false;
+    var caret = composerCaret();
+    if (!caret.collapsed) return false;
+    var browsing = composerHistIdx >= 0;
+    if (!browsing) {
+      if (dir > 0) return false;
+      if (!caret.firstLine) return false;
+      composerHold = input.value;
+      composerHistIdx = list.length;
+    } else if (dir < 0 && !caret.firstLine) {
+      return false;
+    } else if (dir > 0 && !caret.lastLine) {
+      return false;
+    }
+    var next = composerHistIdx + dir;
+    if (next < 0) next = 0;
+    if (next > list.length) next = list.length;
+    composerHistIdx = next;
+    var text = composerHistIdx === list.length ? composerHold : list[composerHistIdx];
+    composerHistApplying = true;
+    input.value = text;
+    grow();
+    syncSend();
+    var pos = input.value.length;
+    input.setSelectionRange(pos, pos);
+    composerHistApplying = false;
+    return true;
+  }
+
   function send() {
-    if (!active || active.dead || !active.ws || active.ws.readyState !== 1) return;
+    var has = !!(input.value.replace(/\s+$/, '') || pending.length);
+    if (!has) return;
+    if (!project) {
+      setStatus('open a project first', 'err');
+      return;
+    }
+    if (!active || active.dead) {
+      newSession(project);
+    }
+    if (!active || active.dead) {
+      setStatus('no session', 'err');
+      return;
+    }
     var item = snapshotComposer();
+    rememberComposer(item.text);
     if (!item.text && !(item.files && item.files.length)) return;
-    if (active.busy) {
+    var ready = active.ws && active.ws.readyState === 1 && !active.busy;
+    if (!ready) {
       if (active.queue.length >= 20) {
         setStatus('queue full (20)', 'err');
         restoreComposer(item);
@@ -1874,13 +2052,23 @@
       paintQueue();
       paintSessions();
       syncSend();
+      if (!active.ws || active.ws.readyState !== 1) {
+        setStatus('connecting… queued', 'busy');
+      }
       return;
     }
     dispatch(active, item);
   }
 
   sendBtn.addEventListener('click', send);
-  input.addEventListener('input', function () { grow(); syncSend(); });
+  input.addEventListener('input', function () {
+    if (!composerHistApplying) {
+      composerHistIdx = -1;
+      composerHold = '';
+    }
+    grow();
+    syncSend();
+  });
   input.addEventListener('paste', function (e) {
     var dt = e.clipboardData;
     if (!dt) return;
@@ -1904,6 +2092,12 @@
       e.preventDefault();
       send();
       return;
+    }
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      if (stepComposerHistory(e.key === 'ArrowUp' ? -1 : 1)) {
+        e.preventDefault();
+        return;
+      }
     }
     if (e.key !== 'Escape' || !active) return;
     if (active.asking && active.askEl) {
@@ -2166,6 +2360,10 @@
   function setProject(path) {
     if (!path) return;
     path = normPath(path);
+    if (project && !samePath(project, path)) {
+      composerHistIdx = -1;
+      composerHold = '';
+    }
     project = path;
     projectBtn.textContent = projectLabel(path);
     projectBtn.title = path + ' — click to copy';
@@ -2176,7 +2374,7 @@
       loadHistory(path);
       return;
     }
-    loadHistory(path, { resume: true, prune: true });
+    loadHistory(path, { resume: true });
   }
 
   function openProject() {
@@ -2218,6 +2416,10 @@
     window.runtime.EventsOn('picker-done', function () { setPickingProject(false); });
     window.runtime.EventsOn('new-session', function () { newSession(project); });
     window.runtime.EventsOn('close-session', function () { closeSession(active); });
+    window.runtime.EventsOn('prev-session', function () { cycleSession(-1); });
+    window.runtime.EventsOn('next-session', function () { cycleSession(1); });
+    window.runtime.EventsOn('prev-project', function () { cycleProject(-1); });
+    window.runtime.EventsOn('next-project', function () { cycleProject(1); });
     window.runtime.EventsOn('request-remote-cwd', function () {
       var path = window.prompt('Project folder on the remote machine', project || '');
       if (path) setProject(path.trim());
@@ -2251,7 +2453,75 @@
     });
   }
 
+  function sessionNavList() {
+    var out = [];
+    var seen = {};
+    sessions.forEach(function (s) {
+      if (s.dead) return;
+      if (project && s.cwd && !samePath(s.cwd, project)) return;
+      var id = s.id || s.resumeID || ('live-' + s.localId);
+      seen[id] = true;
+      out.push({ live: s, id: id });
+    });
+    diskSessions.forEach(function (h) {
+      if (!h || !h.id || seen[h.id]) return;
+      out.push({ disk: h, id: h.id });
+    });
+    return out;
+  }
+
+  function cycleSession(dir) {
+    var list = sessionNavList();
+    if (!list.length) {
+      if (project) newSession(project);
+      return;
+    }
+    var cur = 0;
+    var i;
+    for (i = 0; i < list.length; i++) {
+      if (active && (list[i].live === active || list[i].id === active.id || list[i].id === active.resumeID)) {
+        cur = i;
+        break;
+      }
+    }
+    var next = list[(cur + dir + list.length * 20) % list.length];
+    if (next.live) activate(next.live);
+    else newSession(project, resumeOpts(next.disk));
+  }
+
+  function cycleProject(dir) {
+    var list = projectListCache.slice();
+    if (project) {
+      var here = normPath(project);
+      if (list.indexOf(here) < 0) list.unshift(here);
+    }
+    if (!list.length) return;
+    var cur = 0;
+    var i;
+    for (i = 0; i < list.length; i++) {
+      if (samePath(list[i], project)) {
+        cur = i;
+        break;
+      }
+    }
+    setProject(list[(cur + dir + list.length * 20) % list.length]);
+  }
+
   window.addEventListener('keydown', function (e) {
+    var meta = e.metaKey || e.ctrlKey;
+    var alt = e.altKey;
+    var shift = e.shiftKey;
+    var brack = e.key === '[' || e.key === ']' || e.code === 'BracketLeft' || e.code === 'BracketRight';
+    if (meta && shift && !alt && brack) {
+      e.preventDefault();
+      cycleSession((e.key === ']' || e.code === 'BracketRight') ? 1 : -1);
+      return;
+    }
+    if (meta && alt && !shift && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault();
+      cycleProject(e.key === 'ArrowRight' ? 1 : -1);
+      return;
+    }
     var key = (e.code === 'KeyO' || e.key === 'o' || e.key === 'O');
     var n = (e.code === 'KeyN' || e.key === 'n' || e.key === 'N');
     var w = (e.code === 'KeyW' || e.key === 'w' || e.key === 'W');
@@ -2307,10 +2577,9 @@
       try { saved = localStorage.getItem('pane-project') || ''; } catch (e) {}
     }
     function start() {
-      fetch(paneHTTP() + '/meta')
-        .then(function (r) { return r.json(); })
+      fetchJSON(paneHTTP() + '/meta')
         .then(function (meta) {
-          if (!saved) saved = meta.cwd || '';
+          if (!saved) saved = (meta && meta.cwd) || '';
           resumeBoot(saved);
         })
         .catch(function () { resumeBoot(saved); });

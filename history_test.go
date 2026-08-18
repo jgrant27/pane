@@ -150,6 +150,25 @@ func TestPruneStubSessions(t *testing.T) {
 	}
 }
 
+func TestListGrokSessionsWithoutSummary(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	cwd := t.TempDir()
+	id := "01a01252254873809b92c35df45e8471"
+	dir := filepath.Join(sessionGroupDir(cwd), id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	list := listGrokSessions(cwd, 10)
+	if len(list) != 1 || list[0].ID != id {
+		t.Fatalf("want session without summary, got %+v", list)
+	}
+	projs := listGrokProjects()
+	if len(projs) != 1 || projs[0].Sessions != 1 {
+		t.Fatalf("project must list dirs without summary.json: %+v", projs)
+	}
+}
+
 func TestListGrokProjects(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("GROK_HOME", root)

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -30,6 +31,17 @@ func TestWorkspaceIsSiblingOfRail(t *testing.T) {
 	}
 	if !strings.Contains(string(css), `grid-template-areas: "rail workspace"`) {
 		t.Fatal("style.css must keep a two-column rail/workspace grid")
+	}
+}
+
+func TestDesktopForcesWindowSize(t *testing.T) {
+	b, err := os.ReadFile("../desktop/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	if !strings.Contains(src, "OnDomReady") || !strings.Contains(src, "WindowSetSize(ctx, 1040, 680)") {
+		t.Fatal("desktop must force 1040×680 on launch (macOS restores the last frame)")
 	}
 }
 
@@ -136,10 +148,50 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "function blankSession") || !strings.Contains(src, "syncNewSession") {
 		t.Fatal("term.js must gate New session on a blank unused session")
 	}
-	if !strings.Contains(src, "loadHistory(path, { resume: true, prune: true })") {
+	if !strings.Contains(src, "loadHistory(path, { resume: true })") {
 		t.Fatal("opening a project must resume its last session")
+	}
+	if strings.Contains(src, "loadHistory(path, { resume: true, prune: true })") {
+		t.Fatal("startup must not prune stubs then mint a new session")
+	}
+	resumeFn := src[strings.Index(src, "function resumeLatest"):]
+	if i := strings.Index(resumeFn, "\n  function "); i > 0 {
+		resumeFn = resumeFn[:i]
+	}
+	if strings.Contains(resumeFn, "newSession(cwd);") || strings.Contains(resumeFn, "newSession(cwd )") {
+		t.Fatal("resumeLatest must not create a brand-new session")
 	}
 	if !strings.Contains(src, "pane-last-sid:") {
 		t.Fatal("term.js must reopen the last session for the last project")
+	}
+	if !strings.Contains(src, "function cycleSession") || !strings.Contains(src, "function cycleProject") {
+		t.Fatal("term.js must cycle sessions and projects from the keyboard")
+	}
+	if !strings.Contains(src, "Usage limits") || !strings.Contains(src, "limitMonthly") {
+		t.Fatal("usage pop must show account usage limits")
+	}
+	if !strings.Contains(src, "of weekly included") || !strings.Contains(src, "limitKind") {
+		t.Fatal("usage pop must show SuperGrok weekly credits, not leftover dollar fields")
+	}
+	if !strings.Contains(src, "connecting… queued") {
+		t.Fatal("send must queue when the session is not connected")
+	}
+	if !strings.Contains(src, "function stepComposerHistory") || !strings.Contains(src, "function rememberComposer") {
+		t.Fatal("composer must bind up/down to sent-message history")
+	}
+	if !strings.Contains(src, "ArrowUp") || !strings.Contains(src, "ArrowDown") {
+		t.Fatal("composer history must use the arrow keys")
+	}
+	if !strings.Contains(src, "fetchJSON(url)") {
+		t.Fatal("loadHistory must retry pane HTTP")
+	}
+	if !strings.Contains(src, "function paintProjectList") {
+		t.Fatal("projects rail must paint the current project even when pane is down")
+	}
+	if !strings.Contains(src, "pane not reachable") {
+		t.Fatal("a down pane must say so instead of hanging on connecting")
+	}
+	if !strings.Contains(src, "cwd-path") {
+		t.Fatal("path label must keep the leading slash")
 	}
 }

@@ -41,6 +41,7 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	runtime.WindowSetSize(ctx, 1040, 680)
 	setDockIcon(icon)
 	runtime.EventsOn(ctx, "request-open-project", func(_ ...interface{}) {
 		go a.OpenProject()
@@ -167,6 +168,11 @@ func (a *App) NewSession() {
 func (a *App) CloseSession() {
 	runtime.EventsEmit(a.ctx, "close-session")
 }
+
+func (a *App) PrevSession() { runtime.EventsEmit(a.ctx, "prev-session") }
+func (a *App) NextSession() { runtime.EventsEmit(a.ctx, "next-session") }
+func (a *App) PrevProject() { runtime.EventsEmit(a.ctx, "prev-project") }
+func (a *App) NextProject() { runtime.EventsEmit(a.ctx, "next-project") }
 
 func (a *App) CopyText(s string) {
 	if s == "" {

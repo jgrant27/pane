@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 type modelInfo struct {
@@ -113,15 +116,34 @@ func parseSessionModels(raw json.RawMessage) sessionModels {
 	return out
 }
 
+type productUsageInfo struct {
+	Product string `json:"product"`
+	Pct     int    `json:"pct"`
+}
+
 type usageInfo struct {
-	Used      int      `json:"used"`
-	Size      int      `json:"size"`
-	Pct       int      `json:"pct"`
-	Model     string   `json:"model"`
-	Turns     int      `json:"turns"`
-	ToolCalls int      `json:"toolCalls"`
-	Duration  int      `json:"duration"`
-	Tools     []string `json:"tools"`
+	Used              int                 `json:"used"`
+	Size              int                 `json:"size"`
+	Pct               int                 `json:"pct"`
+	Left              int                 `json:"left"`
+	CompactAt         int                 `json:"compactAt"`
+	Model             string              `json:"model"`
+	Turns             int                 `json:"turns"`
+	ToolCalls         int                 `json:"toolCalls"`
+	Duration          int                 `json:"duration"`
+	Tools             []string            `json:"tools"`
+	LimitKind         string              `json:"limitKind"`
+	LimitWeekly       bool                `json:"limitWeekly"`
+	LimitPct          int                 `json:"limitPct"`
+	LimitProducts     []productUsageInfo  `json:"limitProducts"`
+	LimitMonthly      int                 `json:"limitMonthly"`
+	LimitUsed         int                 `json:"limitUsed"`
+	LimitOnDemand     int                 `json:"limitOnDemand"`
+	LimitOnDemandUsed int                 `json:"limitOnDemandUsed"`
+	LimitPrepaid      int                 `json:"limitPrepaid"`
+	LimitReset        string              `json:"limitReset"`
+	LimitPeriod       string              `json:"limitPeriod"`
+	LimitNote         string              `json:"limitNote"`
 }
 
 func readSessionUsage(cwd, id string) usageInfo {
@@ -157,6 +179,10 @@ func readSessionUsage(cwd, id string) usageInfo {
 	}
 	if out.Size > 0 {
 		out.Pct = (out.Used * 100) / out.Size
+		if out.Used < out.Size {
+			out.Left = out.Size - out.Used
+		}
+		out.CompactAt = out.Size * 80 / 100
 	} else if raw.ContextWindowUsage > 0 {
 		out.Pct = raw.ContextWindowUsage
 	}
@@ -182,6 +208,146 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 		cwd = abs
 	}
 	info := readSessionUsage(cwd, id)
+	applyBilling(&info, readGrokBilling())
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(info)
+}
+
+var (
+	billingMu    sync.Mutex
+	billingCache []byte
+	billingAt    time.Time
+)
+
+var (
+	readGrokBilling = fetchGrokBilling
+	billingURL      = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+)
+
+func fetchGrokBilling() []byte {
+	billingMu.Lock()
+	defer billingMu.Unlock()
+	if billingCache != nil && time.Since(billingAt) < time.Minute {
+		return billingCache
+	}
+	key := grokAuthKey()
+	if key == "" {
+		return nil
+	}
+	req, err := http.NewRequest(http.MethodGet, billingURL, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 4 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	if err != nil || len(body) == 0 {
+		return nil
+	}
+	billingCache = body
+	billingAt = time.Now()
+	return body
+}
+
+func grokAuthKey() string {
+	b, err := os.ReadFile(filepath.Join(grokHome(), "auth.json"))
+	if err != nil {
+		return ""
+	}
+	var wrap map[string]map[string]any
+	if json.Unmarshal(b, &wrap) != nil {
+		return ""
+	}
+	for _, v := range wrap {
+		if s, ok := v["key"].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+type moneyVal struct {
+	Val float64 `json:"val"`
+}
+
+func moneyInt(v moneyVal) int {
+	if v.Val < 0 {
+		return 0
+	}
+	return int(v.Val + 0.5)
+}
+
+func applyBilling(u *usageInfo, raw []byte) {
+	if u == nil || len(raw) == 0 {
+		return
+	}
+	var wrap struct {
+		Config struct {
+			MonthlyLimit       moneyVal `json:"monthlyLimit"`
+			Used               moneyVal `json:"used"`
+			OnDemandCap        moneyVal `json:"onDemandCap"`
+			OnDemandUsed       moneyVal `json:"onDemandUsed"`
+			PrepaidBalance     moneyVal `json:"prepaidBalance"`
+			CreditUsagePercent float64  `json:"creditUsagePercent"`
+			IsUnified          bool     `json:"isUnifiedBillingUser"`
+			PeriodStart        string   `json:"billingPeriodStart"`
+			PeriodEnd          string   `json:"billingPeriodEnd"`
+			CurrentPeriod      struct {
+				Type  string `json:"type"`
+				Start string `json:"start"`
+				End   string `json:"end"`
+			} `json:"currentPeriod"`
+			ProductUsage []struct {
+				Product string  `json:"product"`
+				Pct     float64 `json:"usagePercent"`
+			} `json:"productUsage"`
+		} `json:"config"`
+	}
+	if json.Unmarshal(raw, &wrap) != nil {
+		return
+	}
+	cfg := wrap.Config
+	weekly := cfg.IsUnified || cfg.CreditUsagePercent > 0 || strings.Contains(cfg.CurrentPeriod.Type, "WEEKLY")
+	if weekly {
+		u.LimitKind = "credits"
+		u.LimitWeekly = true
+		u.LimitPct = int(cfg.CreditUsagePercent + 0.5)
+		u.LimitPrepaid = moneyInt(cfg.PrepaidBalance)
+		u.LimitOnDemand = moneyInt(cfg.OnDemandCap)
+		u.LimitOnDemandUsed = moneyInt(cfg.OnDemandUsed)
+		u.LimitPeriod = firstNonEmpty(cfg.CurrentPeriod.Start, cfg.PeriodStart)
+		u.LimitReset = firstNonEmpty(cfg.CurrentPeriod.End, cfg.PeriodEnd)
+		for _, p := range cfg.ProductUsage {
+			name := strings.TrimSpace(p.Product)
+			if name == "" {
+				continue
+			}
+			u.LimitProducts = append(u.LimitProducts, productUsageInfo{
+				Product: name,
+				Pct:     int(p.Pct + 0.5),
+			})
+		}
+		if u.LimitPct >= 100 {
+			u.LimitNote = "weekly included credits used up"
+		}
+		return
+	}
+	u.LimitKind = "usd"
+	u.LimitMonthly = moneyInt(cfg.MonthlyLimit)
+	u.LimitUsed = moneyInt(cfg.Used)
+	u.LimitOnDemand = moneyInt(cfg.OnDemandCap)
+	u.LimitPeriod = cfg.PeriodStart
+	u.LimitReset = cfg.PeriodEnd
+	if u.LimitMonthly > 0 && u.LimitUsed >= u.LimitMonthly {
+		u.LimitNote = "over monthly included limit"
+	}
 }

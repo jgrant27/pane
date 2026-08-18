@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	goruntime "runtime"
 
@@ -35,6 +36,19 @@ func main() {
 	file.AddText("Close Session", keys.CmdOrCtrl("w"), func(_ *menu.CallbackData) {
 		app.CloseSession()
 	})
+	goMenu := appMenu.AddSubmenu("Go")
+	goMenu.AddText("Previous Session", keys.Combo("[", keys.CmdOrCtrlKey, keys.ShiftKey), func(_ *menu.CallbackData) {
+		app.PrevSession()
+	})
+	goMenu.AddText("Next Session", keys.Combo("]", keys.CmdOrCtrlKey, keys.ShiftKey), func(_ *menu.CallbackData) {
+		app.NextSession()
+	})
+	goMenu.AddText("Previous Project", keys.Combo("left", keys.CmdOrCtrlKey, keys.OptionOrAltKey), func(_ *menu.CallbackData) {
+		app.PrevProject()
+	})
+	goMenu.AddText("Next Project", keys.Combo("right", keys.CmdOrCtrlKey, keys.OptionOrAltKey), func(_ *menu.CallbackData) {
+		app.NextProject()
+	})
 	file.AddText("Show Project", keys.Combo("o", keys.CmdOrCtrlKey, keys.ShiftKey), func(_ *menu.CallbackData) {
 		app.Reveal("")
 	})
@@ -57,10 +71,10 @@ func main() {
 
 	err := wails.Run(&options.App{
 		Title:            "Grok Pane",
-		Width:            1240,
-		Height:           820,
-		MinWidth:         880,
-		MinHeight:        560,
+		Width:            1040,
+		Height:           680,
+		MinWidth:         800,
+		MinHeight:        520,
 		Menu:             appMenu,
 		BackgroundColour: &options.RGBA{R: 244, G: 241, B: 234, A: 255},
 		AssetServer:      &assetserver.Options{Assets: web.FS},
@@ -69,6 +83,10 @@ func main() {
 			DisableWebViewDrop: true,
 		},
 		OnStartup:  app.startup,
+		OnDomReady: func(ctx context.Context) {
+			// macOS restores the last frame; force the smaller default.
+			runtime.WindowSetSize(ctx, 1040, 680)
+		},
 		OnShutdown: app.shutdown,
 		Bind:       []interface{}{app},
 		Mac: &mac.Options{

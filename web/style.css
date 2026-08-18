@@ -290,6 +290,10 @@ html[data-busy="true"] #spin {
 }
 #cwd:hover { color: var(--fg); }
 #cwd[hidden] { display: none; }
+#cwd .cwd-path {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
 header > button:not(#cwd) {
   appearance: none;
   background: transparent;
@@ -698,7 +702,9 @@ html.drop .composer,
   position: absolute;
   left: 0;
   bottom: calc(100% + 10px);
-  width: 17.5rem;
+  width: 18.5rem;
+  max-height: min(28rem, 70vh);
+  overflow: auto;
   z-index: 20;
   background: var(--bg);
   color: var(--fg);
@@ -710,14 +716,28 @@ html.drop .composer,
   line-height: 1.4;
 }
 .usage-pop[hidden] { display: none; }
+.usage-pop .u-link {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 0;
+  margin: 0 0 0.65rem;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.usage-pop .u-link:hover { color: var(--fg); }
 .usage-pop h3 {
-  margin: 0 0 0.45rem;
+  margin: 0.55rem 0 0.35rem;
   font-size: 11px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
   font-weight: 400;
 }
+.usage-pop h3:first-child { margin-top: 0; }
 .usage-pop .u-big {
   font-size: 14px;
   margin: 0 0 0.15rem;
