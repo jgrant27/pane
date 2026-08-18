@@ -4,7 +4,7 @@
 
 # Grok Pane
 
-A desktop window onto [`grok agent serve`](https://grok.com). The agent runs on **this machine**. Grok Pane is a face, not a second computer.
+Grok anywhere. A face for [`grok agent serve`](https://grok.com) — this desk or another machine on the tailnet. The agent stays on the box with the files. Not a second computer.
 
 Two programs:
 
