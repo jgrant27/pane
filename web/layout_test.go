@@ -136,4 +136,10 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "function blankSession") || !strings.Contains(src, "syncNewSession") {
 		t.Fatal("term.js must gate New session on a blank unused session")
 	}
+	if !strings.Contains(src, "loadHistory(path, { resume: true, prune: true })") {
+		t.Fatal("opening a project must resume its last session")
+	}
+	if !strings.Contains(src, "pane-last-sid:") {
+		t.Fatal("term.js must reopen the last session for the last project")
+	}
 }

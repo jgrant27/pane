@@ -1019,7 +1019,7 @@
     for (i = 0; i < sessions.length; i++) {
       var s = sessions[i];
       if (s.dead || s.talked) continue;
-      if (cwd && s.cwd && s.cwd !== cwd) continue;
+      if (cwd && s.cwd && !samePath(s.cwd, cwd)) continue;
       return s;
     }
     return null;
@@ -1070,7 +1070,6 @@
   function loadHistory(cwd, opts) {
     opts = opts || {};
     if (!cwd) {
-      if (opts.resume) newSession(cwd);
       return;
     }
     var keep = [];
@@ -1253,19 +1252,31 @@
   }
 
   function resumeLatest(cwd, list) {
-    var firstId = list && list[0] && list[0].id;
-    if (firstId) {
+    list = list || [];
+    var lastSid = stored('pane-last-sid:' + normPath(cwd));
+    var pick = null;
+    var i;
+    if (lastSid) {
+      for (i = 0; i < list.length; i++) {
+        if (list[i] && list[i].id === lastSid) {
+          pick = list[i];
+          break;
+        }
+      }
+    }
+    if (!pick && list[0] && list[0].id) pick = list[0];
+    if (pick && pick.id) {
       var existing = sessions.filter(function (s) {
-        return !s.dead && (s.id === firstId || s.resumeID === firstId);
+        return !s.dead && (s.id === pick.id || s.resumeID === pick.id);
       })[0];
       if (existing) {
         activate(existing);
         return;
       }
-      newSession(cwd, resumeOpts(list[0]));
+      newSession(cwd, resumeOpts(pick));
       return;
     }
-    var open = sessions.filter(function (s) { return !s.dead && s.cwd === cwd; })[0];
+    var open = sessions.filter(function (s) { return !s.dead && samePath(s.cwd, cwd); })[0];
     if (open) {
       activate(open);
       return;
@@ -2159,9 +2170,9 @@
     projectBtn.textContent = projectLabel(path);
     projectBtn.title = path + ' — click to copy';
     try { localStorage.setItem('pane-project', path); } catch (e) {}
+    paintCwd(path);
     loadProjects();
-    if (active && active.cwd === path) {
-      paintCwd(path);
+    if (active && samePath(active.cwd, path)) {
       loadHistory(path);
       return;
     }
