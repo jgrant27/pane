@@ -194,4 +194,16 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "cwd-path") {
 		t.Fatal("path label must keep the leading slash")
 	}
+	if !strings.Contains(src, "function nearBottom") || !strings.Contains(src, "this.stick") {
+		t.Fatal("streaming must not force-tail if you scrolled up")
+	}
+	if !strings.Contains(html, `id="jump-bottom"`) {
+		t.Fatal("log must have a jump-to-latest control")
+	}
+	if !strings.Contains(html, `id="autoscroll"`) || !strings.Contains(src, "pane-autoscroll") {
+		t.Fatal("header must have a persistent auto-scroll setting")
+	}
+	if !strings.Contains(src, "function bindHeaderToggle") {
+		t.Fatal("Thoughts/Follow must bind clicks that the desktop webview cannot steal")
+	}
 }

@@ -88,6 +88,22 @@ make desktop
 
 On Linux you also need GTK + WebKit (`libgtk-3-dev` and `libwebkit2gtk-4.1-dev` on Debian/Ubuntu). On Windows, install [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) if the app will not start.
 
+### Phone (iOS and Android)
+
+Native shells. They load your pane URL. The agent stays on the computer.
+
+1. On the machine with the project: `./pane -tailscale` (or use the LAN URL).
+2. In the phone app, paste that URL (`https://<host>.<tailnet>.ts.net`).
+
+```bash
+make ios          # Xcode simulator
+open mobile/ios/GrokPane.xcodeproj
+```
+
+Android: open `mobile/android` in Android Studio. No SDK is bundled.
+
+The link button (top right) changes the pane URL.
+
 ### Linux via Docker / QEMU (amd64 and arm64)
 
 Needs Docker running (Buildx). `make desktop-linux` installs QEMU binfmt itself, then builds both architectures:

@@ -2,7 +2,7 @@
 <html lang="en" data-busy="false">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Grok Pane</title>
   <meta name="color-scheme" content="light">
   <script>
@@ -15,7 +15,7 @@
   </script>
   <link rel="icon" href="favicon.png">
   <link rel="preload" href="fonts/iosevka-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css?v=48">
+  <link rel="stylesheet" href="style.css?v=53">
 </head>
 <body>
   <div id="shell">
@@ -34,10 +34,13 @@
   <div id="workspace">
     <header>
       <button type="button" id="cwd" hidden title=""></button>
-      <button type="button" id="thoughts" aria-pressed="false">Thoughts</button>
+      <button type="button" id="thoughts" aria-pressed="false" title="Reasoning hidden — click to show">Thoughts</button>
+      <button type="button" id="autoscroll" aria-pressed="true" title="Follow new output">Follow</button>
       <button type="button" id="theme">Dark</button>
     </header>
-    <main id="log"></main>
+    <main id="log">
+      <button type="button" id="jump-bottom" hidden title="Jump to latest" aria-label="Jump to latest">↓</button>
+    </main>
     <footer>
       <div id="queue" hidden></div>
       <div id="live" hidden>
@@ -89,6 +92,6 @@
   </div>
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="term.js?v=53"></script>
+  <script src="term.js?v=57"></script>
 </body>
 </html>

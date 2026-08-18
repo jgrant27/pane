@@ -12,7 +12,7 @@ ifeq ($(UNAME),Linux)
   endif
 endif
 
-.PHONY: all build install run agent agent-restart app open desktop desktop-app icon test clean deploy desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt
+.PHONY: all build install run agent agent-restart app open desktop desktop-app icon test clean deploy desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt ios android
 
 # make run            pane on :7420 — no agent spawn, no browser tab
 # make agent          grok agent serve on :2419 (same secret as pane)
@@ -20,6 +20,8 @@ endif
 # make app            desktop window
 # make open           browser tab → http://127.0.0.1:7420
 # make deploy         bump patch, commit, tag, push (BUMP=minor|major)
+# make ios            Grok Pane iOS app (simulator)
+# make android        print how to build the Android app
 
 BUMP ?= patch
 
@@ -143,6 +145,15 @@ desktop-linux-amd64: qemu-binfmt
 desktop-linux-arm64: qemu-binfmt
 	docker buildx build --builder pane --platform linux/arm64 -f ci/Dockerfile.linux \
 		--output type=local,dest=dist/linux-arm64 .
+
+ios:
+	xcodebuild -project mobile/ios/GrokPane.xcodeproj -scheme GrokPane \
+		-destination 'platform=iOS Simulator,name=iPhone 17' \
+		-configuration Debug CODE_SIGNING_ALLOWED=NO build
+
+android:
+	@echo "Open mobile/android in Android Studio and Run."
+	@echo "No Android SDK on this Mac — the project is the app."
 
 clean:
 	rm -f $(BIN) $(APP)

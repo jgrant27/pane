@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Grok Pane</string>
+    <string name="pane_url">Pane URL</string>
+    <string name="pane_url_help">Tailscale or LAN address of pane. Example: https://beelz.tailnet.ts.net</string>
+</resources>

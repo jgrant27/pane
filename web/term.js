@@ -104,6 +104,7 @@
 
   var themeBtn = document.getElementById('theme');
   var thoughtsBtn = document.getElementById('thoughts');
+  var autoScrollBtn = document.getElementById('autoscroll');
   var status = document.getElementById('status');
   var liveEl = document.getElementById('live');
   var cwdEl = document.getElementById('cwd');
@@ -122,6 +123,7 @@
   var dropEl = document.getElementById('drop');
   var pending = [];
   var logRoot = document.getElementById('log');
+  var jumpBtn = document.getElementById('jump-bottom');
   var sessionsEl = document.getElementById('sessions');
   var projectsEl = document.getElementById('projects');
   var diskSessions = [];
@@ -130,6 +132,7 @@
   var changeBtn = document.getElementById('change-project');
   var newBtn = document.getElementById('new-session');
   var showThoughts = false;
+  var autoScroll = stored('pane-autoscroll') !== '0';
   var project = '';
   var sessions = [];
   var active = null;
@@ -150,7 +153,8 @@
 
   function paintThoughtsBtn() {
     thoughtsBtn.setAttribute('aria-pressed', showThoughts ? 'true' : 'false');
-    thoughtsBtn.textContent = showThoughts ? 'Thoughts on' : 'Thoughts';
+    thoughtsBtn.textContent = 'Thoughts';
+    thoughtsBtn.title = showThoughts ? 'Showing reasoning — click to hide' : 'Reasoning hidden — click to show';
   }
   paintTheme();
   themeBtn.addEventListener('click', function () {
@@ -161,11 +165,36 @@
     try { localStorage.setItem('pane-theme', next); } catch (e) {}
     paintTheme();
   });
+  function paintAutoScrollBtn() {
+    if (!autoScrollBtn) return;
+    autoScrollBtn.setAttribute('aria-pressed', autoScroll ? 'true' : 'false');
+    autoScrollBtn.textContent = 'Follow';
+    autoScrollBtn.title = autoScroll ? 'Following new output — click to stop' : 'Not following — click to follow';
+  }
+  function bindHeaderToggle(el, fn) {
+    if (!el) return;
+    el.addEventListener('pointerdown', function (e) {
+      e.stopPropagation();
+    });
+    el.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      fn();
+    });
+  }
   paintThoughtsBtn();
-  thoughtsBtn.addEventListener('click', function () {
+  bindHeaderToggle(thoughtsBtn, function () {
     showThoughts = !showThoughts;
     paintThoughtsBtn();
     sessions.forEach(function (s) { s.showThoughts(showThoughts); });
+  });
+  paintAutoScrollBtn();
+  bindHeaderToggle(autoScrollBtn, function () {
+    autoScroll = !autoScroll;
+    try { localStorage.setItem('pane-autoscroll', autoScroll ? '1' : '0'); } catch (e) {}
+    paintAutoScrollBtn();
+    if (autoScroll && active) active.scroll(true);
+    else syncJump();
   });
 
   function setStatus(text, cls) {
@@ -482,6 +511,7 @@
     paintQueue();
     paintCatalog();
     paintUsage();
+    syncJump();
     input.focus();
   }
 
@@ -519,14 +549,39 @@
     this.toolCount = 0;
     this.askEl = null;
     this.asking = false;
+    this.stick = true;
     this.el = document.createElement('div');
     this.el.className = 'log-slot';
     this.el.setAttribute('role', 'log');
+    var slot = this;
+    this.el.addEventListener('scroll', function () {
+      if (slot.pinning) return;
+      slot.stick = nearBottom(slot.el);
+      if (slot === active) syncJump();
+    }, { passive: true });
     logRoot.appendChild(this.el);
   }
 
-  Session.prototype.scroll = function () {
+  function nearBottom(el) {
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  }
+
+  function syncJump() {
+    if (!jumpBtn) return;
+    jumpBtn.hidden = !(active && active.el && !nearBottom(active.el));
+  }
+
+  Session.prototype.scroll = function (force) {
+    if (!force && (!autoScroll || !this.stick)) {
+      if (this === active) syncJump();
+      return;
+    }
+    this.stick = true;
+    this.pinning = true;
     this.el.scrollTop = this.el.scrollHeight;
+    this.pinning = false;
+    if (this === active) syncJump();
   };
 
   Session.prototype.addYou = function (text, files) {
@@ -573,7 +628,8 @@
     this.el.appendChild(wrap);
     this.agentBuf = '';
     this.agentEl = null;
-    this.scroll();
+    if (autoScroll) this.scroll(true);
+    else syncJump();
   };
 
   Session.prototype.addOut = function (text) {
@@ -2543,8 +2599,16 @@
     }
   });
 
+  if (jumpBtn) {
+    jumpBtn.addEventListener('click', function () {
+      if (active) active.scroll(true);
+    });
+  }
+
   window.addEventListener('resize', function () {
-    if (active) active.scroll();
+    if (!active) return;
+    if (autoScroll && active.stick) active.scroll();
+    else syncJump();
   });
 
   document.addEventListener('click', function (e) {

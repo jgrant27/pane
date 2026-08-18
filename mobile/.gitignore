@@ -1,0 +1,13 @@
+.DS_Store
+xcuserdata/
+DerivedData/
+*.xcuserstate
+.gradle/
+local.properties
+**/build/
+captures/
+.idea/
+*.iml
+*.apk
+*.aab
+*.ipa

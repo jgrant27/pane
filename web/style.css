@@ -75,6 +75,8 @@ body {
   height: 100%;
   width: 100%;
   min-height: 0;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  box-sizing: border-box;
 }
 #rail {
   grid-area: rail;
@@ -304,9 +306,35 @@ header > button:not(#cwd) {
   padding: 0.15rem 0.45rem;
   cursor: pointer;
   flex: 0 0 auto;
+  --wails-draggable: no-drag;
+  --wails-drop-target: none;
+  pointer-events: auto;
 }
 header > button:not(#cwd):hover { color: var(--fg); }
-header > button[aria-pressed="true"] { color: var(--fg); border-color: var(--fg); }
+header > button[aria-pressed]::before {
+  content: "";
+  display: inline-block;
+  width: 0.5em;
+  height: 0.5em;
+  margin-right: 0.4em;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  box-sizing: border-box;
+  vertical-align: 0.05em;
+}
+header > button[aria-pressed="true"] {
+  color: var(--fg);
+  background: var(--rail);
+  border-color: var(--fg);
+}
+header > button[aria-pressed="true"]::before {
+  background: var(--ok);
+  border-color: var(--ok);
+}
+header > button[aria-pressed="false"] {
+  color: var(--dim);
+  background: transparent;
+}
 #log {
   flex: 1 1 auto;
   min-height: 0;
@@ -322,6 +350,25 @@ header > button[aria-pressed="true"] { color: var(--fg); border-color: var(--fg)
   contain: layout paint;
 }
 .log-slot.active { display: block; }
+#jump-bottom {
+  position: absolute;
+  right: 1.1rem;
+  bottom: 1rem;
+  z-index: 4;
+  width: 2.1rem;
+  height: 2.1rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+}
+#jump-bottom:hover { border-color: var(--fg); }
+#jump-bottom[hidden] { display: none; }
 .msg { margin: 0 0 0.7rem; max-width: 46rem; }
 .msg .who {
   color: var(--dim);
