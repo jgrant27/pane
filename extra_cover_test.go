@@ -73,7 +73,8 @@ func TestServePaneReuseAndStartGrok(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldStart, oldWait := startGrok, grokReadyFor
+	oldStart, oldWait, oldPath := startGrok, grokReadyFor, lookPath
+	lookPath = func(string) (string, error) { return "/bin/grok", nil }
 	grokReadyFor = 80 * time.Millisecond
 	startGrok = func(bind, secret string) (*exec.Cmd, error) {
 		cmd := exec.Command("sleep", "1")
@@ -82,7 +83,7 @@ func TestServePaneReuseAndStartGrok(t *testing.T) {
 		}
 		return cmd, nil
 	}
-	t.Cleanup(func() { startGrok, grokReadyFor = oldStart, oldWait })
+	t.Cleanup(func() { startGrok, grokReadyFor, lookPath = oldStart, oldWait, oldPath })
 	err := servePane(paneCfg{
 		listen:    freeAddr(t),
 		agentBind: freeAddr(t),
