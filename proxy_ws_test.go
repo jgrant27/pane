@@ -343,7 +343,7 @@ func TestHandleWSAskUserQuestion(t *testing.T) {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	if askRes == nil || askRes["type"] != "accepted" {
+	if askRes == nil || askRes["outcome"] != "accepted" {
 		t.Fatalf("ask result %v tool=%v", askRes, sawTool)
 	}
 	if unknown == nil || unknown["error"] == nil {

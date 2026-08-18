@@ -1086,9 +1086,9 @@ func buildAskResult(action string, answers []askAnswer, method string) any {
 	}
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "skip", "skip_interview", "dismiss":
-		return map[string]any{"type": "skip_interview"}
+		return map[string]any{"outcome": "skip_interview"}
 	case "chat", "chat_about_this":
-		return map[string]any{"type": "chat_about_this"}
+		return map[string]any{"outcome": "chat_about_this"}
 	default:
 		payload := make([]map[string]any, 0, len(answers))
 		for _, a := range answers {
@@ -1099,7 +1099,7 @@ func buildAskResult(action string, answers []askAnswer, method string) any {
 			})
 		}
 		return map[string]any{
-			"type":            "accepted",
+			"outcome":         "accepted",
 			"answers":         payload,
 			"partial_answers": []any{},
 		}

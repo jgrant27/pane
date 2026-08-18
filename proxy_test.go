@@ -158,15 +158,15 @@ func TestAskHelpers(t *testing.T) {
 	}
 
 	skip := buildAskResult("skip", nil, "").(map[string]any)
-	if skip["type"] != "skip_interview" {
+	if skip["outcome"] != "skip_interview" {
 		t.Fatal(skip)
 	}
 	chat := buildAskResult("chat", nil, "").(map[string]any)
-	if chat["type"] != "chat_about_this" {
+	if chat["outcome"] != "chat_about_this" {
 		t.Fatal(chat)
 	}
 	acc := buildAskResult("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}}, "").(map[string]any)
-	if acc["type"] != "accepted" {
+	if acc["outcome"] != "accepted" {
 		t.Fatal(acc)
 	}
 	el := buildAskResult("accept", []askAnswer{{Question: "Go?", Selected: []string{"Yes"}}}, "elicitation/create").(map[string]any)
