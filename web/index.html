@@ -15,25 +15,24 @@
   </script>
   <link rel="icon" href="favicon.png">
   <link rel="preload" href="fonts/iosevka-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css?v=23">
+  <link rel="stylesheet" href="style.css?v=41">
 </head>
 <body>
+  <div id="shell">
   <aside id="rail">
     <div class="brand">Grok Pane</div>
-    <button type="button" id="project" title="Show project folder">Open project</button>
+    <button type="button" id="project" title="Open a project folder">Open project</button>
     <button type="button" id="change-project" title="Choose a different folder">Change project…</button>
-    <button type="button" id="new-session">New session</button>
+    <button type="button" id="new-session" title="Send a message first" disabled>New session</button>
+    <div class="rail-label">Projects</div>
+    <div id="projects"></div>
     <div class="rail-label">Sessions</div>
     <div id="sessions"></div>
-    <div class="rail-label">History</div>
-    <div id="history"></div>
+    <div class="rail-label">Remote</div>
+    <div id="remote"></div>
   </aside>
   <div id="workspace">
     <header>
-      <div class="state">
-        <span id="spin" aria-hidden="true"></span>
-        <div id="status" aria-live="polite">connecting…</div>
-      </div>
       <button type="button" id="cwd" hidden title=""></button>
       <button type="button" id="thoughts" aria-pressed="false">Thoughts</button>
       <button type="button" id="theme">Dark</button>
@@ -41,14 +40,24 @@
     <main id="log"></main>
     <footer>
       <div id="queue" hidden></div>
+      <div id="live">
+        <span id="spin" aria-hidden="true"></span>
+        <div id="status" aria-live="polite">connecting…</div>
+      </div>
       <div class="composer">
+        <div id="chips" hidden></div>
         <textarea id="in" rows="2" placeholder="Message…" autocomplete="off"></textarea>
         <div class="composer-bar">
-          <div id="usage" class="usage" title="Context usage" aria-label="Context usage">
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <circle class="usage-track" cx="10" cy="10" r="7"></circle>
-              <circle id="usage-ring" class="usage-ring" cx="10" cy="10" r="7" transform="rotate(-90 10 10)"></circle>
-            </svg>
+          <button type="button" id="attach" title="Attach files or images">+</button>
+          <input type="file" id="file" hidden multiple>
+          <div class="usage-wrap">
+            <button type="button" id="usage" class="usage" title="Context usage — click for details" aria-label="Context usage" aria-expanded="false" aria-controls="usage-pop">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <circle class="usage-track" cx="10" cy="10" r="7"></circle>
+                <circle id="usage-ring" class="usage-ring" cx="10" cy="10" r="7" transform="rotate(-90 10 10)"></circle>
+              </svg>
+            </button>
+            <div id="usage-pop" class="usage-pop" hidden role="dialog" aria-label="Context usage details"></div>
           </div>
           <select id="model" aria-label="Model"></select>
           <select id="effort" aria-label="Effort"></select>
@@ -57,6 +66,18 @@
       </div>
     </footer>
   </div>
+  </div>
+  <script>
+    (function () {
+      var shell = document.getElementById('shell');
+      var rail = document.getElementById('rail');
+      var ws = document.getElementById('workspace');
+      if (!shell || !rail || !ws) return;
+      if (rail.parentNode !== shell) shell.insertBefore(rail, shell.firstChild);
+      if (ws.parentNode !== shell) shell.appendChild(ws);
+    })();
+  </script>
+  <div id="drop" hidden>Drop files to attach</div>
   <div id="modal" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-text">
       <p id="modal-text"></p>
@@ -68,6 +89,6 @@
   </div>
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="term.js?v=23"></script>
+  <script src="term.js?v=41"></script>
 </body>
 </html>

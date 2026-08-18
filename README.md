@@ -111,12 +111,15 @@ Pushes and PRs to `main` run `.github/workflows/build.yml`. Each job uploads a `
 | `windows-amd64` / `windows-arm64` | windows-latest / windows-11-arm |
 | QEMU Linux amd64 + arm64 | ubuntu-24.04 + `docker/setup-qemu-action` |
 
-Push a `v*` tag to publish those zips plus `SHA256SUMS` on a GitHub Release:
+Push a `v*` tag to publish those zips plus `SHA256SUMS` on a GitHub Release. From a clean `main`:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+make deploy              # next patch (0.2.0 → v0.2.1)
+make deploy BUMP=minor
+make deploy BUMP=major
 ```
+
+That stamps `VERSION`, the desktop plist / Wails version, and the ACP client version, commits, tags, and pushes. Working tree must be clean.
 
 Linux desktop builds use Wails’ `webkit2_41` tag (Ubuntu 24.04 has WebKit 4.1, not 4.0). Windows ARM is `continue-on-error` if that runner is missing. Intel Macs are not in CI — build locally with `make desktop-app`.
 
@@ -126,7 +129,7 @@ Linux desktop builds use Wails’ `webkit2_41` tag (Ubuntu 24.04 has WebKit 4.1,
 
 The app looks for `pane` on `http://127.0.0.1:7420`. If nothing is listening, it starts `pane` for you. `pane` starts `grok agent serve` on `:2419` if that port is free.
 
-1. **Open a project** — File → Open Project (⌘O / Ctrl+O), or the **Open project** button. After a folder is chosen, the left rail shows its name. Click the name to show the folder in Finder / Explorer / your file manager. Open Project again to switch trees.
+1. **Open a project** — File → Open Project (⌘O / Ctrl+O), or the **Open project** button. After a folder is chosen, the left rail shows its name. Click the name (or the path in the header) to copy it. **File → Show Project** (⇧⌘O) opens the folder in Finder / Explorer / your file manager. **Change project…** switches trees.
 2. **Talk** — type in the box at the bottom. **Enter** sends, **Shift+Enter** is a newline, **Esc** cancels the turn. While Grok is working, Enter **queues** a follow-up.
 3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder. **History** lists Grok’s saved sessions for this folder; click one to resume it (transcript + context).
 4. **Delete a session** — the **×** on a session or history row, then confirm. That wipes it from Grok’s on-disk history. **⌘W** / File → Close Session only closes the tab.
@@ -153,13 +156,25 @@ The server writes a secret to `~/.grok/pane.secret` on first run (or uses `-secr
 
 ## Browser only (no desktop app)
 
+`make run` starts **only** the pane server. It does not spawn `grok agent serve` and it does not open a browser tab.
+
 ```bash
-make
-./pane
-./pane -cwd ~/src/my-project
+make run                  # pane on :7420
+make agent                # grok agent serve on :2419 (other terminal)
+make agent-restart        # :2419 already taken with a different secret
+make open                 # optional: open http://127.0.0.1:7420
+make app                  # optional: desktop window
 ```
 
-Opens http://127.0.0.1:7420 — same UI. Ctrl-C stops `pane` and any agent **it** started. An agent that was already running is left alone.
+Or by hand:
+
+```bash
+make
+./pane -no-open -no-agent
+./pane -no-open -no-agent -cwd ~/src/my-project
+```
+
+Then open http://127.0.0.1:7420 yourself. Ctrl-C on `make run` stops pane. Ctrl-C on `make agent` stops the agent. An agent that was already running is left alone.
 
 ```bash
 make install              # ~/.local/bin/pane
@@ -168,13 +183,20 @@ make run ARGS='-cwd .'
 
 ---
 
-## Tailscale
+## Tailscale (another machine)
+
+On the **machine that has the project and Grok**:
 
 ```bash
 ./pane -tailscale
 ```
 
-Puts `tailscale serve` in front and requires `Tailscale-User-Login`. Hits straight to `:7420` get 403.
+That keeps `pane` on `127.0.0.1:7420`, puts `tailscale serve` in front, and requires `Tailscale-User-Login`. Loopback hits get 403. The log prints `https://<host>.<tailnet>.ts.net/`.
+
+On a **laptop on the same tailnet**:
+
+- Browser: open that `https://…ts.net/` URL. The UI and WebSocket go through Serve; the agent stays on the remote box.
+- Desktop app: **File → Connect to pane…** and paste the same URL (or start with `PANE_URL=https://host.tailnet.ts.net`). **Change project…** asks for a path *on the remote machine*. **File → Use local pane** goes back to `127.0.0.1:7420`.
 
 **Do not use `tailscale funnel`.** That publishes the page — and the agent — to the public internet.
 
@@ -200,6 +222,8 @@ Puts `tailscale serve` in front and requires `Tailscale-User-Login`. Hits straig
 | `-tailscale` | false | `tailscale serve` + identity gate |
 | `-no-agent` | false | do not start the agent |
 | `-no-open` | false | do not open a browser |
+| `-serve-agent` | false | start/check the agent, then exit |
+| `-replace-agent` | false | with `-serve-agent`, replace the listener on `-agent-bind` |
 
 ---
 

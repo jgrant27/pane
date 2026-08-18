@@ -12,7 +12,16 @@ ifeq ($(UNAME),Linux)
   endif
 endif
 
-.PHONY: all build install run desktop desktop-app icon test clean desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt
+.PHONY: all build install run agent agent-restart app open desktop desktop-app icon test clean deploy desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt
+
+# make run            pane on :7420 — no agent spawn, no browser tab
+# make agent          grok agent serve on :2419 (same secret as pane)
+# make agent-restart  replace whatever is already on :2419
+# make app            desktop window
+# make open           browser tab → http://127.0.0.1:7420
+# make deploy         bump patch, commit, tag, push (BUMP=minor|major)
+
+BUMP ?= patch
 
 all: build
 
@@ -24,7 +33,23 @@ install: build
 	install -m 755 $(BIN) $(PREFIX)/bin/$(BIN)
 
 run: build
-	./$(BIN) $(ARGS)
+	./$(BIN) -no-open -no-agent $(ARGS)
+
+agent: build
+	./$(BIN) -serve-agent
+
+agent-restart: build
+	./$(BIN) -serve-agent -replace-agent
+
+app: desktop
+	./$(APP)
+
+open:
+ifeq ($(UNAME),Darwin)
+	open http://127.0.0.1:7420
+else
+	xdg-open http://127.0.0.1:7420
+endif
 
 icon:
 	go run ./cmd/mkicon desktop/build/appicon.png
@@ -32,6 +57,33 @@ icon:
 
 test:
 	go test $(shell go list ./... | grep -v '/desktop$$')
+
+deploy: test
+	@set -e; \
+	if [ "$$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then \
+		echo "pane: deploy from main (on $$(git rev-parse --abbrev-ref HEAD))"; \
+		exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+		echo "pane: working tree dirty — commit or stash first"; \
+		exit 1; \
+	fi; \
+	git fetch --tags origin; \
+	v=$$(go run ./cmd/bump -bump "$(BUMP)" -write); \
+	git add VERSION desktop/wails.json desktop/Info.plist proxy.go; \
+	if git diff --cached --quiet; then \
+		echo "pane: files already at $$v"; \
+	else \
+		git commit -m "Bump version to $$v"; \
+	fi; \
+	if git rev-parse -q --verify "refs/tags/$$v" >/dev/null; then \
+		echo "pane: tag $$v already exists"; \
+		exit 1; \
+	fi; \
+	git tag "$$v"; \
+	git push origin HEAD; \
+	git push origin "$$v"; \
+	echo "pane: pushed $$v — GitHub Actions will publish the release"
 
 desktop: icon build
 	CGO_ENABLED=1 CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -tags "$(DESKTOP_TAGS)" -o $(APP) ./desktop

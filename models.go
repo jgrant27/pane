@@ -113,32 +113,61 @@ func parseSessionModels(raw json.RawMessage) sessionModels {
 	return out
 }
 
-func readSessionUsage(cwd, id string) (used, size int) {
+type usageInfo struct {
+	Used      int      `json:"used"`
+	Size      int      `json:"size"`
+	Pct       int      `json:"pct"`
+	Model     string   `json:"model"`
+	Turns     int      `json:"turns"`
+	ToolCalls int      `json:"toolCalls"`
+	Duration  int      `json:"duration"`
+	Tools     []string `json:"tools"`
+}
+
+func readSessionUsage(cwd, id string) usageInfo {
+	out := usageInfo{Tools: []string{}}
 	if !validSessionID(id) {
-		return 0, 0
+		return out
 	}
 	b, err := os.ReadFile(filepath.Join(sessionGroupDir(cwd), id, "signals.json"))
 	if err != nil {
-		return 0, 0
+		return out
 	}
 	var raw struct {
-		ContextTokensUsed   int `json:"contextTokensUsed"`
-		ContextWindowTokens int `json:"contextWindowTokens"`
-		ContextWindowUsage  int `json:"contextWindowUsage"`
-		TotalTokens         int `json:"totalTokens"`
+		ContextTokensUsed   int      `json:"contextTokensUsed"`
+		ContextWindowTokens int      `json:"contextWindowTokens"`
+		ContextWindowUsage  int      `json:"contextWindowUsage"`
+		TotalTokens         int      `json:"totalTokens"`
+		PrimaryModelID      string   `json:"primaryModelId"`
+		TurnCount           int      `json:"turnCount"`
+		ToolCallCount       int      `json:"toolCallCount"`
+		SessionDuration     int      `json:"sessionDurationSeconds"`
+		ToolsUsed           []string `json:"toolsUsed"`
 	}
 	if json.Unmarshal(b, &raw) != nil {
-		return 0, 0
+		return out
 	}
-	used = raw.ContextTokensUsed
-	size = raw.ContextWindowTokens
-	if used == 0 && raw.TotalTokens > 0 {
-		used = raw.TotalTokens
+	out.Used = raw.ContextTokensUsed
+	out.Size = raw.ContextWindowTokens
+	if out.Used == 0 && raw.TotalTokens > 0 {
+		out.Used = raw.TotalTokens
 	}
-	if size == 0 && raw.ContextWindowUsage > 0 && used > 0 {
-		size = used * 100 / raw.ContextWindowUsage
+	if out.Size == 0 && raw.ContextWindowUsage > 0 && out.Used > 0 {
+		out.Size = out.Used * 100 / raw.ContextWindowUsage
 	}
-	return used, size
+	if out.Size > 0 {
+		out.Pct = (out.Used * 100) / out.Size
+	} else if raw.ContextWindowUsage > 0 {
+		out.Pct = raw.ContextWindowUsage
+	}
+	out.Model = raw.PrimaryModelID
+	out.Turns = raw.TurnCount
+	out.ToolCalls = raw.ToolCallCount
+	out.Duration = raw.SessionDuration
+	if raw.ToolsUsed != nil {
+		out.Tools = raw.ToolsUsed
+	}
+	return out
 }
 
 func handleUsage(w http.ResponseWriter, r *http.Request) {
@@ -152,7 +181,7 @@ func handleUsage(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		cwd = abs
 	}
-	used, size := readSessionUsage(cwd, id)
+	info := readSessionUsage(cwd, id)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]int{"used": used, "size": size})
+	_ = json.NewEncoder(w).Encode(info)
 }

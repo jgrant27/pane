@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -28,10 +29,13 @@ type proxy struct {
 
 func (p *proxy) handleMeta(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	host, _ := os.Hostname()
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"name":   "Grok Pane",
 		"cwd":    p.cwd,
 		"listen": r.Host,
+		"host":   host,
+		"ts":     tailscaleDNS(),
 	})
 }
 
@@ -59,19 +63,9 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer browser.Close()
 
-	u, err := url.Parse(p.agentBase + "/ws")
+	agent, err := dialAgent(p.agentBase, p.secret, 8*time.Second)
 	if err != nil {
 		_ = writeJSON(browser, map[string]string{"type": "err", "text": err.Error()})
-		return
-	}
-	q := u.Query()
-	q.Set("server-key", p.secret)
-	u.RawQuery = q.Encode()
-
-	dialer := websocket.Dialer{HandshakeTimeout: 8 * time.Second}
-	agent, _, err := dialer.Dial(u.String(), nil)
-	if err != nil {
-		_ = writeJSON(browser, map[string]string{"type": "err", "text": "agent: " + err.Error()})
 		return
 	}
 	defer agent.Close()
@@ -90,6 +84,7 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("session %s cwd=%s model=%s effort=%s", s.id, s.cwd, s.model, s.effort)
+	s.live.Store(true)
 	_ = s.toBrowser(s.readyPayload())
 	s.loop()
 }
@@ -107,12 +102,15 @@ type session struct {
 	effort     string
 	contextN   int
 	models     []modelInfo
+	imageCap   bool
 
-	mu      sync.Mutex
-	bmu     sync.Mutex
-	nextID  atomic.Int64
-	pending map[int64]chan json.RawMessage
-	busy    atomic.Bool
+	mu       sync.Mutex
+	bmu      sync.Mutex
+	nextID   atomic.Int64
+	pending  map[int64]chan json.RawMessage
+	busy     atomic.Bool
+	live     atomic.Bool
+	prompted atomic.Bool
 }
 
 func (s *session) toBrowser(v any) error {
@@ -143,6 +141,7 @@ func (s *session) handshake() error {
 	if err := rpcError(init); err != nil {
 		return err
 	}
+	s.imageCap = parsePromptCaps(init)
 
 	meta := map[string]any{
 		"yoloMode": true,
@@ -229,7 +228,7 @@ func (s *session) readyPayload() map[string]any {
 }
 
 func (s *session) replayHistory() {
-	for _, ev := range replayUpdates(s.cwd, s.id, 400) {
+	for _, ev := range replayUpdates(s.cwd, s.id, 20) {
 		_ = s.toBrowser(map[string]string{"type": ev.Type, "text": ev.Text})
 	}
 }
@@ -241,20 +240,21 @@ func (s *session) loop() {
 			return
 		}
 		var msg struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-			Cwd  string `json:"cwd"`
-			ID   string `json:"id"`
+			Type  string       `json:"type"`
+			Text  string       `json:"text"`
+			Cwd   string       `json:"cwd"`
+			ID    string       `json:"id"`
+			Files []promptFile `json:"files"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
 		switch msg.Type {
 		case "in":
-			if msg.Text == "" || s.busy.Load() {
+			if (msg.Text == "" && len(msg.Files) == 0) || s.busy.Load() {
 				continue
 			}
-			go s.prompt(msg.Text)
+			go s.prompt(msg.Text, msg.Files)
 		case "cancel":
 			s.notify("session/cancel", map[string]any{"sessionId": s.id})
 		case "model":
@@ -281,12 +281,13 @@ func (s *session) loop() {
 	}
 }
 
-func (s *session) prompt(text string) {
+func (s *session) prompt(text string, files []promptFile) {
+	s.prompted.Store(true)
 	s.busy.Store(true)
 	_ = s.toBrowser(map[string]string{"type": "busy"})
 	res, err := s.rpc("session/prompt", map[string]any{
 		"sessionId": s.id,
-		"prompt":    []map[string]string{{"type": "text", "text": text}},
+		"prompt":    buildPrompt(text, files, s.cwd, s.imageCap),
 	})
 	s.busy.Store(false)
 	if err != nil {
@@ -448,8 +449,16 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	if err := json.Unmarshal(wrap.Update, &u); err != nil {
 		return
 	}
-	if u.Meta.TotalTokens > 0 {
+	if u.Meta.TotalTokens > 0 && s.live.Load() {
 		_ = s.toBrowser(map[string]any{"type": "usage", "used": u.Meta.TotalTokens, "size": s.contextN})
+	}
+	if !s.live.Load() {
+		return
+	}
+	// session/load dumps the whole transcript as updates. We already
+	// painted a short chat tail — ignore the flood until the user talks.
+	if s.resumeID != "" && !s.prompted.Load() {
+		return
 	}
 	text := contentText(u.Content)
 	switch u.SessionUpdate {
@@ -502,6 +511,99 @@ func contentText(v any) string {
 		}
 	}
 	return ""
+}
+
+type promptFile struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Mime string `json:"mime"`
+	Size int64  `json:"size"`
+}
+
+func parsePromptCaps(raw json.RawMessage) bool {
+	var wrap struct {
+		AgentCapabilities struct {
+			PromptCapabilities struct {
+				Image bool `json:"image"`
+			} `json:"promptCapabilities"`
+		} `json:"agentCapabilities"`
+	}
+	_ = json.Unmarshal(raw, &wrap)
+	return wrap.AgentCapabilities.PromptCapabilities.Image
+}
+
+func fileURI(path string) string {
+	p := filepath.ToSlash(path)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return (&url.URL{Scheme: "file", Path: p}).String()
+}
+
+func isImageMIME(m string) bool {
+	return strings.HasPrefix(strings.ToLower(m), "image/")
+}
+
+const maxImageEmbed = 8 << 20
+
+func buildPrompt(text string, files []promptFile, cwd string, imageCap bool) []map[string]any {
+	var out []map[string]any
+	text = strings.TrimSpace(text)
+	if text == "" && len(files) == 1 {
+		name := files[0].Name
+		if name == "" {
+			name = filepath.Base(files[0].Path)
+		}
+		text = "See attached file: " + name
+	} else if text == "" && len(files) > 1 {
+		text = "See attached files."
+	}
+	if text != "" {
+		out = append(out, map[string]any{"type": "text", "text": text})
+	}
+	for _, f := range files {
+		path := strings.TrimSpace(f.Path)
+		if path == "" || !underCwd(cwd, path) {
+			continue
+		}
+		name := f.Name
+		if name == "" {
+			name = filepath.Base(path)
+		}
+		link := map[string]any{
+			"type": "resource_link",
+			"uri":  fileURI(path),
+			"name": name,
+		}
+		if f.Mime != "" {
+			link["mimeType"] = f.Mime
+		}
+		if f.Size > 0 {
+			link["size"] = f.Size
+		}
+		out = append(out, link)
+		if !imageCap || !isImageMIME(f.Mime) {
+			continue
+		}
+		st, err := os.Stat(path)
+		if err != nil || st.Size() > maxImageEmbed {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		out = append(out, map[string]any{
+			"type":     "image",
+			"mimeType": f.Mime,
+			"data":     base64.StdEncoding.EncodeToString(data),
+			"uri":      fileURI(path),
+		})
+	}
+	if len(out) == 0 {
+		out = append(out, map[string]any{"type": "text", "text": text})
+	}
+	return out
 }
 
 func rpcError(raw json.RawMessage) error {

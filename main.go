@@ -36,25 +36,45 @@ func main() {
 	tailscaleFront := flag.Bool("tailscale", false, "run `tailscale serve` in front and require Tailscale identity")
 	noAgent := flag.Bool("no-agent", false, "do not start grok agent serve; only connect")
 	noOpen := flag.Bool("no-open", false, "do not open a browser")
+	serveAgentOnly := flag.Bool("serve-agent", false, "start or check grok agent serve, then exit (no HTTP UI)")
+	replaceAgent := flag.Bool("replace-agent", false, "with -serve-agent, replace whatever is on -agent-bind")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Grok Pane — local server for the Grok Pane desktop app
 
   pane
   pane -cwd ~/src/my-project
   pane -tailscale -cwd ~/src/my-project
+  pane -serve-agent
+  pane -serve-agent -replace-agent
 
-Starts grok agent serve if :2419 is free, serves the UI on :7420, opens
-the browser. The desktop app talks to this process. Secret: -secret,
+Serves the UI on :7420. make run is -no-open -no-agent (no tab, no
+spawn). make agent is -serve-agent. Secret: -secret,
 $GROK_AGENT_SECRET, $PANE_SECRET, or ~/.grok/pane.secret (created on
-first run).
+first run). An agent already bound on :2419 is reused only if the
+secret matches; otherwise it tells you to run make agent-restart.
 
 Ctrl-C stops this process and anything it started. It will not kill an
-agent that was already running. Never use tailscale funnel.
+agent that was already running unless -replace-agent. Never use
+tailscale funnel.
 
 `)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *replaceAgent && !*serveAgentOnly {
+		log.Fatal("-replace-agent requires -serve-agent")
+	}
+	if *serveAgentOnly {
+		sec, err := resolveSecret(*secret)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := serveAgent(*agentBind, sec, *replaceAgent); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	if *cwd == "" {
 		home, err := os.UserHomeDir()
@@ -78,10 +98,15 @@ agent that was already running. Never use tailscale funnel.
 		log.Fatal(err)
 	}
 
+	agentBase := strings.TrimRight(*agent, "/")
 	var agentCmd *exec.Cmd
 	if !*noAgent {
 		if tcpBusy(*agentBind) {
-			log.Printf("reusing grok agent serve on %s", *agentBind)
+			if err := probeAgent(agentBase, sec); err != nil {
+				log.Printf("%v", err)
+			} else {
+				log.Printf("reusing grok agent serve on %s", *agentBind)
+			}
 		} else {
 			if _, err := exec.LookPath("grok"); err != nil {
 				log.Fatal("grok not on PATH")
@@ -101,10 +126,14 @@ agent that was already running. Never use tailscale funnel.
 				log.Fatalf("grok agent serve: %v", err)
 			}
 		}
+	} else if !tcpBusy(*agentBind) {
+		log.Printf("no grok agent on %s — start one with: make agent", *agentBind)
+	} else if err := probeAgent(agentBase, sec); err != nil {
+		log.Printf("%v", err)
 	}
 
 	p := &proxy{
-		agentBase: strings.TrimRight(*agent, "/"),
+		agentBase: agentBase,
 		secret:    sec,
 		cwd:       *cwd,
 	}
@@ -118,8 +147,12 @@ agent that was already running. Never use tailscale funnel.
 	})
 	mux.HandleFunc("/meta", p.handleMeta)
 	mux.HandleFunc("/v1/sessions", handleSessions)
+	mux.HandleFunc("/v1/projects", handleProjects)
+	mux.HandleFunc("/v1/rename", handleRename)
 	mux.HandleFunc("/v1/transcript", handleTranscript)
 	mux.HandleFunc("/v1/usage", handleUsage)
+	mux.HandleFunc("/v1/upload", handleUpload)
+	mux.HandleFunc("/v1/remote-sessions", handleRemoteSessions)
 
 	h := http.Handler(withCORS(mux))
 	if *tailscaleFront {

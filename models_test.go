@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseSessionModels(t *testing.T) {
 	raw := []byte(`{
@@ -27,5 +31,35 @@ func TestParseSessionModels(t *testing.T) {
 	}
 	if st.Models[0].Efforts[0].ID != "xhigh" {
 		t.Fatalf("%+v", st.Models[0].Efforts)
+	}
+}
+
+func TestReadSessionUsage(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	cwd := "/Users/jgrant/stuff/demo"
+	dir := filepath.Join(sessionGroupDir(cwd), "01use")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{
+		"contextTokensUsed":18912,
+		"contextWindowTokens":500000,
+		"contextWindowUsage":3,
+		"primaryModelId":"grok-4.6",
+		"turnCount":2,
+		"toolCallCount":4,
+		"sessionDurationSeconds":50,
+		"toolsUsed":["read_file","run_terminal_command"]
+	}`)
+	if err := os.WriteFile(filepath.Join(dir, "signals.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	u := readSessionUsage(cwd, "01use")
+	if u.Used != 18912 || u.Size != 500000 || u.Model != "grok-4.6" || u.Turns != 2 {
+		t.Fatalf("%+v", u)
+	}
+	if len(u.Tools) != 2 {
+		t.Fatalf("tools %+v", u.Tools)
 	}
 }

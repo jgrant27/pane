@@ -1,5 +1,14 @@
 /* Grok Pane UI. Talks to the pane server over HTTP + WS. ACP stays in Go. */
 (function () {
+  (function hoistWorkspace() {
+    var shell = document.getElementById('shell');
+    var rail = document.getElementById('rail');
+    var ws = document.getElementById('workspace');
+    if (!shell || !rail || !ws) return;
+    if (rail.parentNode !== shell) shell.insertBefore(rail, shell.firstChild);
+    if (ws.parentNode !== shell) shell.appendChild(ws);
+  })();
+
   function currentTheme() {
     return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
   }
@@ -18,8 +27,24 @@
     } catch (e) {
       html = '<p>' + raw.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</p>';
     }
-    if (window.DOMPurify) return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    if (window.DOMPurify) {
+      return DOMPurify.sanitize(html, { USE_PROFILES: { html: true }, ADD_ATTR: ['target', 'rel'] });
+    }
     return html;
+  }
+
+  function openExternal(href) {
+    if (!href) return;
+    if (window.runtime && typeof window.runtime.BrowserOpenURL === 'function') {
+      window.runtime.BrowserOpenURL(href);
+      return;
+    }
+    var api = desktopAPI();
+    if (api && typeof api.OpenURL === 'function') {
+      Promise.resolve(api.OpenURL(href));
+      return;
+    }
+    window.open(href, '_blank', 'noopener,noreferrer');
   }
 
   function isDesktop() {
@@ -65,6 +90,7 @@
   var themeBtn = document.getElementById('theme');
   var thoughtsBtn = document.getElementById('thoughts');
   var status = document.getElementById('status');
+  var liveEl = document.getElementById('live');
   var cwdEl = document.getElementById('cwd');
   var input = document.getElementById('in');
   var sendBtn = document.getElementById('send');
@@ -73,9 +99,18 @@
   var effortEl = document.getElementById('effort');
   var usageEl = document.getElementById('usage');
   var usageRing = document.getElementById('usage-ring');
+  var usagePop = document.getElementById('usage-pop');
+  var usageWrap = document.querySelector('.usage-wrap');
+  var attachBtn = document.getElementById('attach');
+  var fileInput = document.getElementById('file');
+  var chipsEl = document.getElementById('chips');
+  var dropEl = document.getElementById('drop');
+  var pending = [];
   var logRoot = document.getElementById('log');
   var sessionsEl = document.getElementById('sessions');
-  var historyEl = document.getElementById('history');
+  var projectsEl = document.getElementById('projects');
+  var diskSessions = [];
+  var remoteEl = document.getElementById('remote');
   var projectBtn = document.getElementById('project');
   var changeBtn = document.getElementById('change-project');
   var newBtn = document.getElementById('new-session');
@@ -84,6 +119,15 @@
   var sessions = [];
   var active = null;
   var n = 0;
+  var pickingProject = false;
+
+  function setPickingProject(on) {
+    pickingProject = !!on;
+    if (changeBtn) {
+      changeBtn.disabled = pickingProject;
+      changeBtn.setAttribute('aria-busy', pickingProject ? 'true' : 'false');
+    }
+  }
 
   function paintTheme() {
     themeBtn.textContent = currentTheme() === 'dark' ? 'Light' : 'Dark';
@@ -110,12 +154,18 @@
   });
 
   function setStatus(text, cls) {
+    text = text || '';
+    cls = cls || '';
     status.textContent = text;
-    status.className = cls || '';
+    status.className = cls;
+    if (liveEl) {
+      liveEl.hidden = !text || (cls === 'ok' && text === 'ready');
+    }
   }
 
   function canSend() {
-    return active && !active.dead && active.ws && active.ws.readyState === 1 && !!input.value.replace(/\s+$/, '');
+    return active && !active.dead && active.ws && active.ws.readyState === 1 &&
+      (!!input.value.replace(/\s+$/, '') || pending.length > 0);
   }
 
   function syncSend() {
@@ -130,9 +180,8 @@
     document.documentElement.dataset.busy = on ? 'true' : 'false';
     document.documentElement.setAttribute('aria-busy', on ? 'true' : 'false');
     syncSend();
-    paintSessions();
+    refreshSessionRow(active);
     paintQueue();
-    if (!on) input.focus();
   }
 
   function setBusy(on) {
@@ -172,8 +221,17 @@
     if (val) {
       s.title = val;
       s.named = true;
+      var id = s.id || s.resumeID;
+      if (id && s.cwd) {
+        fetch(paneHTTP() + '/v1/rename?cwd=' + encodeURIComponent(s.cwd) + '&id=' + encodeURIComponent(id), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: val })
+        }).catch(function () {});
+      }
     }
     renaming = null;
+    sessPaintKey = '';
     paintSessions();
   }
 
@@ -183,10 +241,48 @@
     paintSessions();
   }
 
+  function highlightActiveSession() {
+    if (!sessionsEl) return;
+    var buttons = sessionsEl.querySelectorAll('.sess');
+    for (var i = 0; i < buttons.length; i++) {
+      var lid = +buttons[i].getAttribute('data-lid');
+      buttons[i].classList.toggle('active', !!(active && active.localId === lid));
+    }
+  }
+
+  function refreshSessionRow(s) {
+    if (!s || !sessionsEl) return;
+    var btn = sessionsEl.querySelector('.sess[data-lid="' + s.localId + '"]');
+    if (!btn) {
+      paintSessions();
+      return;
+    }
+    btn.textContent = s.title + (s.busy ? ' ·' : '') + (s.queue && s.queue.length ? ' +' + s.queue.length : '');
+    btn.title = (s.busy ? 'working… — ' : '') + (s.queue && s.queue.length ? s.queue.length + ' queued — ' : '') + 'double-click to rename';
+    if (btn.parentNode) btn.parentNode.classList.toggle('locked', !!s.busy);
+    highlightActiveSession();
+  }
+
+  var sessPaintKey = '';
+
   function paintSessions() {
     if (renaming && sessionsEl.querySelector('.sess-edit')) return;
+    var key = sessions.map(function (s) {
+      return s.localId + '\t' + s.title + '\t' + (s.busy ? '1' : '0') + '\t' + ((s.queue && s.queue.length) || 0);
+    }).join('|') + '//' + diskSessions.map(function (h) { return (h.id || '') + '\t' + (h.title || ''); }).join('|');
+    if (key === sessPaintKey && sessionsEl.firstChild && !renaming) {
+      highlightActiveSession();
+      return;
+    }
+    sessPaintKey = key;
     sessionsEl.textContent = '';
+    var seen = {};
+    var any = false;
     sessions.forEach(function (s) {
+      if (project && s.cwd && s.cwd !== project) return;
+      var sid = s.id || s.resumeID;
+      if (sid) seen[sid] = true;
+      any = true;
       var row = document.createElement('div');
       row.className = 'sess-row' + (s.busy ? ' locked' : '');
       if (renaming === s) {
@@ -219,6 +315,7 @@
       var b = document.createElement('button');
       b.type = 'button';
       b.className = 'sess' + (s === active ? ' active' : '');
+      b.setAttribute('data-lid', String(s.localId));
       b.textContent = s.title + (s.busy ? ' ·' : '') + (s.queue && s.queue.length ? ' +' + s.queue.length : '');
       b.title = (s.busy ? 'working… — ' : '') + (s.queue && s.queue.length ? s.queue.length + ' queued — ' : '') + 'double-click to rename';
       b.addEventListener('click', function () {
@@ -243,21 +340,61 @@
       row.appendChild(x);
       sessionsEl.appendChild(row);
     });
+    diskSessions.forEach(function (h) {
+      if (!h || !h.id || seen[h.id]) return;
+      any = true;
+      var row = document.createElement('div');
+      row.className = 'sess-row';
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'sess';
+      b.textContent = h.title || h.id;
+      var when = (h.updated || '').replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+      b.title = (h.id || '') + (when ? '\n' + when : '');
+      b.addEventListener('click', function () {
+        newSession(h.cwd || project, resumeOpts(h));
+      });
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'sess-close';
+      x.title = 'Delete session permanently';
+      x.textContent = '×';
+      x.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        wipeSession(h.cwd || project, h.id, h.title || h.id, null);
+      });
+      row.appendChild(b);
+      row.appendChild(x);
+      sessionsEl.appendChild(row);
+    });
+    if (!any) {
+      var empty = document.createElement('div');
+      empty.className = 'hist';
+      empty.style.cursor = 'default';
+      empty.textContent = 'no sessions';
+      sessionsEl.appendChild(empty);
+    }
   }
 
   function activate(s) {
     if (!s) return;
+    if (s === active) {
+      input.focus();
+      return;
+    }
     active = s;
     sessions.forEach(function (x) {
       if (x.el) x.el.classList.toggle('active', x === s);
     });
+    highlightActiveSession();
     paintCwd(s.cwd);
     setStatus(s.statusText || (s.busy ? 'working…' : 'ready'), s.statusCls || (s.busy ? 'busy' : 'ok'));
-    syncBusyChrome();
+    document.documentElement.dataset.busy = s.busy ? 'true' : 'false';
+    document.documentElement.setAttribute('aria-busy', s.busy ? 'true' : 'false');
+    syncSend();
     paintQueue();
     paintCatalog();
     paintUsage();
-    s.scroll();
     input.focus();
   }
 
@@ -287,6 +424,8 @@
     this.models = [];
     this.used = 0;
     this.context = 0;
+    this.usage = null;
+    this.talked = false;
     this.el = document.createElement('div');
     this.el.className = 'log-slot';
     this.el.setAttribute('role', 'log');
@@ -297,17 +436,43 @@
     this.el.scrollTop = this.el.scrollHeight;
   };
 
-  Session.prototype.addYou = function (text) {
+  Session.prototype.addYou = function (text, files) {
+    if (!this.talked) {
+      this.talked = true;
+      syncNewSession();
+    }
     var wrap = document.createElement('div');
     wrap.className = 'msg you';
     var who = document.createElement('div');
     who.className = 'who';
     who.textContent = 'you';
-    var body = document.createElement('div');
-    body.className = 'body';
-    body.textContent = text;
     wrap.appendChild(who);
-    wrap.appendChild(body);
+    if (text) {
+      var body = document.createElement('div');
+      body.className = 'body';
+      body.textContent = text;
+      wrap.appendChild(body);
+    }
+    if (files && files.length) {
+      var row = document.createElement('div');
+      row.className = 'you-files';
+      files.forEach(function (f) {
+        var chip = document.createElement('div');
+        chip.className = 'you-file';
+        if (f.preview || (f.mime && f.mime.indexOf('image/') === 0)) {
+          var img = document.createElement('img');
+          img.alt = '';
+          img.src = f.preview || '';
+          if (!img.src && f.path) img.alt = f.name || 'image';
+          if (img.src) chip.appendChild(img);
+        }
+        var lab = document.createElement('span');
+        lab.textContent = f.name || basename(f.path) || 'file';
+        chip.appendChild(lab);
+        row.appendChild(chip);
+      });
+      wrap.appendChild(row);
+    }
     this.el.appendChild(wrap);
     this.agentBuf = '';
     this.agentEl = null;
@@ -438,12 +603,13 @@
           else paintSessions();
           applyCatalog(s, msg);
           if (s === active) paintCatalog();
+          if (s.id && s.cwd) store('pane-last-sid:' + s.cwd, s.id);
           refreshUsage(s);
-          loadHistory(s.cwd);
+          scheduleHistory(s.cwd);
           flushQueue(s);
           break;
         case 'you':
-          s.addYou(msg.text || '');
+          s.addYou(msg.text || '', msg.files || []);
           break;
         case 'out':
           if (!s.startedReply) s.startedReply = true;
@@ -495,6 +661,20 @@
     };
   };
 
+  function liveToolTitle(s) {
+    var tools = s && s.tools;
+    if (!tools) return '';
+    var keys = Object.keys(tools);
+    var i;
+    for (i = keys.length - 1; i >= 0; i--) {
+      var t = tools[keys[i]];
+      if (!t) continue;
+      if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') continue;
+      return t.title || '';
+    }
+    return '';
+  }
+
   function renderTool(s, msg) {
     var id = msg.id || msg.text || 'tool';
     var prev = s.tools[id];
@@ -503,11 +683,42 @@
     if (!prev) {
       s.tools[id] = { title: title, status: st };
       s.addTool(title);
-      return;
+    } else {
+      if (title && title !== 'tool') prev.title = title;
+      if (st && st !== prev.status) prev.status = st;
     }
-    if (st && st !== prev.status && (st === 'completed' || st === 'failed' || st === 'cancelled')) {
-      prev.status = st;
+    if (s.busy) {
+      s.setChrome(liveToolTitle(s) || title || 'working…', 'busy');
     }
+  }
+
+  function resumeOpts(h) {
+    h = h || {};
+    return {
+      sid: h.id,
+      title: h.title || h.id,
+      talked: !!(h.messages > 0 || h.lastTurn)
+    };
+  }
+
+  function blankSession(cwd) {
+    cwd = cwd || project;
+    var i;
+    for (i = 0; i < sessions.length; i++) {
+      var s = sessions[i];
+      if (s.dead || s.talked) continue;
+      if (cwd && s.cwd && s.cwd !== cwd) continue;
+      return s;
+    }
+    return null;
+  }
+
+  function syncNewSession() {
+    var ok = !blankSession(project);
+    if (!newBtn) return;
+    newBtn.disabled = !ok;
+    newBtn.setAttribute('aria-disabled', ok ? 'false' : 'true');
+    newBtn.title = ok ? 'Start a new session' : 'Send a message first';
   }
 
   function newSession(cwd, opts) {
@@ -518,32 +729,167 @@
         activate(existing);
         return existing;
       }
+    } else {
+      var blank = blankSession(cwd || project);
+      if (blank) {
+        activate(blank);
+        syncNewSession();
+        return blank;
+      }
     }
     var s = new Session(cwd || project);
-    if (opts.sid) s.resumeID = opts.sid;
+    if (opts.sid) {
+      s.resumeID = opts.sid;
+      if (opts.talked) s.talked = true;
+    }
     if (opts.title) {
       s.title = opts.title;
       s.named = true;
     }
     sessions.push(s);
+    sessPaintKey = '';
+    paintSessions();
     s.connect();
     activate(s);
+    syncNewSession();
     return s;
   }
 
-  function loadHistory(cwd) {
-    if (!historyEl || !cwd) return;
-    fetch(paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd))
+  function loadHistory(cwd, opts) {
+    opts = opts || {};
+    if (!cwd) {
+      if (opts.resume) newSession(cwd);
+      return;
+    }
+    var keep = [];
+    sessions.forEach(function (s) {
+      if (s.id) keep.push(s.id);
+      if (s.resumeID && keep.indexOf(s.resumeID) < 0) keep.push(s.resumeID);
+    });
+    var url = paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd);
+    if (opts.prune) {
+      url += '&prune=1';
+      if (keep.length) url += '&keep=' + keep.map(encodeURIComponent).join(',');
+    }
+    fetch(url)
       .then(function (r) { return r.ok ? r.json() : []; })
       .then(function (list) {
-        historyEl.textContent = '';
-        var open = {};
-        sessions.forEach(function (s) {
-          if (s.id) open[s.id] = true;
-          if (s.resumeID) open[s.resumeID] = true;
+        diskSessions = list || [];
+        sessPaintKey = '';
+        applyGrokTitles(diskSessions);
+        paintSessions();
+        if (opts.resume) resumeLatest(cwd, diskSessions);
+        loadProjects();
+      })
+      .catch(function () {
+        diskSessions = [];
+        sessPaintKey = '';
+        paintSessions();
+        if (opts.resume) resumeLatest(cwd, []);
+      });
+  }
+
+  function applyGrokTitles(list) {
+    var changed = false;
+    (list || []).forEach(function (h) {
+      if (!h || !h.id || !h.title) return;
+      sessions.forEach(function (s) {
+        if (s.named) return;
+        if (s.id !== h.id && s.resumeID !== h.id) return;
+        if (s.title !== h.title) {
+          s.title = h.title;
+          changed = true;
+        }
+      });
+    });
+    if (changed) {
+      sessPaintKey = '';
+      paintSessions();
+    }
+  }
+
+  function loadProjects() {
+    if (!projectsEl) return;
+    fetch(paneHTTP() + '/v1/projects')
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (list) {
+        projectsEl.textContent = '';
+        (list || []).forEach(function (p) {
+          if (!p || !p.cwd) return;
+          var row = document.createElement('div');
+          row.className = 'sess-row';
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'hist' + (p.cwd === project ? ' active' : '');
+          b.textContent = p.name || basename(p.cwd);
+          b.title = p.cwd + (p.sessions ? '\n' + p.sessions + ' Grok sessions' : '');
+          b.addEventListener('click', function () {
+            if (p.cwd === project) return;
+            setProject(p.cwd);
+          });
+          var x = document.createElement('button');
+          x.type = 'button';
+          x.className = 'sess-close';
+          x.title = 'Delete this Grok project (all its sessions)';
+          x.textContent = '×';
+          x.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            wipeProject(p);
+          });
+          row.appendChild(b);
+          row.appendChild(x);
+          projectsEl.appendChild(row);
         });
+        if (!projectsEl.childNodes.length) {
+          var empty = document.createElement('div');
+          empty.className = 'hist';
+          empty.style.cursor = 'default';
+          empty.textContent = 'no grok projects';
+          projectsEl.appendChild(empty);
+        }
+      })
+      .catch(function () {});
+  }
+
+  var histSoon = {};
+  function scheduleHistory(cwd) {
+    if (!cwd) return;
+    if (histSoon[cwd]) clearTimeout(histSoon[cwd]);
+    histSoon[cwd] = setTimeout(function () {
+      delete histSoon[cwd];
+      loadHistory(cwd);
+    }, 600);
+  }
+
+  function resumeLatest(cwd, list) {
+    var firstId = list && list[0] && list[0].id;
+    if (firstId) {
+      var existing = sessions.filter(function (s) {
+        return !s.dead && (s.id === firstId || s.resumeID === firstId);
+      })[0];
+      if (existing) {
+        activate(existing);
+        return;
+      }
+      newSession(cwd, resumeOpts(list[0]));
+      return;
+    }
+    var open = sessions.filter(function (s) { return !s.dead && s.cwd === cwd; })[0];
+    if (open) {
+      activate(open);
+      return;
+    }
+    newSession(cwd);
+  }
+
+  function loadRemote() {
+    if (!remoteEl) return;
+    fetch(paneHTTP() + '/v1/remote-sessions')
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (list) {
+        remoteEl.textContent = '';
         (list || []).forEach(function (h) {
-          if (!h || !h.id || open[h.id]) return;
+          if (!h || !h.id) return;
           var row = document.createElement('div');
           row.className = 'sess-row';
           var b = document.createElement('button');
@@ -551,33 +897,74 @@
           b.className = 'hist';
           var title = h.title || h.id;
           b.textContent = title;
-          var when = (h.updated || '').replace('T', ' ').replace(/\.\d+Z$/, 'Z');
-          b.title = (h.id || '') + (when ? '\n' + when : '');
-          b.addEventListener('click', function () {
-            newSession(h.cwd || cwd, { sid: h.id, title: title });
-          });
-          var x = document.createElement('button');
-          x.type = 'button';
-          x.className = 'sess-close';
-          x.title = 'Delete from history permanently';
-          x.textContent = '×';
-          x.addEventListener('click', function (ev) {
-            ev.stopPropagation();
-            wipeSession(h.cwd || cwd, h.id, title, null);
-          });
+          var sub = document.createElement('span');
+          sub.className = 'hist-sub';
+          sub.textContent = (h.host || '') + (h.cwd ? ' · ' + h.cwd : '');
+          b.appendChild(document.createElement('br'));
+          b.appendChild(sub);
+          b.title = (h.origin || '') + '\n' + (h.cwd || '') + '\n' + (h.id || '');
+          b.addEventListener('click', function () { openRemote(h); });
           row.appendChild(b);
-          row.appendChild(x);
-          historyEl.appendChild(row);
+          remoteEl.appendChild(row);
         });
-        if (!historyEl.childNodes.length) {
+        if (!remoteEl.childNodes.length) {
           var empty = document.createElement('div');
           empty.className = 'hist';
           empty.style.cursor = 'default';
-          empty.textContent = 'no past sessions';
-          historyEl.appendChild(empty);
+          empty.textContent = 'no other tailnet panes';
+          remoteEl.appendChild(empty);
         }
       })
-      .catch(function () {});
+      .catch(function () {
+        if (!remoteEl.childNodes.length) {
+          var empty = document.createElement('div');
+          empty.className = 'hist';
+          empty.style.cursor = 'default';
+          empty.textContent = 'no other tailnet panes';
+          remoteEl.appendChild(empty);
+        }
+      });
+  }
+
+  function sameOrigin(a, b) {
+    try {
+      var ua = new URL(a);
+      var ub = new URL(b);
+      return ua.origin === ub.origin;
+    } catch (e) {
+      return a === b;
+    }
+  }
+
+  function openRemote(h) {
+    if (!h || !h.id) return;
+    var origin = (h.origin || '').replace(/\/$/, '');
+    if (!origin || sameOrigin(origin, paneHTTP())) {
+      if (h.cwd) setProject(h.cwd);
+      newSession(h.cwd || project, resumeOpts(h));
+      return;
+    }
+    try {
+      localStorage.setItem('pane-pending-session', JSON.stringify({
+        cwd: h.cwd || '',
+        sid: h.id,
+        title: h.title || ''
+      }));
+    } catch (e) {}
+    var api = desktopAPI();
+    if (api && typeof api.SetPaneOrigin === 'function') {
+      Promise.resolve(api.SetPaneOrigin(origin)).then(function (got) {
+        if (String(got).indexOf('error:') === 0) {
+          setStatus(got, 'err');
+          return;
+        }
+        try { localStorage.setItem('pane-url', got); } catch (e) {}
+        window.__paneOrigin = got;
+        location.reload();
+      }).catch(function () { setStatus('could not reach ' + origin, 'err'); });
+      return;
+    }
+    location.href = origin + '/?cwd=' + encodeURIComponent(h.cwd || '') + '&sid=' + encodeURIComponent(h.id) + '&title=' + encodeURIComponent(h.title || '');
   }
 
   var modalEl = document.getElementById('modal');
@@ -627,6 +1014,57 @@
     if (i >= 0) sessions.splice(i, 1);
     if (s === active) active = null;
     s.shutdown();
+    syncNewSession();
+  }
+
+  function wipeProject(p) {
+    if (!p || !p.cwd) return;
+    var name = p.name || basename(p.cwd);
+    var n = p.sessions || 0;
+    askConfirm('Delete project “' + name + '” permanently?\nThis removes all ' + n + ' Grok session' + (n === 1 ? '' : 's') + ' for\n' + p.cwd + '\nThe project files on disk stay.', function (ok) {
+      if (!ok) return;
+      var doomed = [];
+      sessions.forEach(function (s) {
+        if (s.cwd === p.cwd) doomed.push(s);
+      });
+      doomed.forEach(dropTab);
+      fetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(p.cwd), { method: 'DELETE' })
+        .then(function (r) {
+          if (!r.ok) throw new Error('delete failed');
+          setStatus('deleted project', 'ok');
+          if (project === p.cwd) {
+            project = '';
+            if (projectBtn) {
+              projectBtn.textContent = 'Open project';
+              projectBtn.title = 'Open a project folder';
+            }
+            try { localStorage.removeItem('pane-project'); } catch (e) {}
+            diskSessions = [];
+            sessPaintKey = '';
+            paintCwd('');
+            loadProjects();
+            if (!sessions.length) {
+              fetch(paneHTTP() + '/v1/projects')
+                .then(function (r) { return r.ok ? r.json() : []; })
+                .then(function (list) {
+                  if (list && list[0] && list[0].cwd) setProject(list[0].cwd);
+                  else paintSessions();
+                })
+                .catch(function () { paintSessions(); });
+              return;
+            }
+            if (!active) activate(sessions[0]);
+            paintSessions();
+            return;
+          }
+          loadProjects();
+          paintSessions();
+        })
+        .catch(function () {
+          setStatus('could not delete project', 'err');
+          loadProjects();
+        });
+    });
   }
 
   function wipeSession(cwd, id, title, tab) {
@@ -682,6 +1120,7 @@
     if (sessions.length) activate(sessions[Math.min(i, sessions.length - 1)]);
     else newSession(project);
     paintSessions();
+    syncNewSession();
     if (s.cwd) loadHistory(s.cwd);
   }
 
@@ -694,12 +1133,16 @@
     if (msg.context) s.context = +msg.context;
   }
 
+  var catalogKey = '';
   function paintCatalog() {
     if (!modelEl || !effortEl) return;
     var s = active;
     var models = (s && s.models) ? s.models : [];
     var cur = s && s.model ? s.model : stored('pane-model');
     var eff = s && s.effort ? s.effort : stored('pane-effort');
+    var key = cur + '\t' + eff + '\t' + models.map(function (m) { return m.id; }).join(',');
+    if (key === catalogKey && modelEl.options.length) return;
+    catalogKey = key;
     modelEl.textContent = '';
     if (!models.length) {
       var o = document.createElement('option');
@@ -763,10 +1206,86 @@
     usageRing.style.strokeDashoffset = String(circ * (1 - pct));
     usageEl.classList.toggle('warn', pct >= 0.7 && pct < 0.9);
     usageEl.classList.toggle('hot', pct >= 0.9);
-    var title = size ? (Math.round(pct * 100) + '% · ' + fmtNum(used) + ' / ' + fmtNum(size)) : 'Context usage';
+    var title = size ? (Math.round(pct * 100) + '% · ' + fmtNum(used) + ' / ' + fmtNum(size) + ' — click for details') : 'Context usage — click for details';
     usageEl.title = title;
     usageEl.setAttribute('aria-label', title);
+    if (usagePop && !usagePop.hidden) fillUsagePop();
   }
+
+  function fmtDur(sec) {
+    sec = Math.round(sec || 0);
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
+    return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+  }
+
+  function fillUsagePop() {
+    if (!usagePop) return;
+    var u = (active && active.usage) || {};
+    var used = (active && active.used) || u.used || 0;
+    var size = (active && active.context) || u.size || 0;
+    var pct = size > 0 ? Math.round(used * 100 / size) : (u.pct || 0);
+    var left = size > used ? size - used : 0;
+    var model = (active && active.model) || u.model || '—';
+    var effort = (active && active.effort) || '—';
+    var tools = (u.tools && u.tools.length) ? u.tools.join(', ') : '—';
+    var turns = u.turns != null ? u.turns : '—';
+    var calls = u.toolCalls != null ? u.toolCalls : '—';
+    var dur = u.duration ? fmtDur(u.duration) : '—';
+    usagePop.innerHTML = '';
+    var h = document.createElement('h3');
+    h.textContent = 'Context';
+    usagePop.appendChild(h);
+    var big = document.createElement('p');
+    big.className = 'u-big';
+    big.textContent = size ? (fmtNum(used) + ' / ' + fmtNum(size) + ' tokens') : 'No usage yet';
+    usagePop.appendChild(big);
+    var sub = document.createElement('p');
+    sub.className = 'u-sub';
+    sub.textContent = size ? (pct + '% used · ' + fmtNum(left) + ' left') : 'Send a message to start counting.';
+    usagePop.appendChild(sub);
+    var dl = document.createElement('dl');
+    function row(k, v) {
+      var dt = document.createElement('dt');
+      dt.textContent = k;
+      var dd = document.createElement('dd');
+      dd.textContent = v;
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    }
+    row('Model', model);
+    row('Effort', shortEffort(effort));
+    row('Turns', String(turns));
+    row('Tools', String(calls) + (tools !== '—' ? ' · ' + tools : ''));
+    row('Session', dur);
+    usagePop.appendChild(dl);
+  }
+
+  function setUsageOpen(on) {
+    if (!usagePop || !usageEl) return;
+    usagePop.hidden = !on;
+    usageEl.setAttribute('aria-expanded', on ? 'true' : 'false');
+    if (on) {
+      fillUsagePop();
+      if (active) refreshUsage(active);
+    }
+  }
+
+  if (usageEl) {
+    usageEl.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setUsageOpen(usagePop && usagePop.hidden);
+    });
+  }
+  if (usageWrap) {
+    usageWrap.addEventListener('click', function (e) { e.stopPropagation(); });
+  }
+  document.addEventListener('click', function () { setUsageOpen(false); });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && usagePop && !usagePop.hidden) {
+      setUsageOpen(false);
+    }
+  });
 
   function fmtNum(n) {
     n = Math.round(n || 0);
@@ -784,6 +1303,7 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (u) {
         if (!u) return;
+        s.usage = u;
         if (u.used) s.used = +u.used;
         if (u.size) s.context = +u.size;
         if (s === active) paintUsage();
@@ -822,7 +1342,8 @@
       return;
     }
     queueEl.hidden = false;
-    q.forEach(function (text, i) {
+    q.forEach(function (item, i) {
+      var text = queueText(item);
       var row = document.createElement('div');
       row.className = 'q-row';
       var mark = document.createElement('span');
@@ -835,10 +1356,10 @@
       t.title = 'Edit — put back in the composer';
       t.addEventListener('click', function () {
         if (!active) return;
-        var cur = input.value.replace(/\s+$/, '');
+        var cur = snapshotComposer();
         active.queue.splice(i, 1);
-        if (cur) active.queue.splice(i, 0, cur);
-        input.value = text;
+        if (cur.text || (cur.files && cur.files.length)) active.queue.splice(i, 0, cur);
+        restoreComposer(item);
         grow();
         paintQueue();
         paintSessions();
@@ -863,12 +1384,49 @@
     });
   }
 
-  function dispatch(s, text) {
-    if (!s || s.dead || !s.ws || s.ws.readyState !== 1) return false;
-    if (!s.named && s.title.indexOf('Session ') === 0) {
-      s.title = text.length > 28 ? text.slice(0, 28) + '…' : text;
+  function queueText(item) {
+    if (typeof item === 'string') return item;
+    var t = (item && item.text) || '';
+    var files = (item && item.files) || [];
+    if (t && files.length) return t + ' · ' + files.map(function (f) { return f.name || 'file'; }).join(', ');
+    if (t) return t;
+    if (files.length) return files.map(function (f) { return f.name || 'file'; }).join(', ');
+    return '(empty)';
+  }
+
+  function snapshotComposer() {
+    var text = input.value.replace(/\s+$/, '');
+    var files = pending.slice();
+    input.value = '';
+    pending = [];
+    paintChips();
+    grow();
+    return { text: text, files: files };
+  }
+
+  function restoreComposer(item) {
+    if (typeof item === 'string') {
+      input.value = item;
+      pending = [];
+    } else {
+      input.value = (item && item.text) || '';
+      pending = ((item && item.files) || []).slice();
     }
-    s.addYou(text);
+    paintChips();
+    grow();
+  }
+
+  function dispatch(s, item) {
+    if (!s || s.dead || !s.ws || s.ws.readyState !== 1) return false;
+    if (typeof item === 'string') item = { text: item, files: [] };
+    var text = (item && item.text) || '';
+    var files = (item && item.files) || [];
+    if (!text && !files.length) return false;
+    var label = text || queueText(item);
+    if (!s.named && s.title.indexOf('Session ') === 0) {
+      s.title = label.length > 28 ? label.slice(0, 28) + '…' : label;
+    }
+    s.addYou(text, files);
     s.startedReply = false;
     s.agentBuf = '';
     s.agentEl = null;
@@ -878,7 +1436,13 @@
     if (s === active) setBusy(true);
     else paintSessions();
     s.setChrome('working…', 'busy');
-    s.ws.send(JSON.stringify({ type: 'in', text: text }));
+    s.ws.send(JSON.stringify({
+      type: 'in',
+      text: text,
+      files: files.map(function (f) {
+        return { path: f.path, name: f.name, mime: f.mime, size: f.size };
+      })
+    }));
     return true;
   }
 
@@ -888,35 +1452,51 @@
       if (s === active) paintQueue();
       return;
     }
-    var text = s.queue.shift();
+    var item = s.queue.shift();
     if (s === active) paintQueue();
-    dispatch(s, text);
+    dispatch(s, item);
   }
 
   function send() {
-    var text = input.value.replace(/\s+$/, '');
-    if (!text || !active || active.dead || !active.ws || active.ws.readyState !== 1) return;
-    input.value = '';
-    grow();
+    if (!active || active.dead || !active.ws || active.ws.readyState !== 1) return;
+    var item = snapshotComposer();
+    if (!item.text && !(item.files && item.files.length)) return;
     if (active.busy) {
       if (active.queue.length >= 20) {
         setStatus('queue full (20)', 'err');
-        input.value = text;
-        grow();
+        restoreComposer(item);
         syncSend();
         return;
       }
-      active.queue.push(text);
+      active.queue.push(item);
       paintQueue();
       paintSessions();
       syncSend();
       return;
     }
-    dispatch(active, text);
+    dispatch(active, item);
   }
 
   sendBtn.addEventListener('click', send);
   input.addEventListener('input', function () { grow(); syncSend(); });
+  input.addEventListener('paste', function (e) {
+    var dt = e.clipboardData;
+    if (!dt) return;
+    var files = [];
+    if (dt.files && dt.files.length) {
+      files = dt.files;
+    } else if (dt.items) {
+      for (var i = 0; i < dt.items.length; i++) {
+        if (dt.items[i].kind === 'file') {
+          var f = dt.items[i].getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    if (!files.length) return;
+    e.preventDefault();
+    addFiles(files);
+  });
   input.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -936,6 +1516,225 @@
     }
   });
 
+  function dropPending(i) {
+    var f = pending[i];
+    if (!f) return;
+    pending.splice(i, 1);
+    if (f.preview) {
+      try { URL.revokeObjectURL(f.preview); } catch (e) {}
+    }
+    if (f.copied && f.path) {
+      var cwd = (active && active.cwd) || project;
+      if (cwd) {
+        fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd) + '&path=' + encodeURIComponent(f.path), { method: 'DELETE' }).catch(function () {});
+      }
+    }
+    paintChips();
+    syncSend();
+  }
+
+  function paintChips() {
+    if (!chipsEl) return;
+    chipsEl.textContent = '';
+    if (!pending.length) {
+      chipsEl.hidden = true;
+      return;
+    }
+    chipsEl.hidden = false;
+    pending.forEach(function (f, i) {
+      var chip = document.createElement('div');
+      chip.className = 'chip';
+      if (f.preview) {
+        var img = document.createElement('img');
+        img.src = f.preview;
+        img.alt = '';
+        chip.appendChild(img);
+      }
+      var lab = document.createElement('span');
+      lab.className = 'chip-name';
+      lab.textContent = f.name || 'file';
+      lab.title = f.path || f.name || '';
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'chip-x';
+      x.title = 'Remove attachment';
+      x.setAttribute('aria-label', 'Remove ' + (f.name || 'attachment'));
+      x.textContent = '×';
+      x.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        dropPending(i);
+      });
+      chip.appendChild(lab);
+      chip.appendChild(x);
+      chipsEl.appendChild(chip);
+    });
+  }
+
+  function addFiles(list) {
+    if (!list || !list.length) return;
+    var cwd = (active && active.cwd) || project;
+    if (!cwd) {
+      setStatus('open a project first', 'err');
+      return;
+    }
+    Array.prototype.forEach.call(list, function (file) {
+      if (!file) return;
+      if (file.size > 20 * 1024 * 1024) {
+        setStatus((file.name || 'file') + ' is over 20MB', 'err');
+        return;
+      }
+      var fd = new FormData();
+      fd.append('file', file, file.name || 'upload');
+      fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), { method: 'POST', body: fd })
+        .then(function (r) {
+          if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.statusText); });
+          return r.json();
+        })
+        .then(function (info) {
+          pending.push({
+            name: info.name || file.name,
+            path: info.path,
+            mime: info.mime || file.type || '',
+            size: info.size || file.size || 0,
+            copied: !!info.copied,
+            preview: (file.type && file.type.indexOf('image/') === 0) ? URL.createObjectURL(file) : ''
+          });
+          paintChips();
+          syncSend();
+        })
+        .catch(function (err) {
+          setStatus((file.name || 'file') + ': ' + ((err && err.message) || 'upload failed'), 'err');
+        });
+    });
+  }
+
+  function attachPaths(paths) {
+    var cwd = (active && active.cwd) || project;
+    if (!cwd) {
+      setStatus('open a project first', 'err');
+      return;
+    }
+    (paths || []).forEach(function (p) {
+      if (!p) return;
+      var dup = pending.some(function (f) { return f.path === p || f.name === basename(p); });
+      if (dup) return;
+      fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: p })
+      })
+        .then(function (r) {
+          if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.statusText); });
+          return r.json();
+        })
+        .then(function (info) {
+          pending.push({
+            name: info.name || basename(p),
+            path: info.path,
+            mime: info.mime || '',
+            size: info.size || 0,
+            copied: !!info.copied,
+            preview: ''
+          });
+          paintChips();
+          syncSend();
+        })
+        .catch(function (err) {
+          setStatus((basename(p) || 'file') + ': ' + ((err && err.message) || 'attach failed'), 'err');
+        });
+    });
+  }
+
+  function pickAttachments() {
+    if (pickingProject) return;
+    var api = desktopAPI();
+    if (api && typeof api.PickFiles === 'function') {
+      setPickingProject(true);
+      Promise.resolve(api.PickFiles()).then(function (paths) {
+        if (paths && paths.length) attachPaths(paths);
+      }).catch(function () { setStatus('could not open file picker', 'err'); }).then(function () {
+        setPickingProject(false);
+      });
+      return;
+    }
+    if (fileInput) fileInput.click();
+  }
+
+  if (attachBtn) {
+    attachBtn.addEventListener('click', pickAttachments);
+  }
+  if (fileInput) {
+    fileInput.addEventListener('change', function () {
+      addFiles(fileInput.files);
+      fileInput.value = '';
+    });
+  }
+  var lastDropAt = 0;
+  function takeDropPaths(x, y, paths) {
+    if (Array.isArray(x) && y == null) paths = x;
+    if (!paths && typeof x === 'string') paths = [x];
+    if (typeof paths === 'string') paths = paths.split('\n');
+    if (!paths || !paths.length) return;
+    lastDropAt = Date.now();
+    attachPaths(paths);
+    showDrop(false);
+  }
+
+  function bindNativeDrop() {
+    if (window.__paneDropBound) return true;
+    var rt = window.runtime;
+    if (rt && typeof rt.OnFileDrop === 'function') {
+      rt.OnFileDrop(function (x, y, paths) { takeDropPaths(x, y, paths); }, false);
+      window.__paneDropBound = true;
+      return true;
+    }
+    return false;
+  }
+  if (!bindNativeDrop()) {
+    var dropTries = 0;
+    var dropTimer = setInterval(function () {
+      dropTries++;
+      if (bindNativeDrop() || dropTries > 50) clearInterval(dropTimer);
+    }, 100);
+  }
+
+  function hasFiles(e) {
+    var dt = e.dataTransfer;
+    if (!dt) return false;
+    if (dt.types && (dt.types.indexOf ? dt.types.indexOf('Files') !== -1 : dt.types.contains('Files'))) return true;
+    return !!(dt.files && dt.files.length);
+  }
+
+  var dragDepth = 0;
+  function showDrop(on) {
+    document.documentElement.classList.toggle('drop', !!on);
+    if (dropEl) dropEl.hidden = !on;
+    if (!on) dragDepth = 0;
+  }
+  document.addEventListener('dragenter', function (e) {
+    if (!hasFiles(e)) return;
+    dragDepth++;
+    showDrop(true);
+  });
+  document.addEventListener('dragleave', function (e) {
+    if (!hasFiles(e) && dragDepth === 0) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) showDrop(false);
+  });
+  document.addEventListener('dragover', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  document.addEventListener('drop', function (e) {
+    showDrop(false);
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    if (Date.now() - lastDropAt < 800) return;
+    addFiles(e.dataTransfer.files);
+  });
+
   function desktopAPI() {
     return window.go && window.go.main && window.go.main.App ? window.go.main.App : null;
   }
@@ -950,63 +1749,98 @@
     if (navigator.clipboard) navigator.clipboard.writeText(path).catch(function () {});
   }
 
-  function reveal(path) {
-    if (!path) return;
-    var api = desktopAPI();
-    if (api && api.Reveal) {
-      Promise.resolve(api.Reveal(path)).catch(function () {});
-      return true;
-    }
-    return false;
-  }
-
   cwdEl.addEventListener('click', function () {
     var path = active && active.cwd;
     if (!path) return;
     copyPath(path);
-    if (!reveal(path)) {
-      setStatus('copied path', 'ok');
-    }
+    setStatus('copied path', 'ok');
   });
 
   function setProject(path) {
     if (!path) return;
     project = path;
     projectBtn.textContent = basename(path) || path;
-    projectBtn.title = path + ' — click to show in Finder';
+    projectBtn.title = path + ' — click to copy';
     try { localStorage.setItem('pane-project', path); } catch (e) {}
-    loadHistory(path);
-    if (!active || active.cwd !== path) newSession(path);
-    else paintCwd(path);
+    loadProjects();
+    if (active && active.cwd === path) {
+      paintCwd(path);
+      loadHistory(path);
+      return;
+    }
+    loadHistory(path, { resume: true, prune: true });
   }
 
   function openProject() {
-    if (railLocked()) return;
+    if (railLocked() || pickingProject) return;
     if (window.runtime && typeof window.runtime.EventsEmit === 'function') {
+      setPickingProject(true);
       window.runtime.EventsEmit('request-open-project');
       return;
     }
     var api = desktopAPI();
     if (api && typeof api.OpenProject === 'function') {
+      setPickingProject(true);
       Promise.resolve(api.OpenProject()).then(function (path) {
         if (path) setProject(path);
-      }).catch(function () {});
+      }).catch(function () {}).then(function () { setPickingProject(false); });
       return;
     }
-    var path = window.prompt('Project folder', project || '');
-    if (path) setProject(path.trim());
+    setPickingProject(true);
+    try {
+      var path = window.prompt('Project folder', project || '');
+      if (path) setProject(path.trim());
+    } finally {
+      setPickingProject(false);
+    }
   }
 
   projectBtn.addEventListener('click', function () {
-    if (project && reveal(project)) return;
+    if (project) {
+      copyPath(project);
+      setStatus('copied path', 'ok');
+      return;
+    }
     openProject();
   });
   if (changeBtn) changeBtn.addEventListener('click', openProject);
   newBtn.addEventListener('click', function () { newSession(project); });
   if (window.runtime && window.runtime.EventsOn) {
     window.runtime.EventsOn('project', function (path) { if (path) setProject(path); });
+    window.runtime.EventsOn('picker-done', function () { setPickingProject(false); });
     window.runtime.EventsOn('new-session', function () { newSession(project); });
     window.runtime.EventsOn('close-session', function () { closeSession(active); });
+    window.runtime.EventsOn('request-remote-cwd', function () {
+      var path = window.prompt('Project folder on the remote machine', project || '');
+      if (path) setProject(path.trim());
+    });
+    window.runtime.EventsOn('request-connect-pane', function () {
+      var cur = paneHTTP();
+      var u = window.prompt('Pane URL on the tailnet\n(https://machine.ts.net  or  local)', cur);
+      if (u == null) return;
+      u = String(u).trim();
+      var api = desktopAPI();
+      if (api && typeof api.SetPaneOrigin === 'function') {
+        Promise.resolve(api.SetPaneOrigin(u || 'local')).then(function (got) {
+          if (String(got).indexOf('error:') === 0) {
+            setStatus(got, 'err');
+            return;
+          }
+          try { localStorage.setItem('pane-url', got); } catch (e) {}
+          window.__paneOrigin = got;
+          location.reload();
+        }).catch(function () { setStatus('could not set pane url', 'err'); });
+        return;
+      }
+      try { localStorage.setItem('pane-url', u); } catch (e) {}
+      location.reload();
+    });
+    window.runtime.EventsOn('pane-origin', function (url) {
+      if (!url) return;
+      try { localStorage.setItem('pane-url', url); } catch (e) {}
+      window.__paneOrigin = url;
+      location.reload();
+    });
   }
 
   window.addEventListener('keydown', function (e) {
@@ -1035,21 +1869,73 @@
     if (active) active.scroll();
   });
 
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    var a = t && t.closest ? t.closest('a[href]') : null;
+    if (!a) return;
+    var href = a.getAttribute('href') || '';
+    if (!/^(https?:|mailto:)/i.test(href)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openExternal(href);
+  }, true);
+
   function boot() {
-    var saved = '';
-    try { saved = localStorage.getItem('pane-project') || ''; } catch (e) {}
-    fetch(paneHTTP() + '/meta')
-      .then(function (r) { return r.json(); })
-      .then(function (meta) {
-        if (!saved) saved = meta.cwd || '';
-        if (saved) setProject(saved);
-        else newSession('');
-      })
-      .catch(function () {
-        if (saved) setProject(saved);
-        else newSession('');
-      });
-    input.focus();
+    var q = new URLSearchParams(location.search);
+    var qCwd = q.get('cwd') || '';
+    var qSid = q.get('sid') || '';
+    var qTitle = q.get('title') || '';
+    try {
+      var pending = JSON.parse(localStorage.getItem('pane-pending-session') || 'null');
+      if (pending && pending.sid) {
+        qCwd = qCwd || pending.cwd || '';
+        qSid = qSid || pending.sid || '';
+        qTitle = qTitle || pending.title || '';
+        localStorage.removeItem('pane-pending-session');
+      }
+    } catch (e) {}
+    var saved = qCwd;
+    if (!saved) {
+      try { saved = localStorage.getItem('pane-project') || ''; } catch (e) {}
+    }
+    function start() {
+      fetch(paneHTTP() + '/meta')
+        .then(function (r) { return r.json(); })
+        .then(function (meta) {
+          if (!saved) saved = meta.cwd || '';
+          resumeBoot(saved);
+        })
+        .catch(function () { resumeBoot(saved); });
+      loadRemote();
+      loadProjects();
+      input.focus();
+    }
+    function resumeBoot(path) {
+      if (qSid) {
+        if (path) {
+          project = path;
+          projectBtn.textContent = basename(path) || path;
+          projectBtn.title = path;
+          try { localStorage.setItem('pane-project', path); } catch (e) {}
+          loadHistory(path);
+        }
+        newSession(path || project, { sid: qSid, title: qTitle });
+        return;
+      }
+      if (path) setProject(path);
+    }
+    var api = desktopAPI();
+    if (api && typeof api.PaneOrigin === 'function') {
+      Promise.resolve(api.PaneOrigin()).then(function (o) {
+        if (o) {
+          window.__paneOrigin = o;
+          try { localStorage.setItem('pane-url', o); } catch (e) {}
+        }
+        start();
+      }).catch(function () { start(); });
+      return;
+    }
+    start();
   }
   boot();
 })();

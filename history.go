@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,6 +25,13 @@ type sessionInfo struct {
 	LastTurn string `json:"lastTurn"`
 }
 
+type projectInfo struct {
+	Cwd      string `json:"cwd"`
+	Name     string `json:"name"`
+	Sessions int    `json:"sessions"`
+	Updated  string `json:"updated"`
+}
+
 func grokHome() string {
 	if h := os.Getenv("GROK_HOME"); h != "" {
 		return h
@@ -43,7 +50,13 @@ func sessionGroupDir(cwd string) string {
 func handleSessions(w http.ResponseWriter, r *http.Request) {
 	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
 	if cwd == "" {
-		http.Error(w, "cwd required", http.StatusBadRequest)
+		if r.Method == http.MethodDelete {
+			http.Error(w, "cwd required", http.StatusBadRequest)
+			return
+		}
+		list := listAllGrokSessions(40)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(list)
 		return
 	}
 	abs, err := filepath.Abs(cwd)
@@ -58,6 +71,16 @@ func handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+	if r.URL.Query().Get("prune") == "1" {
+		keep := map[string]bool{}
+		for _, id := range strings.Split(r.URL.Query().Get("keep"), ",") {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				keep[id] = true
+			}
+		}
+		pruneStubSessions(cwd, keep)
 	}
 	list := listGrokSessions(cwd, 40)
 	w.Header().Set("Content-Type", "application/json")
@@ -154,6 +177,236 @@ func deleteGrokSession(cwd, id string) error {
 	}
 	log.Printf("deleted session %s cwd=%s", id, cwd)
 	return nil
+}
+
+func decodeSessionGroup(name, dir string) string {
+	if b, err := os.ReadFile(filepath.Join(dir, ".cwd")); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" {
+			return s
+		}
+	}
+	s, err := url.PathUnescape(name)
+	if err != nil {
+		return ""
+	}
+	return s
+}
+
+func listGrokProjects() []projectInfo {
+	root := filepath.Join(grokHome(), "sessions")
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return []projectInfo{}
+	}
+	var out []projectInfo
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		group := filepath.Join(root, e.Name())
+		cwd := decodeSessionGroup(e.Name(), group)
+		if cwd == "" {
+			continue
+		}
+		if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
+			continue
+		}
+		n, latest := 0, ""
+		for _, s := range listGrokSessions(cwd, 0) {
+			if isStubSession(s) {
+				continue
+			}
+			n++
+			if s.Updated > latest {
+				latest = s.Updated
+			}
+		}
+		if n == 0 {
+			continue
+		}
+		out = append(out, projectInfo{
+			Cwd:      cwd,
+			Name:     filepath.Base(cwd),
+			Sessions: n,
+			Updated:  latest,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Updated > out[j].Updated
+	})
+	return out
+}
+
+func deleteGrokProject(cwd string) error {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return fmt.Errorf("cwd required")
+	}
+	abs, err := filepath.Abs(cwd)
+	if err == nil {
+		cwd = abs
+	}
+	group := sessionGroupDir(cwd)
+	root := filepath.Join(grokHome(), "sessions")
+	rel, err := filepath.Rel(root, group)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("bad project")
+	}
+	for _, s := range listGrokSessions(cwd, 0) {
+		if err := deleteGrokSession(cwd, s.ID); err != nil {
+			log.Printf("delete project session %s: %v", s.ID, err)
+		}
+	}
+	if err := os.RemoveAll(group); err != nil {
+		return err
+	}
+	log.Printf("deleted project cwd=%s", cwd)
+	return nil
+}
+
+func handleProjects(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(listGrokProjects())
+	case http.MethodDelete:
+		cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
+		if err := deleteGrokProject(cwd); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "GET or DELETE", http.StatusMethodNotAllowed)
+	}
+}
+
+func renameGrokSession(cwd, id, title string) error {
+	if !validSessionID(id) {
+		return os.ErrInvalid
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return fmt.Errorf("title required")
+	}
+	abs, err := filepath.Abs(cwd)
+	if err == nil {
+		cwd = abs
+	}
+	path := filepath.Join(sessionGroupDir(cwd), id, "summary.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	raw["title"] = title
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(out, '\n'), 0o644)
+}
+
+func handleRename(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if cwd == "" || id == "" {
+		http.Error(w, "cwd and id required", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "title required", http.StatusBadRequest)
+		return
+	}
+	if err := renameGrokSession(cwd, id, body.Title); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func listAllGrokSessions(limit int) []sessionInfo {
+	root := filepath.Join(grokHome(), "sessions")
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return []sessionInfo{}
+	}
+	var out []sessionInfo
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		group := filepath.Join(root, e.Name())
+		kids, err := os.ReadDir(group)
+		if err != nil {
+			continue
+		}
+		for _, k := range kids {
+			if !k.IsDir() {
+				continue
+			}
+			info, ok := readSummary(filepath.Join(group, k.Name(), "summary.json"))
+			if ok {
+				out = append(out, info)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Updated > out[j].Updated
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func looksLikeSessionID(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 20 {
+		return false
+	}
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(s), "01")
+}
+
+func isStubSession(s sessionInfo) bool {
+	if s.Messages > 1 {
+		return false
+	}
+	if s.Title == "" || s.Title == s.ID || looksLikeSessionID(s.Title) {
+		return true
+	}
+	return false
+}
+
+func pruneStubSessions(cwd string, keep map[string]bool) int {
+	n := 0
+	for _, s := range listGrokSessions(cwd, 0) {
+		if keep[s.ID] || !isStubSession(s) {
+			continue
+		}
+		if err := deleteGrokSession(cwd, s.ID); err != nil {
+			log.Printf("prune %s: %v", s.ID, err)
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func listGrokSessions(cwd string, limit int) []sessionInfo {
@@ -253,7 +506,7 @@ type replayEvent struct {
 
 func replayUpdates(cwd, id string, max int) []replayEvent {
 	if max <= 0 {
-		max = 300
+		max = 20
 	}
 	path := filepath.Join(sessionGroupDir(cwd), id, "updates.jsonl")
 	f, err := os.Open(path)
@@ -261,46 +514,83 @@ func replayUpdates(cwd, id string, max int) []replayEvent {
 		return nil
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return nil
+	}
+	const chunk = 512 << 10
+	var tail []byte
+	off := st.Size()
 	var evs []replayEvent
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
+	for off > 0 {
+		n := int64(chunk)
+		if n > off {
+			n = off
+		}
+		off -= n
+		piece := make([]byte, n)
+		if _, err := f.ReadAt(piece, off); err != nil {
+			break
+		}
+		tail = append(piece, tail...)
+		data := tail
+		if off > 0 {
+			i := bytes.IndexByte(data, '\n')
+			if i < 0 {
+				continue
+			}
+			data = data[i+1:]
+		}
+		evs = parseChatReplay(data)
+		if len(evs) >= max {
+			return evs[len(evs)-max:]
+		}
+	}
+	if len(evs) > max {
+		return evs[len(evs)-max:]
+	}
+	return evs
+}
+
+func parseChatReplay(data []byte) []replayEvent {
+	var evs []replayEvent
+	for len(data) > 0 {
+		var line []byte
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			line = data[:i]
+			data = data[i+1:]
+		} else {
+			line = data
+			data = nil
+		}
+		if len(line) == 0 || len(line) > 1<<20 {
+			continue
+		}
+		if !bytes.Contains(line, []byte(`"user_message_chunk"`)) && !bytes.Contains(line, []byte(`"agent_message_chunk"`)) {
 			continue
 		}
 		var row struct {
-			Method string `json:"method"`
 			Params struct {
 				Update struct {
 					SessionUpdate string          `json:"sessionUpdate"`
-					Title         string          `json:"title"`
 					Content       json.RawMessage `json:"content"`
 				} `json:"update"`
 			} `json:"params"`
 		}
-		if err := json.Unmarshal(line, &row); err != nil {
+		if json.Unmarshal(line, &row) != nil {
 			continue
 		}
 		kind := row.Params.Update.SessionUpdate
 		text := contentTextFromRaw(row.Params.Update.Content)
+		if text == "" {
+			continue
+		}
 		switch kind {
 		case "user_message_chunk":
 			evs = appendReplay(evs, "you", text)
 		case "agent_message_chunk":
 			evs = appendReplay(evs, "out", text)
-		case "agent_thought_chunk":
-			evs = appendReplay(evs, "thought", text)
-		case "tool_call":
-			title := row.Params.Update.Title
-			if title == "" {
-				title = "tool"
-			}
-			evs = appendReplay(evs, "tool", title)
 		}
-	}
-	if len(evs) > max {
-		evs = evs[len(evs)-max:]
 	}
 	return evs
 }
