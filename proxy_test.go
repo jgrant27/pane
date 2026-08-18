@@ -122,13 +122,26 @@ func TestAskHelpers(t *testing.T) {
 	if askFromTitle("Execute `git push origin main && git status`") != nil {
 		t.Fatal("execute title is not an ask")
 	}
-	if permissionAutoAllow("read", "Read file") == false || permissionAutoAllow("execute", "Execute git") == true {
+	if permissionAutoAllow(permHint{Kind: "read", Title: "Read file"}) == false ||
+		permissionAutoAllow(permHint{Kind: "execute", Title: "Execute git"}) == true {
 		t.Fatal("perm auto")
 	}
-	if permissionAutoAllow("", "Execute `git push`") || permissionAutoAllow("", "git push origin") {
+	if permissionAutoAllow(permHint{Title: "Execute `git push`"}) ||
+		permissionAutoAllow(permHint{Title: "git push origin"}) {
 		t.Fatal("push must wait")
 	}
-	if !permissionAutoAllow("other", "ask_user_question") || !permissionAutoAllow("", "Grep foo") {
+	if permissionAutoAllow(permHint{Kind: "Other", Title: "run_terminal_command", Command: "git push origin main"}) {
+		t.Fatal("ACP first-frame run_terminal_command must wait")
+	}
+	if permissionAutoAllow(permHint{Title: "run_terminal_command", Name: "run_terminal_command"}) {
+		t.Fatal("tool name run_terminal_command must wait")
+	}
+	ro := true
+	if !permissionAutoAllow(permHint{Kind: "execute", ReadOnly: &ro}) {
+		t.Fatal("read_only execute")
+	}
+	if !permissionAutoAllow(permHint{Kind: "other", Title: "ask_user_question"}) ||
+		!permissionAutoAllow(permHint{Title: "Grep foo"}) {
 		t.Fatal("safe auto")
 	}
 
@@ -192,6 +205,11 @@ func TestAskHelpers(t *testing.T) {
 	if rpcIDSet(s.permID) {
 		t.Fatal("read should auto-allow")
 	}
+	s.replyPermission([]byte("11"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"run_terminal_command","kind":"Other","rawInput":{"command":"git push origin main && git status"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute","read_only":false}}}}}`))
+	if !rpcIDSet(s.permID) {
+		t.Fatal("real ACP execute frame should wait")
+	}
+	s.completePerm("deny")
 	s.offerAsk([]byte("3"), "x.ai/ask_user_question", qs)
 	s.completeAsk("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}})
 	s.offerAsk([]byte("4"), "", qs)

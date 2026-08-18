@@ -435,22 +435,40 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte) {
 		Title    string          `json:"title"`
 		Kind     string          `json:"kind"`
 		RawInput json.RawMessage `json:"rawInput"`
+		Meta     struct {
+			Tool struct {
+				Name     string `json:"name"`
+				Kind     string `json:"kind"`
+				ReadOnly *bool  `json:"read_only"`
+			} `json:"x.ai/tool"`
+		} `json:"_meta"`
 	}
 	_ = json.Unmarshal(req.Params.ToolCall, &tc)
+	var in struct {
+		Command string `json:"command"`
+	}
+	_ = json.Unmarshal(tc.RawInput, &in)
+	hint := permHint{
+		Kind:     firstNonEmpty(tc.Meta.Tool.Kind, tc.Kind),
+		Title:    tc.Title,
+		Name:     tc.Meta.Tool.Name,
+		Command:  strings.TrimSpace(in.Command),
+		ReadOnly: tc.Meta.Tool.ReadOnly,
+	}
 	allow := pickPermOption(req.Params.Options, "allow_once", "allow_always", "allow")
 	deny := pickPermOption(req.Params.Options, "reject_once", "reject_always", "reject", "deny")
-	if permissionAutoAllow(tc.Kind, tc.Title) || !rpcIDSet(id) {
+	if permissionAutoAllow(hint) || !rpcIDSet(id) {
 		if allow == "" && len(req.Params.Options) > 0 {
 			allow = req.Params.Options[0].OptionID
 		}
 		s.writePermResult(id, allow)
 		return
 	}
-	var in struct {
-		Command string `json:"command"`
+	title := strings.TrimSpace(tc.Title)
+	if hint.Command != "" && (title == "" || strings.EqualFold(title, "run_terminal_command")) {
+		title = "Execute `" + hint.Command + "`"
 	}
-	_ = json.Unmarshal(tc.RawInput, &in)
-	s.offerPerm(id, tc.Title, strings.TrimSpace(in.Command), allow, deny)
+	s.offerPerm(id, title, hint.Command, allow, deny)
 }
 
 func (s *session) forwardUpdate(params json.RawMessage) {
@@ -709,25 +727,44 @@ func askFromTitle(title string) []askQuestion {
 	return []askQuestion{{Question: t}}
 }
 
-func permissionAutoAllow(kind, title string) bool {
-	if isAskTool(kind) || isAskTool(title) {
+type permHint struct {
+	Kind     string
+	Title    string
+	Name     string
+	Command  string
+	ReadOnly *bool
+}
+
+func permissionAutoAllow(h permHint) bool {
+	if isAskTool(h.Kind) || isAskTool(h.Title) || isAskTool(h.Name) {
 		return true
 	}
-	switch strings.ToLower(strings.TrimSpace(kind)) {
+	if h.ReadOnly != nil && *h.ReadOnly {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(h.Kind)) {
 	case "execute", "edit", "write", "delete", "move", "remove":
 		return false
 	case "read", "search", "fetch":
 		return true
 	}
-	t := strings.ToLower(title)
-	switch {
-	case strings.HasPrefix(t, "execute"), strings.HasPrefix(t, "run "),
-		strings.HasPrefix(t, "edit"), strings.HasPrefix(t, "write"),
-		strings.HasPrefix(t, "delete"), strings.Contains(t, "git push"),
-		strings.Contains(t, "git commit"):
+	blob := strings.ToLower(h.Title + " " + h.Name + " " + h.Kind)
+	for _, w := range []string{
+		"run_terminal", "terminal_command", "execute", "bash", "shell",
+		"git push", "git commit", "search_replace", "write_file",
+	} {
+		if strings.Contains(blob, w) {
+			return false
+		}
+	}
+	if strings.TrimSpace(h.Command) != "" {
 		return false
 	}
-	return true
+	t := strings.ToLower(h.Title + " " + h.Name)
+	if strings.Contains(t, "grep") || strings.Contains(t, "read") || strings.Contains(t, "list") {
+		return true
+	}
+	return false
 }
 
 func pickPermOption(opts []struct {
