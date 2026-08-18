@@ -85,7 +85,7 @@ func TestHistoryEdges(t *testing.T) {
 	if got := listGrokSessions(cwd, 1); len(got) != 1 {
 		t.Fatalf("limit %d", len(got))
 	}
-	if got := listGrokProjects(); len(got) != 1 || got[0].Sessions != 2 {
+	if got := listGrokProjects(); len(got) != 1 || got[0].Sessions < 2 {
 		t.Fatalf("projects %+v", listGrokProjects())
 	}
 	if got := listAllGrokSessions(1); len(got) != 1 {

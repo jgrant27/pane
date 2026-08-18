@@ -168,6 +168,76 @@ func TestListGrokProjects(t *testing.T) {
 	}
 }
 
+func TestRenameGrokProject(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	cwd := t.TempDir()
+	if err := renameGrokProject(cwd, "LEGEND Case"); err != nil {
+		t.Fatal(err)
+	}
+	if projectDisplayName(cwd, sessionGroupDir(cwd)) != "LEGEND Case" {
+		t.Fatal(projectDisplayName(cwd, sessionGroupDir(cwd)))
+	}
+	id := "01projnamexxxxxxxxxxxxxxxxxx"
+	dir := filepath.Join(sessionGroupDir(cwd), id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := []byte(`{"info":{"id":"` + id + `","cwd":"` + cwd + `"},"generated_title":"Hi","num_messages":2}`)
+	if err := os.WriteFile(filepath.Join(dir, "summary.json"), sum, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	list := listGrokProjects()
+	if len(list) != 1 || list[0].Name != "LEGEND Case" {
+		t.Fatalf("%+v", list)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects?cwd="+cwd, strings.NewReader(`{"name":"Case file"}`))
+	handleProjects(rec, req)
+	if rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if projectDisplayName(cwd, sessionGroupDir(cwd)) != "Case file" {
+		t.Fatal(projectDisplayName(cwd, sessionGroupDir(cwd)))
+	}
+	if err := renameGrokProject(cwd, ""); err != nil {
+		t.Fatal(err)
+	}
+	if projectDisplayName(cwd, sessionGroupDir(cwd)) != filepath.Base(cwd) {
+		t.Fatal(projectDisplayName(cwd, sessionGroupDir(cwd)))
+	}
+	if err := renameGrokProject(cwd, "a/b"); err == nil {
+		t.Fatal("slash allowed")
+	}
+	if err := renameGrokProject("", "x"); err == nil {
+		t.Fatal("empty cwd")
+	}
+	rec = httptest.NewRecorder()
+	handleProjects(rec, httptest.NewRequest(http.MethodPost, "/v1/projects?cwd="+cwd, strings.NewReader("{")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatal(rec.Code)
+	}
+}
+
+func TestListGrokProjectsIncludesStubOnly(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	cwd := t.TempDir()
+	id := "01aaaaaaaaaaaaaaaaaaaaaaaa"
+	dir := filepath.Join(sessionGroupDir(cwd), id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := []byte(`{"info":{"id":"` + id + `","cwd":"` + cwd + `"},"generated_title":"` + id + `","num_messages":1}`)
+	if err := os.WriteFile(filepath.Join(dir, "summary.json"), sum, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	list := listGrokProjects()
+	if len(list) != 1 || list[0].Cwd != cwd || list[0].Sessions != 1 {
+		t.Fatalf("stub-only project missing: %+v", list)
+	}
+}
+
 func TestDeleteGrokProject(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("GROK_HOME", root)

@@ -198,10 +198,23 @@
     input.style.height = Math.min(input.scrollHeight, 144) + 'px';
   }
 
+  function normPath(p) {
+    p = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    return p;
+  }
+
+  function samePath(a, b) {
+    return normPath(a) === normPath(b);
+  }
+
   function basename(p) {
     if (!p) return '';
-    var parts = p.replace(/\\/g, '/').split('/');
+    var parts = normPath(p).split('/');
     return parts[parts.length - 1] || p;
+  }
+
+  function looksLikeSessionID(s) {
+    return /^01[0-9a-fA-F-]{20,}$/.test(String(s || ''));
   }
 
   function paintCwd(path) {
@@ -215,19 +228,31 @@
   }
 
   var renaming = null;
+  var renamingProject = null;
+  var projectNames = {};
+
+  function projectLabel(cwd) {
+    return projectNames[normPath(cwd)] || basename(cwd);
+  }
 
   function commitRename(s, val) {
     val = String(val || '').replace(/\s+/g, ' ').trim();
     if (val) {
+      var id = s.id || s.resumeID;
+      var cwd = s.cwd || project;
       s.title = val;
       s.named = true;
-      var id = s.id || s.resumeID;
-      if (id && s.cwd) {
-        fetch(paneHTTP() + '/v1/rename?cwd=' + encodeURIComponent(s.cwd) + '&id=' + encodeURIComponent(id), {
+      if (id && cwd) {
+        fetch(paneHTTP() + '/v1/rename?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title: val })
         }).catch(function () {});
+      }
+      if (s.disk) {
+        diskSessions.forEach(function (h) {
+          if (h && h.id === id) h.title = val;
+        });
       }
     }
     renaming = null;
@@ -238,6 +263,7 @@
   function startRename(s) {
     if (!s || renaming === s) return;
     renaming = s;
+    sessPaintKey = '';
     paintSessions();
   }
 
@@ -279,7 +305,7 @@
     var seen = {};
     var any = false;
     sessions.forEach(function (s) {
-      if (project && s.cwd && s.cwd !== project) return;
+      if (project && s.cwd && !samePath(s.cwd, project)) return;
       var sid = s.id || s.resumeID;
       if (sid) seen[sid] = true;
       any = true;
@@ -319,7 +345,10 @@
       b.textContent = s.title + (s.busy ? ' ·' : '') + (s.queue && s.queue.length ? ' +' + s.queue.length : '');
       b.title = (s.busy ? 'working… — ' : '') + (s.queue && s.queue.length ? s.queue.length + ' queued — ' : '') + 'double-click to rename';
       b.addEventListener('click', function () {
-        if (s === active) return;
+        if (s === active) {
+          startRename(s);
+          return;
+        }
         activate(s);
       });
       b.addEventListener('dblclick', function (ev) {
@@ -345,14 +374,46 @@
       any = true;
       var row = document.createElement('div');
       row.className = 'sess-row';
+      if (renaming && renaming.disk && renaming.id === h.id) {
+        var inp2 = document.createElement('input');
+        inp2.type = 'text';
+        inp2.className = 'sess-edit';
+        inp2.value = h.title || h.id;
+        inp2.setAttribute('aria-label', 'Session name');
+        inp2.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            commitRename(renaming, inp2.value);
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            renaming = null;
+            paintSessions();
+          }
+          e.stopPropagation();
+        });
+        inp2.addEventListener('blur', function () { commitRename(renaming, inp2.value); });
+        row.appendChild(inp2);
+        sessionsEl.appendChild(row);
+        setTimeout(function () {
+          inp2.focus();
+          inp2.select();
+        }, 0);
+        return;
+      }
       var b = document.createElement('button');
       b.type = 'button';
       b.className = 'sess';
       b.textContent = h.title || h.id;
       var when = (h.updated || '').replace('T', ' ').replace(/\.\d+Z$/, 'Z');
-      b.title = (h.id || '') + (when ? '\n' + when : '');
+      b.title = (h.id || '') + (when ? '\n' + when : '') + '\ndouble-click to rename';
       b.addEventListener('click', function () {
         newSession(h.cwd || project, resumeOpts(h));
+      });
+      b.addEventListener('dblclick', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        startRename({ disk: true, id: h.id, cwd: h.cwd || project, title: h.title || h.id });
       });
       var x = document.createElement('button');
       x.type = 'button';
@@ -426,6 +487,12 @@
     this.context = 0;
     this.usage = null;
     this.talked = false;
+    this.toolsBox = null;
+    this.toolsList = null;
+    this.toolsSum = null;
+    this.toolCount = 0;
+    this.askEl = null;
+    this.asking = false;
     this.el = document.createElement('div');
     this.el.className = 'log-slot';
     this.el.setAttribute('role', 'log');
@@ -437,6 +504,10 @@
   };
 
   Session.prototype.addYou = function (text, files) {
+    this.toolsBox = null;
+    this.toolsList = null;
+    this.toolsSum = null;
+    this.toolCount = 0;
     if (!this.talked) {
       this.talked = true;
       syncNewSession();
@@ -547,11 +618,155 @@
   };
 
   Session.prototype.addTool = function (title) {
-    var wrap = document.createElement('div');
-    wrap.className = 'msg tool';
-    wrap.textContent = '· ' + title;
-    this.el.appendChild(wrap);
+    title = String(title || 'tool');
+    if (!this.toolsBox) {
+      var box = document.createElement('details');
+      box.className = 'msg tools';
+      var sum = document.createElement('summary');
+      var list = document.createElement('div');
+      list.className = 'tool-list';
+      box.appendChild(sum);
+      box.appendChild(list);
+      this.el.appendChild(box);
+      this.toolsBox = box;
+      this.toolsList = list;
+      this.toolsSum = sum;
+      this.toolCount = 0;
+    }
+    this.toolCount++;
+    var row = document.createElement('div');
+    row.textContent = title;
+    this.toolsList.appendChild(row);
+    this.toolsSum.textContent = this.toolCount === 1 ? title : (this.toolCount + ' tools · ' + title);
     this.scroll();
+  };
+
+  Session.prototype.addAsk = function (msg) {
+    var s = this;
+    var questions = (msg && msg.questions) || [];
+    if (!questions.length) {
+      questions = [{ question: 'Grok has a question.', options: [] }];
+    }
+    if (s.askEl && s.askEl.parentNode) {
+      s.askEl.parentNode.removeChild(s.askEl);
+    }
+    s.asking = true;
+    var wrap = document.createElement('div');
+    wrap.className = 'msg ask';
+    var who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = 'grok asks';
+    wrap.appendChild(who);
+    var chosen = questions.map(function () { return []; });
+    var multiFlags = [];
+    questions.forEach(function (q, qi) {
+      var block = document.createElement('div');
+      block.className = 'ask-q';
+      var title = document.createElement('div');
+      title.className = 'ask-title';
+      title.textContent = q.question || q.header || 'Question';
+      block.appendChild(title);
+      var opts = document.createElement('div');
+      opts.className = 'ask-opts';
+      var multi = !!(q.multiSelect || q.multi_select);
+      multiFlags[qi] = multi;
+      var optionList = q.options || [];
+      optionList.forEach(function (o, oi) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ask-opt';
+        var lab = document.createElement('div');
+        lab.className = 'ask-label';
+        lab.textContent = (oi + 1) + '. ' + (o.label || 'option');
+        b.appendChild(lab);
+        if (o.description) {
+          var d = document.createElement('div');
+          d.className = 'ask-desc';
+          d.textContent = o.description;
+          b.appendChild(d);
+        }
+        b.addEventListener('click', function () {
+          if (!s.asking) return;
+          if (multi) {
+            var i = chosen[qi].indexOf(o.label);
+            if (i >= 0) chosen[qi].splice(i, 1);
+            else chosen[qi].push(o.label);
+            b.classList.toggle('on', i < 0);
+            return;
+          }
+          chosen[qi] = [o.label];
+          var siblings = opts.querySelectorAll('.ask-opt');
+          for (var j = 0; j < siblings.length; j++) siblings[j].classList.toggle('on', siblings[j] === b);
+          if (questions.length === 1) finish(collect(), 'accept');
+        });
+        opts.appendChild(b);
+      });
+      block.appendChild(opts);
+      wrap.appendChild(block);
+    });
+    var actions = document.createElement('div');
+    actions.className = 'ask-actions';
+    var needsSubmit = questions.length > 1 || multiFlags.some(function (m) { return m; });
+    if (needsSubmit) {
+      var submit = document.createElement('button');
+      submit.type = 'button';
+      submit.className = 'ask-submit';
+      submit.textContent = 'Submit';
+      submit.addEventListener('click', function () {
+        if (!s.asking) return;
+        var answers = collect();
+        if (!answers.length || answers.some(function (a) { return !a.selected.length; })) return;
+        finish(answers, 'accept');
+      });
+      actions.appendChild(submit);
+    }
+    var skip = document.createElement('button');
+    skip.type = 'button';
+    skip.className = 'ask-skip';
+    skip.textContent = 'Skip';
+    skip.addEventListener('click', function () {
+      if (!s.asking) return;
+      finish([], 'skip');
+    });
+    actions.appendChild(skip);
+    wrap.appendChild(actions);
+    s.el.appendChild(wrap);
+    s.askEl = wrap;
+    s.scroll();
+
+    function collect() {
+      return questions.map(function (q, i) {
+        return { question: q.question || '', selected: (chosen[i] || []).slice() };
+      });
+    }
+
+    function finish(answers, action) {
+      if (!s.asking) return;
+      s.asking = false;
+      wrap.classList.add('done');
+      var buttons = wrap.querySelectorAll('button');
+      for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+      if (s.ws && s.ws.readyState === 1) {
+        s.ws.send(JSON.stringify({
+          type: 'ask',
+          action: action || 'accept',
+          answers: answers || []
+        }));
+      }
+      var note = document.createElement('div');
+      note.className = 'ask-picked';
+      if (action === 'skip') {
+        note.textContent = 'skipped';
+      } else {
+        var bits = [];
+        (answers || []).forEach(function (a) {
+          bits = bits.concat(a.selected || []);
+        });
+        note.textContent = bits.join(' · ') || 'answered';
+      }
+      wrap.appendChild(note);
+      s.setChrome('working…', 'busy');
+    }
   };
 
   Session.prototype.addErr = function (text) {
@@ -618,6 +833,11 @@
         case 'thought':
           s.addThought(msg.text || '');
           break;
+        case 'ask':
+          s.addAsk(msg);
+          s.setChrome('waiting for you…', 'busy');
+          if (s === active) setBusy(true);
+          break;
         case 'tool':
           renderTool(s, msg);
           break;
@@ -627,8 +847,13 @@
           break;
         case 'busy':
           s.busy = true;
+          s.asking = false;
           s.startedReply = false;
           s.tools = {};
+          s.toolsBox = null;
+          s.toolsList = null;
+          s.toolsSum = null;
+          s.toolCount = 0;
           s.agentBuf = '';
           s.agentEl = null;
           s.thoughtBuf = '';
@@ -638,6 +863,7 @@
           break;
         case 'idle':
           s.busy = false;
+          s.asking = false;
           s.setChrome('ready', 'ok');
           if (s === active) setBusy(false);
           else paintSessions();
@@ -680,14 +906,15 @@
     var prev = s.tools[id];
     var st = msg.status || '';
     var title = msg.text || 'tool';
+    var ask = /ask_user|ask user|^ask:/i.test(title);
     if (!prev) {
       s.tools[id] = { title: title, status: st };
-      s.addTool(title);
+      if (!ask) s.addTool(title);
     } else {
       if (title && title !== 'tool') prev.title = title;
       if (st && st !== prev.status) prev.status = st;
     }
-    if (s.busy) {
+    if (s.busy && !s.asking && !ask) {
       s.setChrome(liveToolTitle(s) || title || 'working…', 'busy');
     }
   }
@@ -744,7 +971,7 @@
     }
     if (opts.title) {
       s.title = opts.title;
-      s.named = true;
+      s.named = !looksLikeSessionID(opts.title);
     }
     sessions.push(s);
     sessPaintKey = '';
@@ -808,24 +1035,102 @@
     }
   }
 
+  function commitProjectRename(cwd, val) {
+    val = String(val || '').replace(/\s+/g, ' ').trim();
+    renamingProject = null;
+    if (!cwd) {
+      loadProjects();
+      return;
+    }
+    fetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(cwd), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: val })
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (info) {
+        if (info && info.name) projectNames[normPath(cwd)] = info.name;
+        else if (val) projectNames[normPath(cwd)] = val;
+        else delete projectNames[normPath(cwd)];
+        if (samePath(cwd, project) && projectBtn) {
+          projectBtn.textContent = projectLabel(project);
+        }
+        loadProjects();
+      })
+      .catch(function () { loadProjects(); });
+  }
+
+  function startProjectRename(cwd) {
+    cwd = normPath(cwd);
+    if (!cwd || renamingProject === cwd) return;
+    renamingProject = cwd;
+    loadProjects();
+  }
+
   function loadProjects() {
     if (!projectsEl) return;
     fetch(paneHTTP() + '/v1/projects')
       .then(function (r) { return r.ok ? r.json() : []; })
       .then(function (list) {
+        list = list || [];
+        list.forEach(function (p) {
+          if (p && p.cwd && p.name) projectNames[normPath(p.cwd)] = p.name;
+        });
+        if (project) {
+          var seen = list.some(function (p) { return p && samePath(p.cwd, project); });
+          if (!seen) {
+            list = [{ cwd: project, name: projectLabel(project), sessions: 0 }].concat(list);
+          }
+        }
+        if (renamingProject && projectsEl.querySelector('.sess-edit')) return;
         projectsEl.textContent = '';
-        (list || []).forEach(function (p) {
+        list.forEach(function (p) {
           if (!p || !p.cwd) return;
           var row = document.createElement('div');
           row.className = 'sess-row';
+          if (renamingProject && samePath(p.cwd, renamingProject)) {
+            var inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'sess-edit';
+            inp.value = p.name || projectLabel(p.cwd);
+            inp.setAttribute('aria-label', 'Project name');
+            inp.addEventListener('keydown', function (e) {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                commitProjectRename(p.cwd, inp.value);
+              }
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                renamingProject = null;
+                loadProjects();
+              }
+              e.stopPropagation();
+            });
+            inp.addEventListener('blur', function () { commitProjectRename(p.cwd, inp.value); });
+            row.appendChild(inp);
+            projectsEl.appendChild(row);
+            setTimeout(function () {
+              inp.focus();
+              inp.select();
+            }, 0);
+            return;
+          }
           var b = document.createElement('button');
           b.type = 'button';
-          b.className = 'hist' + (p.cwd === project ? ' active' : '');
-          b.textContent = p.name || basename(p.cwd);
-          b.title = p.cwd + (p.sessions ? '\n' + p.sessions + ' Grok sessions' : '');
+          b.className = 'hist' + (samePath(p.cwd, project) ? ' active' : '');
+          b.textContent = p.name || projectLabel(p.cwd);
+          b.title = p.cwd + (p.sessions ? '\n' + p.sessions + ' Grok sessions' : '') + '\ndouble-click to rename';
           b.addEventListener('click', function () {
-            if (p.cwd === project) return;
+            if (samePath(p.cwd, project)) {
+              startProjectRename(p.cwd);
+              return;
+            }
             setProject(p.cwd);
+          });
+          b.addEventListener('dblclick', function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            startProjectRename(p.cwd);
           });
           var x = document.createElement('button');
           x.type = 'button';
@@ -847,6 +1152,7 @@
           empty.textContent = 'no grok projects';
           projectsEl.appendChild(empty);
         }
+        if (project && projectBtn) projectBtn.textContent = projectLabel(project);
       })
       .catch(function () {});
   }
@@ -1504,6 +1810,11 @@
       return;
     }
     if (e.key !== 'Escape' || !active) return;
+    if (active.asking && active.askEl) {
+      var skip = active.askEl.querySelector('.ask-skip');
+      if (skip && !skip.disabled) skip.click();
+      return;
+    }
     if (active.busy && active.ws && active.ws.readyState === 1) {
       active.ws.send(JSON.stringify({ type: 'cancel' }));
       active.setChrome('cancelling…', 'busy');
@@ -1758,8 +2069,9 @@
 
   function setProject(path) {
     if (!path) return;
+    path = normPath(path);
     project = path;
-    projectBtn.textContent = basename(path) || path;
+    projectBtn.textContent = projectLabel(path);
     projectBtn.title = path + ' — click to copy';
     try { localStorage.setItem('pane-project', path); } catch (e) {}
     loadProjects();
@@ -1911,11 +2223,12 @@
       input.focus();
     }
     function resumeBoot(path) {
+      path = normPath(path);
       if (qSid) {
         if (path) {
           project = path;
           projectBtn.textContent = basename(path) || path;
-          projectBtn.title = path;
+          projectBtn.title = path + ' — click to copy';
           try { localStorage.setItem('pane-project', path); } catch (e) {}
           loadHistory(path);
         }

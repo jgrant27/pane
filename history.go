@@ -192,6 +192,50 @@ func decodeSessionGroup(name, dir string) string {
 	return s
 }
 
+func projectDisplayName(cwd, group string) string {
+	if b, err := os.ReadFile(filepath.Join(group, ".name")); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" {
+			return s
+		}
+	}
+	return filepath.Base(strings.TrimRight(cwd, `/\`))
+}
+
+func renameGrokProject(cwd, name string) error {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return fmt.Errorf("cwd required")
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return err
+	}
+	cwd = abs
+	if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
+		return fmt.Errorf("cwd not a directory")
+	}
+	name = strings.TrimSpace(name)
+	name = strings.ReplaceAll(name, "\x00", "")
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("invalid name")
+	}
+	group := sessionGroupDir(cwd)
+	if err := os.MkdirAll(group, 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(group, ".cwd")); err != nil {
+		_ = os.WriteFile(filepath.Join(group, ".cwd"), []byte(cwd+"\n"), 0o600)
+	}
+	path := filepath.Join(group, ".name")
+	if name == "" || name == filepath.Base(strings.TrimRight(cwd, `/\`)) {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return os.WriteFile(path, []byte(name+"\n"), 0o600)
+}
+
 func listGrokProjects() []projectInfo {
 	root := filepath.Join(grokHome(), "sessions")
 	ents, err := os.ReadDir(root)
@@ -213,9 +257,6 @@ func listGrokProjects() []projectInfo {
 		}
 		n, latest := 0, ""
 		for _, s := range listGrokSessions(cwd, 0) {
-			if isStubSession(s) {
-				continue
-			}
 			n++
 			if s.Updated > latest {
 				latest = s.Updated
@@ -226,7 +267,7 @@ func listGrokProjects() []projectInfo {
 		}
 		out = append(out, projectInfo{
 			Cwd:      cwd,
-			Name:     filepath.Base(cwd),
+			Name:     projectDisplayName(cwd, group),
 			Sessions: n,
 			Updated:  latest,
 		})
@@ -269,6 +310,24 @@ func handleProjects(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(listGrokProjects())
+	case http.MethodPost:
+		cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "name required", http.StatusBadRequest)
+			return
+		}
+		if err := renameGrokProject(cwd, body.Name); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(projectInfo{
+			Cwd:  cwd,
+			Name: projectDisplayName(cwd, sessionGroupDir(cwd)),
+		})
 	case http.MethodDelete:
 		cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
 		if err := deleteGrokProject(cwd); err != nil {

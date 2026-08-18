@@ -45,6 +45,79 @@ func TestParsePromptCaps(t *testing.T) {
 	}
 }
 
+func TestAskHelpers(t *testing.T) {
+	if !isAskMethod("GrokBuild:ask_user_question") || !isAskMethod("ask_user_question") {
+		t.Fatal("method")
+	}
+	if isAskMethod("session/update") || isAskMethod("") {
+		t.Fatal("not ask")
+	}
+	if !isAskTool("ask_user_question") || !isAskTool("Ask: hello") || isAskTool("read_file") || isAskTool("") {
+		t.Fatal("tool title")
+	}
+	if rpcIDSet(nil) || rpcIDSet([]byte("null")) || !rpcIDSet([]byte("7")) {
+		t.Fatal("rpc id set")
+	}
+	if n, ok := rpcIDInt([]byte("42")); !ok || n != 42 {
+		t.Fatal(n, ok)
+	}
+	if _, ok := rpcIDInt([]byte(`"x"`)); ok {
+		t.Fatal("string id")
+	}
+
+	qs := parseAskQuestions([]byte(`{"questions":[{"question":"Q?","options":[{"label":"A","description":"da"},{"label":""}]}]}`))
+	if len(qs) != 1 || qs[0].Question != "Q?" || len(qs[0].Options) != 1 {
+		t.Fatalf("%+v", qs)
+	}
+	qs = parseAskQuestions([]byte(`{"rawInput":{"questions":[{"header":"H","multi_select":true,"options":[{"label":"x"}]}]}}`))
+	if len(qs) != 1 || qs[0].Question != "H" || !qs[0].multi() {
+		t.Fatalf("nested %+v", qs)
+	}
+	qs = parseAskQuestions([]byte(`[{"question":"bare","options":[{"label":"1"}]}]`))
+	if len(qs) != 1 || qs[0].Question != "bare" {
+		t.Fatalf("array %+v", qs)
+	}
+	if parseAskQuestions(nil) != nil || parseAskQuestions([]byte("nope")) != nil {
+		t.Fatal("empty")
+	}
+
+	ans := parseAskAnswers([]byte(`[{"question":"Q?","selected":["A"]}]`))
+	if len(ans) != 1 || ans[0].Selected[0] != "A" {
+		t.Fatalf("%+v", ans)
+	}
+	ans = parseAskAnswers([]byte(`["only"]`))
+	if len(ans) != 1 || ans[0].Selected[0] != "only" {
+		t.Fatalf("labels %+v", ans)
+	}
+	if parseAskAnswers(nil) != nil {
+		t.Fatal("nil answers")
+	}
+
+	skip := buildAskResult("skip", nil).(map[string]any)
+	if skip["type"] != "skip_interview" {
+		t.Fatal(skip)
+	}
+	chat := buildAskResult("chat", nil).(map[string]any)
+	if chat["type"] != "chat_about_this" {
+		t.Fatal(chat)
+	}
+	acc := buildAskResult("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}}).(map[string]any)
+	if acc["type"] != "accepted" {
+		t.Fatal(acc)
+	}
+
+	s := &session{}
+	s.offerAsk([]byte("3"), qs)
+	s.completeAsk("accept", []askAnswer{{Question: "Q?", Selected: []string{"A"}}})
+	s.offerAsk([]byte("4"), qs)
+	s.offerAsk([]byte("5"), qs)
+	s.clearAsk()
+	s.completeAsk("skip", nil)
+	s.offerAsk([]byte("6"), qs)
+	s.replyMethodNotFound(nil, "x")
+	s.writeAskResult(nil, skip)
+}
+
 func TestBuildPrompt(t *testing.T) {
 	dir := t.TempDir()
 	img := filepath.Join(dir, "pic.png")

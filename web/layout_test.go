@@ -75,6 +75,36 @@ func TestLiveStatusSitsAboveComposer(t *testing.T) {
 	}
 }
 
+func TestToolCallsUseDetails(t *testing.T) {
+	js, err := FS.ReadFile("term.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	if !strings.Contains(src, `className = 'msg tools'`) || !strings.Contains(src, "createElement('details')") {
+		t.Fatal("tool calls must collapse into a details/summary block")
+	}
+	if !strings.Contains(src, "function normPath") || !strings.Contains(src, "function samePath") {
+		t.Fatal("term.js must normalize project paths (trailing slash)")
+	}
+	if !strings.Contains(src, "function startProjectRename") || !strings.Contains(src, "function commitProjectRename") {
+		t.Fatal("term.js must let you rename a project")
+	}
+	if !strings.Contains(src, "Session.prototype.addAsk") || !strings.Contains(src, "waiting for you") {
+		t.Fatal("term.js must render ask_user_question as a card")
+	}
+	css, err := FS.ReadFile("style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(css), ".msg.tools summary") {
+		t.Fatal("style.css must style the tools summary")
+	}
+	if !strings.Contains(string(css), ".msg.ask") || !strings.Contains(string(css), ".ask-opt") {
+		t.Fatal("style.css must style the ask card")
+	}
+}
+
 func TestNewSessionStartsDisabled(t *testing.T) {
 	b, err := FS.ReadFile("index.html")
 	if err != nil {
