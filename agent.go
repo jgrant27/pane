@@ -64,8 +64,16 @@ func probeAgent(agentBase, secret string) error {
 	return err
 }
 
+var runGrokServe = func(bind, secret string) error {
+	cmd := exec.Command("grok", "agent", "serve", "--bind", bind, "--secret", secret)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	log.Printf("starting grok agent serve on %s", bind)
+	return cmd.Run()
+}
+
 func serveAgent(bind, secret string, replace bool) error {
-	if _, err := exec.LookPath("grok"); err != nil {
+	if _, err := lookPath("grok"); err != nil {
 		return fmt.Errorf("grok not on PATH")
 	}
 	if replace && tcpBusy(bind) {
@@ -84,11 +92,7 @@ func serveAgent(bind, secret string, replace bool) error {
 		log.Printf("already running on %s — secret matches", bind)
 		return nil
 	}
-	cmd := exec.Command("grok", "agent", "serve", "--bind", bind, "--secret", secret)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	log.Printf("starting grok agent serve on %s", bind)
-	return cmd.Run()
+	return runGrokServe(bind, secret)
 }
 
 func listenerInfo(bind string) (pid, cmd string) {

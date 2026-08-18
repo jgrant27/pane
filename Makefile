@@ -55,8 +55,16 @@ icon:
 	go run ./cmd/mkicon desktop/build/appicon.png
 	sips -z 256 256 desktop/build/appicon.png --out web/favicon.png >/dev/null 2>&1 || cp desktop/build/appicon.png web/favicon.png
 
+TEST_PKGS := $(shell go list ./... | grep -v '/desktop$$' | grep -v '/cmd/mkicon$$' | grep -v '/cmd/probe$$')
+COVER_PKG ?= github.com/jgrant27/pane
+COVER_MIN ?= 90
+COVER_OUT ?= cover.out
+
 test:
-	go test $(shell go list ./... | grep -v '/desktop$$')
+	go test -count=1 $(filter-out $(COVER_PKG),$(TEST_PKGS))
+	go test -count=1 -covermode=atomic -coverprofile=$(COVER_OUT) $(COVER_PKG)
+	@go tool cover -func=$(COVER_OUT)
+	@go run ./cmd/covercheck -min=$(COVER_MIN) $(COVER_OUT)
 
 deploy: test
 	@set -e; \

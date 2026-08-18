@@ -133,4 +133,32 @@ func TestHandleUpload(t *testing.T) {
 	if _, err := os.Stat(info.Path); !os.IsNotExist(err) {
 		t.Fatal("copied file still there")
 	}
+
+	if detectMIME("x.bin", []byte{0x00, 0x01}) == "" {
+		t.Fatal("detectMIME")
+	}
+	if detectMIME("note.txt", nil) == "" {
+		t.Fatal("empty head")
+	}
+	if _, err := attachPath(dir, ""); err == nil {
+		t.Fatal("empty path")
+	}
+	if _, err := attachPath(dir, dir); err == nil {
+		t.Fatal("dir attach")
+	}
+	rec = httptest.NewRecorder()
+	handleUpload(rec, httptest.NewRequest(http.MethodGet, "/v1/upload?cwd="+dir, nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatal(rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handleUpload(rec, httptest.NewRequest(http.MethodPost, "/v1/upload", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatal(rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatal(rec.Code)
+	}
 }

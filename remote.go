@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -23,6 +22,8 @@ type tsPeer struct {
 	Online bool
 	Self   bool
 }
+
+var remoteURLScheme = "https"
 
 func handleRemoteSessions(w http.ResponseWriter, r *http.Request) {
 	list := cachedRemoteSessions()
@@ -95,7 +96,7 @@ func discoverRemoteSessions(budget time.Duration) []remoteSession {
 		wg.Add(1)
 		go func(p tsPeer) {
 			defer wg.Done()
-			origin := "https://" + strings.TrimSuffix(p.DNS, ".")
+			origin := remoteURLScheme + "://" + strings.TrimSuffix(p.DNS, ".")
 			if !remotePaneOK(ctx, origin) {
 				return
 			}
@@ -124,11 +125,10 @@ func discoverRemoteSessions(budget time.Duration) []remoteSession {
 }
 
 func tailscalePeerList() []tsPeer {
-	bin, err := exec.LookPath("tailscale")
-	if err != nil {
+	if _, err := lookPath("tailscale"); err != nil {
 		return nil
 	}
-	out, err := exec.Command(bin, "status", "--json").Output()
+	out, err := tailscaleJSON()
 	if err != nil {
 		return nil
 	}

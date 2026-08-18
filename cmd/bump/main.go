@@ -173,27 +173,36 @@ func repoRoot() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+func doBump(kind string, write bool) (string, error) {
+	switch kind {
+	case "patch", "minor", "major":
+	default:
+		return "", fmt.Errorf("unknown bump %q", kind)
+	}
+	root, err := repoRoot()
+	if err != nil {
+		return "", err
+	}
+	next := current(root).bump(kind)
+	if write {
+		if err := writeVersion(root, next.String()); err != nil {
+			return "", err
+		}
+	}
+	return next.Tag(), nil
+}
+
 func main() {
 	kind := flag.String("bump", "patch", "patch, minor, or major")
 	write := flag.Bool("write", false, "update VERSION and stamped files")
 	flag.Parse()
-	switch *kind {
-	case "patch", "minor", "major":
-	default:
-		fmt.Fprintf(os.Stderr, "pane: unknown bump %q\n", *kind)
-		os.Exit(2)
-	}
-	root, err := repoRoot()
+	tag, err := doBump(*kind, *write)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pane: %v\n", err)
+		if strings.Contains(err.Error(), "unknown bump") {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
-	next := current(root).bump(*kind)
-	if *write {
-		if err := writeVersion(root, next.String()); err != nil {
-			fmt.Fprintf(os.Stderr, "pane: write version: %v\n", err)
-			os.Exit(1)
-		}
-	}
-	fmt.Print(next.Tag())
+	fmt.Print(tag)
 }

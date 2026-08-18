@@ -24,22 +24,14 @@ import (
 	"github.com/jgrant27/pane/web"
 )
 
-func main() {
-	log.SetFlags(0)
-	log.SetPrefix("pane: ")
+type paneCfg struct {
+	listen, agent, agentBind, secret, cwd string
+	tailscale, noAgent, noOpen            bool
+	serveAgent, replaceAgent              bool
+}
 
-	listen := flag.String("listen", "127.0.0.1:7420", "HTTP listen address")
-	agent := flag.String("agent", "ws://127.0.0.1:2419", "grok agent serve base (no /ws)")
-	agentBind := flag.String("agent-bind", "127.0.0.1:2419", "bind for a spawned grok agent serve")
-	secret := flag.String("secret", env("GROK_AGENT_SECRET", env("PANE_SECRET", "")), "agent server-key")
-	cwd := flag.String("cwd", env("PANE_CWD", ""), "ACP working directory (default: $HOME)")
-	tailscaleFront := flag.Bool("tailscale", false, "run `tailscale serve` in front and require Tailscale identity")
-	noAgent := flag.Bool("no-agent", false, "do not start grok agent serve; only connect")
-	noOpen := flag.Bool("no-open", false, "do not open a browser")
-	serveAgentOnly := flag.Bool("serve-agent", false, "start or check grok agent serve, then exit (no HTTP UI)")
-	replaceAgent := flag.Bool("replace-agent", false, "with -serve-agent, replace whatever is on -agent-bind")
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), `Grok Pane — local server for the Grok Pane desktop app
+func paneUsage(fs *flag.FlagSet) {
+	fmt.Fprintf(fs.Output(), `Grok Pane — local server for the Grok Pane desktop app
 
   pane
   pane -cwd ~/src/my-project
@@ -58,76 +50,129 @@ agent that was already running unless -replace-agent. Never use
 tailscale funnel.
 
 `)
-		flag.PrintDefaults()
-	}
-	flag.Parse()
+	fs.PrintDefaults()
+}
 
-	if *replaceAgent && !*serveAgentOnly {
-		log.Fatal("-replace-agent requires -serve-agent")
+func parsePaneArgs(args []string) (paneCfg, error) {
+	var cfg paneCfg
+	fs := flag.NewFlagSet("pane", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() { paneUsage(fs) }
+	fs.StringVar(&cfg.listen, "listen", "127.0.0.1:7420", "HTTP listen address")
+	fs.StringVar(&cfg.agent, "agent", "ws://127.0.0.1:2419", "grok agent serve base (no /ws)")
+	fs.StringVar(&cfg.agentBind, "agent-bind", "127.0.0.1:2419", "bind for a spawned grok agent serve")
+	fs.StringVar(&cfg.secret, "secret", env("GROK_AGENT_SECRET", env("PANE_SECRET", "")), "agent server-key")
+	fs.StringVar(&cfg.cwd, "cwd", env("PANE_CWD", ""), "ACP working directory (default: $HOME)")
+	fs.BoolVar(&cfg.tailscale, "tailscale", false, "run `tailscale serve` in front and require Tailscale identity")
+	fs.BoolVar(&cfg.noAgent, "no-agent", false, "do not start grok agent serve; only connect")
+	fs.BoolVar(&cfg.noOpen, "no-open", false, "do not open a browser")
+	fs.BoolVar(&cfg.serveAgent, "serve-agent", false, "start or check grok agent serve, then exit (no HTTP UI)")
+	fs.BoolVar(&cfg.replaceAgent, "replace-agent", false, "with -serve-agent, replace whatever is on -agent-bind")
+	if err := fs.Parse(args); err != nil {
+		return cfg, err
 	}
-	if *serveAgentOnly {
-		sec, err := resolveSecret(*secret)
+	return cfg, nil
+}
+
+func main() {
+	log.SetFlags(0)
+	log.SetPrefix("pane: ")
+	if err := run(os.Args[1:]); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(args []string) error {
+	cfg, err := parsePaneArgs(args)
+	if err != nil {
+		return err
+	}
+	if cfg.replaceAgent && !cfg.serveAgent {
+		return fmt.Errorf("-replace-agent requires -serve-agent")
+	}
+	if cfg.serveAgent {
+		sec, err := resolveSecret(cfg.secret)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
-		if err := serveAgent(*agentBind, sec, *replaceAgent); err != nil {
-			log.Fatal(err)
-		}
-		return
+		return serveAgent(cfg.agentBind, sec, cfg.replaceAgent)
 	}
+	stop := make(chan struct{})
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		close(stop)
+	}()
+	return servePane(cfg, stop)
+}
 
-	if *cwd == "" {
+var (
+	lookPath       = exec.LookPath
+	openBrowser    = openURL
+	tailscaleRun   = func(args ...string) error { return exec.Command("tailscale", args...).Run() }
+	tailscaleJSON  = func() ([]byte, error) { return exec.Command("tailscale", "status", "--json").Output() }
+	grokReadyFor   = 8 * time.Second
+	listenReadyFor = 3 * time.Second
+	startGrok      = func(bind, secret string) (*exec.Cmd, error) {
+		cmd := exec.Command("grok", "agent", "serve", "--bind", bind, "--secret", secret)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return cmd, nil
+	}
+)
+
+func servePane(cfg paneCfg, stop <-chan struct{}) error {
+	if cfg.cwd == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
-		*cwd = home
+		cfg.cwd = home
 	}
-	abs, err := filepath.Abs(*cwd)
+	abs, err := filepath.Abs(cfg.cwd)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	st, err := os.Stat(abs)
 	if err != nil || !st.IsDir() {
-		log.Fatalf("cwd: %s", abs)
+		return fmt.Errorf("cwd: %s", abs)
 	}
-	*cwd = abs
+	cfg.cwd = abs
 
-	sec, err := resolveSecret(*secret)
+	sec, err := resolveSecret(cfg.secret)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	agentBase := strings.TrimRight(*agent, "/")
+	agentBase := strings.TrimRight(cfg.agent, "/")
 	var agentCmd *exec.Cmd
-	if !*noAgent {
-		if tcpBusy(*agentBind) {
+	if !cfg.noAgent {
+		if tcpBusy(cfg.agentBind) {
 			if err := probeAgent(agentBase, sec); err != nil {
 				log.Printf("%v", err)
 			} else {
-				log.Printf("reusing grok agent serve on %s", *agentBind)
+				log.Printf("reusing grok agent serve on %s", cfg.agentBind)
 			}
 		} else {
-			if _, err := exec.LookPath("grok"); err != nil {
-				log.Fatal("grok not on PATH")
+			if _, err := lookPath("grok"); err != nil {
+				return fmt.Errorf("grok not on PATH")
 			}
-			agentCmd = exec.Command("grok", "agent", "serve",
-				"--bind", *agentBind,
-				"--secret", sec,
-			)
-			agentCmd.Stdout = os.Stdout
-			agentCmd.Stderr = os.Stderr
-			if err := agentCmd.Start(); err != nil {
-				log.Fatalf("start grok agent serve: %v", err)
+			agentCmd, err = startGrok(cfg.agentBind, sec)
+			if err != nil {
+				return fmt.Errorf("start grok agent serve: %w", err)
 			}
-			log.Printf("started grok agent serve pid=%d on %s", agentCmd.Process.Pid, *agentBind)
-			if err := waitTCP(*agentBind, 8*time.Second); err != nil {
+			log.Printf("started grok agent serve pid=%d on %s", agentCmd.Process.Pid, cfg.agentBind)
+			if err := waitTCP(cfg.agentBind, grokReadyFor); err != nil {
 				_ = agentCmd.Process.Signal(syscall.SIGTERM)
-				log.Fatalf("grok agent serve: %v", err)
+				return fmt.Errorf("grok agent serve: %w", err)
 			}
 		}
-	} else if !tcpBusy(*agentBind) {
-		log.Printf("no grok agent on %s — start one with: make agent", *agentBind)
+	} else if !tcpBusy(cfg.agentBind) {
+		log.Printf("no grok agent on %s — start one with: make agent", cfg.agentBind)
 	} else if err := probeAgent(agentBase, sec); err != nil {
 		log.Printf("%v", err)
 	}
@@ -135,7 +180,7 @@ tailscale funnel.
 	p := &proxy{
 		agentBase: agentBase,
 		secret:    sec,
-		cwd:       *cwd,
+		cwd:       cfg.cwd,
 	}
 
 	mux := http.NewServeMux()
@@ -155,52 +200,56 @@ tailscale funnel.
 	mux.HandleFunc("/v1/remote-sessions", handleRemoteSessions)
 
 	h := http.Handler(withCORS(mux))
-	if *tailscaleFront {
-		if _, err := exec.LookPath("tailscale"); err != nil {
-			log.Fatal("tailscale not on PATH")
+	if cfg.tailscale {
+		if _, err := lookPath("tailscale"); err != nil {
+			return fmt.Errorf("tailscale not on PATH")
 		}
 		h = requireTailscale(h)
 	}
 
-	if tcpBusy(*listen) {
-		log.Fatalf("already listening on %s", *listen)
+	if tcpBusy(cfg.listen) {
+		return fmt.Errorf("already listening on %s", cfg.listen)
 	}
 
-	srv := &http.Server{Addr: *listen, Handler: h}
+	srv := &http.Server{Addr: cfg.listen, Handler: h}
+	errc := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+			errc <- err
 		}
 	}()
-	if err := waitTCP(*listen, 3*time.Second); err != nil {
-		log.Fatalf("listen %s: %v", *listen, err)
+	if err := waitTCP(cfg.listen, listenReadyFor); err != nil {
+		_ = srv.Close()
+		return fmt.Errorf("listen %s: %w", cfg.listen, err)
 	}
 
-	url := "http://" + *listen
+	url := "http://" + cfg.listen
 	log.Printf("local  %s", url)
-	log.Printf("agent  %s/ws  cwd=%s", p.agentBase, *cwd)
+	log.Printf("agent  %s/ws  cwd=%s", p.agentBase, cfg.cwd)
 
 	tsReset := false
-	if *tailscaleFront {
-		port := listenPort(*listen)
-		if err := exec.Command("tailscale", "serve", "--bg", port).Run(); err != nil {
-			log.Fatalf("tailscale serve: %v", err)
+	if cfg.tailscale {
+		if err := tailscaleRun("serve", "--bg", listenPort(cfg.listen)); err != nil {
+			_ = srv.Close()
+			return fmt.Errorf("tailscale serve: %w", err)
 		}
 		tsReset = true
 		if dns := tailscaleDNS(); dns != "" {
 			log.Printf("tailnet https://%s/", dns)
 		}
 		log.Printf("loopback is 403 unless the request comes through tailscale serve")
-	} else if !*noOpen {
-		openURL(url)
+	} else if !cfg.noOpen {
+		openBrowser(url)
 	}
 
 	log.Printf("Ctrl-C to stop")
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	select {
+	case <-stop:
+	case err := <-errc:
+		return err
+	}
 	if tsReset {
-		_ = exec.Command("tailscale", "serve", "reset").Run()
+		_ = tailscaleRun("serve", "reset")
 		log.Printf("cleared tailscale serve")
 	}
 	_ = srv.Close()
@@ -208,6 +257,7 @@ tailscale funnel.
 		_ = agentCmd.Process.Signal(syscall.SIGTERM)
 		_, _ = agentCmd.Process.Wait()
 	}
+	return nil
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -303,7 +353,7 @@ func listenPort(addr string) string {
 }
 
 func tailscaleDNS() string {
-	out, err := exec.Command("tailscale", "status", "--json").Output()
+	out, err := tailscaleJSON()
 	if err != nil {
 		return ""
 	}
@@ -328,8 +378,10 @@ func requireTailscale(next http.Handler) http.Handler {
 	})
 }
 
+var openCmd = func(u string) *exec.Cmd { return exec.Command("open", u) }
+
 func openURL(u string) {
-	cmd := exec.Command("open", u)
+	cmd := openCmd(u)
 	if err := cmd.Start(); err != nil {
 		return
 	}

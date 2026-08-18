@@ -70,3 +70,24 @@ func TestWriteVersion(t *testing.T) {
 		t.Fatalf("proxy %s", proxy)
 	}
 }
+
+func TestDoBumpAndFileVer(t *testing.T) {
+	if _, err := doBump("nope", false); err == nil {
+		t.Fatal("expected unknown bump")
+	}
+	tag, err := doBump("patch", false)
+	if err != nil || !strings.HasPrefix(tag, "v") {
+		t.Fatal(tag, err)
+	}
+	root, err := repoRoot()
+	if err != nil || root == "" {
+		t.Fatal(root, err)
+	}
+	if current(root).String() == "" {
+		t.Fatal("current")
+	}
+	if err := replaceAll(filepath.Join(t.TempDir(), "missing.json"), reWails, "1.0.0", 2); err == nil {
+		t.Fatal("missing file")
+	}
+	_ = gitTags()
+}
