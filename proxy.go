@@ -129,7 +129,7 @@ func (p *proxy) ensureHub() (*agentHub, error) {
 		"clientInfo": map[string]string{
 			"name":    "grok-pane",
 			"title":   "Grok Pane",
-			"version": "0.2.3",
+			"version": "0.2.4",
 		},
 		"clientCapabilities": map[string]any{
 			"fs":       map[string]bool{"readTextFile": false, "writeTextFile": false},
