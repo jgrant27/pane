@@ -63,6 +63,12 @@
     window.open(href, '_blank', 'noopener,noreferrer');
   }
 
+  // Schemes a click may hand to the operating system. DOMPurify lets more
+  // through (ftp, xmpp, cid, callto), but nothing on this side knows what
+  // to do with those; tel: and sms: are here because the mobile shells
+  // forward them and a phone number in agent markdown should still dial.
+  var externalSchemes = ['http:', 'https:', 'mailto:', 'tel:', 'sms:'];
+
   function isDesktop() {
     return !!(window.runtime || window.wails || (window.go && window.go.main));
   }
@@ -627,7 +633,7 @@
     this.statusCls = '';
     this.reconnects = 0;
     this.retry = 0;
-    this.handshakeErrs = 0;
+    this.handshakeSince = 0;
     this.giveUp = false;
     this.startedReply = false;
     this.tools = {};
@@ -1097,6 +1103,26 @@
     if (this === active) setStatus(text, cls);
   };
 
+  // How long a session keeps redialling through pre-ready errors before it
+  // stops and waits to be used again. An agent restart is the thing being
+  // ridden out, and it takes longer than a handful of dials.
+  var handshakeGraceMs = 60000;
+
+  // Whether a pre-ready error means the id we asked to resume is gone
+  // rather than the agent being briefly away. The wording comes from grok,
+  // so this looks for the two ideas together — a session, and it not being
+  // there — and treats anything else as worth another dial. Guessing wrong
+  // this way costs a retry; guessing wrong the other way loses the session.
+  var gonePhrase = /not found|no such|unknown|invalid|missing|does not exist|expired|corrupt/i;
+  var sessionWord = /session|conversation|thread/i;
+
+  function unloadableSession(text, id) {
+    var t = String(text || '');
+    if (!gonePhrase.test(t)) return false;
+    if (sessionWord.test(t)) return true;
+    return !!id && t.toLowerCase().indexOf(String(id).toLowerCase()) >= 0;
+  }
+
   Session.prototype.connect = function () {
     var s = this;
     // A retry timer armed before shutdown() must not resurrect the tab.
@@ -1133,16 +1159,21 @@
           // waiting on is gone, so an unanswered card cannot be answered.
           if (s.seenReady) s.retireAsk('expired — reconnected');
           s.reconnects = 0;
-          s.handshakeErrs = 0;
+          s.handshakeSince = 0;
           s.seenReady = true;
           s.live = true;
           s.id = msg.session || s.id;
           if (s.id) s.resumeID = s.id;
           if (msg.cwd) s.cwd = msg.cwd;
           if (s === active) paintCwd(s.cwd);
-          s.busy = false;
-          s.setChrome('ready', 'ok');
-          if (s === active) setBusy(false);
+          // Reattaching to a session that is still answering has to show
+          // Queue, not a Send that would race the turn. `busy` is the
+          // server's word for that; a server too old to send it leaves
+          // this undefined, which reads as idle exactly as it used to.
+          var midTurn = msg.busy === true;
+          s.busy = midTurn;
+          s.setChrome(midTurn ? 'working…' : 'ready', midTurn ? 'busy' : 'ok');
+          if (s === active) setBusy(midTurn);
           else paintSessions();
           applyCatalog(s, msg);
           if (s === active) paintCatalog();
@@ -1181,21 +1212,28 @@
         case 'err':
           s.addErr(msg.text || 'error');
           s.setChrome(msg.text || 'error', 'err');
-          // An error before ready means the handshake itself failed, and
-          // the socket is about to close. Redialling the same id would
-          // just repeat it, so drop the id we asked to resume — a session
-          // deleted elsewhere must not trap the tab in a retry loop.
+          // An error before ready means the handshake itself failed and
+          // the socket is about to close. Only an error that says this
+          // session cannot be loaded is a reason to stop asking for it —
+          // "no grok agent at …", "agent closed" and a failed dial all
+          // mean the agent is between lives, and dropping the id there
+          // would lose the session the user was sitting in.
           if (!s.seenReady) {
-            if (s.resumeID) {
+            if (s.resumeID && unloadableSession(msg.text, s.resumeID)) {
               forget('pane-last-sid:' + normPath(s.cwd));
               s.resumeID = '';
-            } else if (++s.handshakeErrs >= 8) {
-              // Enough tries to ride out an agent restart; past that the
-              // server cannot open a session here at all, and a red line
-              // every few seconds tells the user nothing new. Sending
-              // dials again, so the tab is not stuck.
-              s.giveUp = true;
-              s.setChrome((msg.text || 'error') + ' — send to retry', 'err');
+              s.handshakeSince = 0;
+            } else {
+              if (!s.handshakeSince) s.handshakeSince = Date.now();
+              if (Date.now() - s.handshakeSince >= handshakeGraceMs) {
+                // The redial backs off to eight seconds, so counting
+                // attempts is a poor clock: this is a whole minute of the
+                // pane being unreachable, which outlasts an agent
+                // restart. Past it a red line every few seconds tells the
+                // user nothing new, and sending dials again.
+                s.giveUp = true;
+                s.setChrome((msg.text || 'error') + ' — send to retry', 'err');
+              }
             }
           }
           break;
@@ -1362,7 +1400,7 @@
         sessPaintKey = '';
         applyGrokTitles(diskSessions);
         paintSessions();
-        if (opts.resume) resumeLatest(cwd, diskSessions, true);
+        if (opts.resume) resumeLatest(cwd, diskSessions, diskSessions.length < sessionListCap);
         loadProjects();
       })
       .catch(function () {
@@ -1537,7 +1575,14 @@
     }, 600);
   }
 
-  function resumeLatest(cwd, list, listOK) {
+  // What /v1/sessions will return at most (history.go: listGrokSessions
+  // with a limit of 40). A response that hits the cap is a page, not a
+  // census: it is sorted by Updated, and a session grok has not written a
+  // summary for yet sorts last on an empty Updated, so the very session
+  // being resumed is the one a full page drops.
+  var sessionListCap = 40;
+
+  function resumeLatest(cwd, list, listComplete) {
     list = list || [];
     var lastSid = stored('pane-last-sid:' + normPath(cwd));
     var pick = null;
@@ -1550,11 +1595,12 @@
         }
       }
     }
-    // A list that came back without the stored id is authoritative: that
-    // session was deleted or pruned, and resuming it only yields an error
-    // and a redial. Trust the id only when the list never arrived.
-    if (!pick && lastSid && !listOK) pick = { id: lastSid, cwd: cwd, title: lastSid };
-    if (!pick && lastSid && listOK) forget('pane-last-sid:' + normPath(cwd));
+    // Only a list that is known complete can prove the stored id is gone:
+    // then it was deleted or pruned, and resuming it yields an error and a
+    // redial. A list that never arrived, or one long enough to have been
+    // truncated, proves nothing — keep the id and let the handshake say.
+    if (!pick && lastSid && !listComplete) pick = { id: lastSid, cwd: cwd, title: lastSid };
+    if (!pick && lastSid && listComplete) forget('pane-last-sid:' + normPath(cwd));
     if (!pick && list[0] && list[0].id) pick = list[0];
     if (pick && pick.id) {
       var existing = sessions.filter(function (s) {
@@ -1702,8 +1748,10 @@
     if (!s) return;
     var i = sessions.indexOf(s);
     if (i >= 0) sessions.splice(i, 1);
-    if (s === active) active = null;
+    // shutdown() hands back the composer draft of the tab that is on
+    // screen, so it has to still be the active one while it runs.
     s.shutdown();
+    if (s === active) active = null;
     syncNewSession();
   }
 
@@ -1811,6 +1859,15 @@
       releaseFiles(item && item.files, cwd);
     });
     this.queue = [];
+    // The composer is shared, but the draft in it belongs to the tab on
+    // screen and its attachments were already copied into that tab's
+    // project. Nothing else remembers them once the tab is gone.
+    if (this === active && pending.length) {
+      releaseFiles(pending, cwd);
+      pending = [];
+      paintChips();
+      syncSend();
+    }
     if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
   };
 
@@ -2325,7 +2382,7 @@
     if (active.giveUp) {
       active.giveUp = false;
       active.reconnects = 0;
-      active.handshakeErrs = 0;
+      active.handshakeSince = 0;
       active.connect();
     }
     var item = snapshotComposer();
@@ -2908,6 +2965,33 @@
     else syncJump();
   });
 
+  function stripHash(href) {
+    var i = String(href).indexOf('#');
+    return i < 0 ? String(href) : String(href).slice(0, i);
+  }
+
+  // True only for a link that moves inside this document — the #anchor a
+  // markdown table of contents emits. Everything else, relative included,
+  // resolves to some other document.
+  function sameDocument(u) {
+    return !!(u && u.hash) && stripHash(u.href) === stripHash(location.href);
+  }
+
+  // An in-page anchor has to scroll, not open a window. renderMd strips
+  // `id`, so a heading usually answers to `name` instead; when nothing
+  // matches, the click is simply spent, which is still not a navigation.
+  function scrollToAnchor(hash) {
+    var id = String(hash || '').replace(/^#/, '');
+    try { id = decodeURIComponent(id); } catch (e) {}
+    if (!id) return;
+    var el = document.getElementById(id);
+    if (!el) {
+      var named = document.getElementsByName(id);
+      el = (named && named[0]) || null;
+    }
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'start' });
+  }
+
   document.addEventListener('click', function (e) {
     var t = e.target;
     var a = t && t.closest ? t.closest('a[href]') : null;
@@ -2915,16 +2999,26 @@
     var href = a.getAttribute('href') || '';
     var u = null;
     try { u = new URL(href, location.href); } catch (err) { u = null; }
-    // Every anchor on this page came out of agent markdown. A relative
-    // one is a same-origin navigation: it unloads the app (cancelling
-    // every running turn) and can hit a pane endpoint that acts. Nothing
-    // here is allowed to navigate the tab — the schemes we mean to
-    // support open in the browser instead, the rest go nowhere.
+    // Every anchor on this page came out of agent markdown, so the click
+    // is taken first and answered afterwards: letting the browser follow
+    // one would unload the app, cancelling every running turn, and could
+    // hit a pane endpoint that acts.
     e.preventDefault();
     e.stopPropagation();
-    if (u && (u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'mailto:')) {
-      openExternal(u.href);
+    if (!u) return;
+    if (sameDocument(u)) {
+      scrollToAnchor(u.hash);
+      return;
     }
+    if (externalSchemes.indexOf(u.protocol) < 0) return;
+    // A same-origin URL that is not an in-page anchor is the navigation
+    // this guard exists to stop; handing it to openExternal would only
+    // move the same load into a second window aimed at the pane. Only the
+    // web schemes get this test — mailto: and friends report origin
+    // "null", which a page on a custom scheme would match.
+    var web = u.protocol === 'http:' || u.protocol === 'https:';
+    if (web && u.origin === location.origin) return;
+    openExternal(u.href);
   }, true);
 
   function boot() {

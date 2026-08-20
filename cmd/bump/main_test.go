@@ -111,6 +111,23 @@ func TestWriteVersionStampsMobile(t *testing.T) {
 	}
 }
 
+// A file that is present but has drifted out of the shape cmd/bump expects is
+// worse than a missing one: nothing is stamped, nothing is said, and the
+// release ships the old version.
+func TestWriteVersionReportsUnmatchedStamp(t *testing.T) {
+	dir := stampTree(t)
+	gradle := filepath.Join(dir, filepath.FromSlash("mobile/android/app/build.gradle.kts"))
+	if err := os.WriteFile(gradle, []byte("android { defaultConfig { } }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVersion(dir, "0.2.1"); err == nil {
+		t.Fatal("a gradle file with no version stamp should fail the write")
+	}
+	if err := replaceAll(gradle, reGradleName, "0.2.1", 2); err == nil {
+		t.Fatal("a regex that matched nothing reported success")
+	}
+}
+
 func TestWriteVersionReportsMissingMobile(t *testing.T) {
 	dir := stampTree(t)
 	if err := os.Remove(filepath.Join(dir, filepath.FromSlash("mobile/android/app/build.gradle.kts"))); err != nil {
@@ -177,6 +194,42 @@ func TestRepoMobileFilesMatchVERSION(t *testing.T) {
 	}
 	if !strings.Contains(string(gradle), "versionCode = "+buildCode(v)) {
 		t.Fatalf("gradle versionCode is not %s: %s", buildCode(v), gradle)
+	}
+}
+
+// The gate a developer runs and the gate CI runs have to be one gate. They
+// had drifted: make test grew -race and a coverage floor while CI still
+// called go test by hand, and both of them filtered the desktop package out,
+// so desktop/app_test.go ran in neither place.
+func TestReleaseGateIsOneGate(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Skip(err)
+	}
+	mk, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(mk), "\n") {
+		if !strings.HasPrefix(line, "\t") || !strings.Contains(line, "go test") {
+			continue
+		}
+		if !strings.Contains(line, "-race") {
+			t.Errorf("make runs a test without the race detector: %s", strings.TrimSpace(line))
+		}
+	}
+	if !strings.Contains(string(mk), "$(DESKTOP_TEST)") {
+		t.Error("make test does not run the desktop package's tests")
+	}
+	ci, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(".github/workflows/build.yml")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ci), "run: make test") {
+		t.Error("CI does not run make test, so it is not running the developer's gate")
+	}
+	if strings.Contains(string(ci), "grep -v '/desktop$'") {
+		t.Error("CI still drops the desktop package's tests on the floor")
 	}
 }
 

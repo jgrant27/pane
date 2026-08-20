@@ -130,16 +130,24 @@ func current(root string) ver {
 	return maxVer(vs)
 }
 
+// replaceAll rewrites capture group sub of every match with next. A file that
+// the pattern does not match at all is the dangerous case: the stamp quietly
+// does not happen and the release ships carrying the previous version, which
+// looks exactly like a stamp that worked. So count the matches and refuse to
+// call zero of them a success. Matching but writing nothing is fine — that is
+// just a file already sitting at the version being stamped.
 func replaceAll(path string, re *regexp.Regexp, next string, sub int) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
+	hits := 0
 	out := re.ReplaceAllFunc(b, func(m []byte) []byte {
 		parts := re.FindSubmatch(m)
 		if len(parts) <= sub {
 			return m
 		}
+		hits++
 		var buf []byte
 		for i := 1; i < len(parts); i++ {
 			if i == sub {
@@ -150,6 +158,9 @@ func replaceAll(path string, re *regexp.Regexp, next string, sub int) error {
 		}
 		return buf
 	})
+	if hits == 0 {
+		return fmt.Errorf("%s: no version stamp matching %s", path, re)
+	}
 	if bytes.Equal(b, out) {
 		return nil
 	}

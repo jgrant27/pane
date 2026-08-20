@@ -767,7 +767,7 @@ func TestReplyPermissionMarksToolCall(t *testing.T) {
 
 	raw := []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"}],
 	 "toolCall":{"toolCallId":"tc42","title":"Execute ` + "`ls`" + `","kind":"execute","rawInput":{"command":"ls"}}}}`)
-	s.replyPermission(json.RawMessage(`77`), raw)
+	s.replyPermission(json.RawMessage(`77`), raw, true)
 
 	s.pendMu.Lock()
 	seen := s.permSeen["tc42"]
@@ -778,4 +778,177 @@ func TestReplyPermissionMarksToolCall(t *testing.T) {
 	// An execute tool is gated, so the card goes to the browser rather than
 	// being answered on the spot.
 	sink.quiet(t)
+}
+
+// permRequest is one gated tool call, tagged with the session it belongs to.
+func permRequest(id int, sid string) []byte {
+	return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"session/request_permission","params":{
+	 "sessionId":%q,
+	 "options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],
+	 "toolCall":{"toolCallId":"tc-%d","title":"Execute `+"`rm -rf /`"+`","kind":"execute","rawInput":{"command":"rm -rf /"}}}}`, id, sid, id))
+}
+
+// permTab is one browser watching an ACP session id, with a sink standing in
+// for what that browser sees.
+func permTab(t *testing.T, h *agentHub, sid string) (*session, *frameSink) {
+	t.Helper()
+	c, sink := newSinkConn(t)
+	s := &session{id: sid, hub: h, browser: c, pendPerm: map[string]bool{}, permSeen: map[string]bool{}}
+	h.attach(sid, s)
+	return s, sink
+}
+
+// Two tabs on one session, both with a turn in flight, is a tie routing
+// cannot break. It used to answer "cancelled", so neither browser was shown
+// the card and the tool call was denied behind the user's back.
+func TestTiedTabsBothSeeThePermissionCard(t *testing.T) {
+	h, agent, toPane := hubWithAgent(t)
+	a, aSink := permTab(t, h, "shared")
+	b, bSink := permTab(t, h, "shared")
+	a.busy.Store(true)
+	b.busy.Store(true)
+
+	toPane <- permRequest(81, "shared")
+	for who, sink := range map[string]*frameSink{"a": aSink, "b": bSink} {
+		if got := sink.next(t)["type"]; got != "perm" {
+			t.Fatalf("tab %s saw %q instead of the card", who, got)
+		}
+	}
+	// Nothing is answered yet: the user is looking at the card.
+	agent.quiet(t)
+
+	a.completePerm("allow")
+	if kind, opt := outcome(t, agent.next(t)); kind != "selected" || opt != "allow_once" {
+		t.Fatalf("the answered card resolved to %q/%q", kind, opt)
+	}
+	// The first answer is the answer. The other tab's stale card must not
+	// reject the same request after it was allowed.
+	b.completePerm("deny")
+	b.clearPerm()
+	agent.quiet(t)
+}
+
+// A tab whose write side is already shut cannot show a card, so routing must
+// not pick it. Preferring the busy one handed the request to the socket that
+// was leaving, and clearPerm denied it when the turn ended.
+func TestCardSkipsADepartingBrowser(t *testing.T) {
+	h, agent, toPane := hubWithAgent(t)
+	leaving, _ := permTab(t, h, "shared")
+	leaving.busy.Store(true)
+	// The tab is on its way out: its prompt is still outstanding and routing
+	// still holds it, but nothing can reach it any more. Reattaching after
+	// the write side is shut is the window a teardown spends flushing.
+	leaving.stopWriting()
+	h.attach("shared", leaving)
+	_, stayingSink := permTab(t, h, "shared")
+
+	toPane <- permRequest(82, "shared")
+	if got := stayingSink.next(t)["type"]; got != "perm" {
+		t.Fatalf("the tab that could still show the card saw %q", got)
+	}
+	agent.quiet(t)
+}
+
+// The writer is the only thing that can notice a failed write. It used to
+// exit leaving the write side open, so toBrowser went on reporting frames
+// delivered into a queue nobody drains and the hub went on routing to a
+// socket with no writer.
+func TestFailedWriteEndsTheSession(t *testing.T) {
+	h := newAgentHub(nil)
+	c, _ := newSinkConn(t)
+	s := &session{id: "dead", hub: h, browser: c}
+	h.attach("dead", s)
+
+	_ = c.Close()
+	_ = s.toBrowser(map[string]string{"type": "out", "text": "first"})
+	waitFor(t, 3*time.Second, "the writer to notice the failed write", s.gone)
+
+	if err := s.toBrowser(map[string]string{"type": "out", "text": "second"}); err != errBrowserGone {
+		t.Fatalf("a frame queued with no writer left reported %v", err)
+	}
+	if len(h.lookupAll("dead")) != 0 {
+		t.Fatal("the hub still routes to a session whose writer is gone")
+	}
+}
+
+// A browser that stops draining must not park its writer for ever: the write
+// deadline is what turns a wedged socket into an error the session can act
+// on.
+func TestWriterGivesUpOnASocketThatNeverDrains(t *testing.T) {
+	h := newAgentHub(nil)
+	s := &session{id: "deaf", hub: h, browser: deafBrowser(t), writeWait: 50 * time.Millisecond}
+	h.attach("deaf", s)
+
+	// Fewer frames than the queue holds, so nothing here is the queue-full
+	// path — what has to stop the writer is the deadline on the write.
+	big := strings.Repeat("x", 128<<10)
+	for range browserQueue - 6 {
+		if err := s.toBrowser(map[string]any{"type": "out", "text": big}); err != nil {
+			t.Fatalf("the queue filled: this is the wrong path, %v", err)
+		}
+	}
+	waitFor(t, 5*time.Second, "the writer to give up on a socket that never drains", s.gone)
+}
+
+// A model switch writes the token budget from its own goroutine while usage
+// updates read it on the hub's readLoop. Nothing switched model while totals
+// were streaming, so the detector never had the two in flight together.
+func TestUsageReadsTheContextSizeUnderTheLock(t *testing.T) {
+	h, agent, toPane := hubWithAgent(t)
+	s := &session{id: "ctx", hub: h, models: []modelInfo{{ID: "big", Context: 4096}}, contextN: 1024}
+	s.live.Store(true)
+	h.attach("ctx", s)
+
+	usage := []byte(`{"sessionId":"ctx","update":{"sessionUpdate":"agent_message_chunk",
+	 "content":{"text":"x"},"_meta":{"totalTokens":7}}}`)
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.forwardUpdate(usage)
+			}
+		}
+	}()
+
+	go s.setModel("big")
+	id, _ := agent.next(t)["id"].(float64)
+	toPane <- []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{}}`, int64(id)))
+	waitFor(t, 3*time.Second, "the switch to apply the new budget", func() bool {
+		return s.contextSize() == 4096
+	})
+	close(stop)
+	<-done
+}
+
+// Closing the write side flushes what is already queued: the last frame of a
+// session is usually the one that explains why it ended.
+func TestClosingFlushesQueuedFrames(t *testing.T) {
+	c, sink := newSinkConn(t)
+	s := &session{id: "flush", hub: newAgentHub(nil), browser: c, writeWait: browserWriteWait}
+	// The queue is filled before the writer exists, so every frame is still
+	// waiting when it starts and finds the session already closing. That is
+	// the state startWriter would have handed it, minus the race.
+	s.outCh = make(chan any, browserQueue)
+	s.closing = make(chan struct{})
+	s.written = make(chan struct{})
+	for i := range 20 {
+		s.outCh <- map[string]any{"type": "out", "text": fmt.Sprint(i)}
+	}
+	s.endWrites()
+	go s.writeLoop()
+
+	select {
+	case <-s.written:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the writer never finished")
+	}
+	for i := range 20 {
+		if got := sink.next(t)["text"]; got != fmt.Sprint(i) {
+			t.Fatalf("frame %d arrived as %v", i, got)
+		}
+	}
 }
