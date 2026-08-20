@@ -188,6 +188,12 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "function paintProjectList") {
 		t.Fatal("projects rail must paint the current project even when pane is down")
 	}
+	if !strings.Contains(src, "function liveSessionFor") || !strings.Contains(src, "function deactivateView") {
+		t.Fatal("switching projects must hide the other project's streaming transcript")
+	}
+	if !strings.Contains(src, "function foreignSession") {
+		t.Fatal("a session socket must ignore agent chunks tagged for another session")
+	}
 	if !strings.Contains(src, "pane not reachable") {
 		t.Fatal("a down pane must say so instead of hanging on connecting")
 	}

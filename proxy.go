@@ -25,6 +25,25 @@ type proxy struct {
 	agentBase string
 	secret    string
 	cwd       string
+
+	hubMu sync.Mutex
+	hub   *agentHub
+}
+
+// One ACP WebSocket to grok agent serve. Pane used to dial a new agent
+// socket per browser tab; grok's persistent agent then replaced the
+// actor and the in-flight reply landed in whichever project you had
+// just switched to.
+type agentHub struct {
+	conn     *websocket.Conn
+	imageCap bool
+	dead     atomic.Bool
+
+	wmu      sync.Mutex
+	mu       sync.Mutex
+	nextID   atomic.Int64
+	pending  map[int64]chan json.RawMessage
+	sessions map[string]*session
 }
 
 func (p *proxy) handleMeta(w http.ResponseWriter, r *http.Request) {
@@ -63,22 +82,22 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer browser.Close()
 
-	agent, err := dialAgent(p.agentBase, p.secret, 8*time.Second)
+	h, err := p.ensureHub()
 	if err != nil {
 		_ = writeJSON(browser, map[string]string{"type": "err", "text": err.Error()})
 		return
 	}
-	defer agent.Close()
 
 	s := &session{
 		browser:    browser,
-		agent:      agent,
+		hub:        h,
 		cwd:        p.sessionCwd(r),
 		resumeID:   strings.TrimSpace(r.URL.Query().Get("sid")),
 		replay:     r.URL.Query().Get("replay") == "1",
 		wantModel:  strings.TrimSpace(r.URL.Query().Get("model")),
 		wantEffort: strings.TrimSpace(r.URL.Query().Get("effort")),
 	}
+	defer h.drop(s)
 	if err := s.handshake(); err != nil {
 		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
 		return
@@ -89,9 +108,50 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.loop()
 }
 
+func (p *proxy) ensureHub() (*agentHub, error) {
+	p.hubMu.Lock()
+	defer p.hubMu.Unlock()
+	if p.hub != nil && !p.hub.dead.Load() {
+		return p.hub, nil
+	}
+	conn, err := dialAgent(p.agentBase, p.secret, 8*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	h := &agentHub{
+		conn:     conn,
+		pending:  map[int64]chan json.RawMessage{},
+		sessions: map[string]*session{},
+	}
+	go h.readLoop()
+	init, err := h.rpc("initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientInfo": map[string]string{
+			"name":    "grok-pane",
+			"title":   "Grok Pane",
+			"version": "0.2.3",
+		},
+		"clientCapabilities": map[string]any{
+			"fs":       map[string]bool{"readTextFile": false, "writeTextFile": false},
+			"terminal": false,
+		},
+	})
+	if err != nil {
+		h.shutdown()
+		return nil, err
+	}
+	if err := rpcError(init); err != nil {
+		h.shutdown()
+		return nil, err
+	}
+	h.imageCap = parsePromptCaps(init)
+	p.hub = h
+	return h, nil
+}
+
 type session struct {
 	browser    *websocket.Conn
-	agent      *websocket.Conn
+	hub        *agentHub
 	cwd        string
 	id         string
 	resumeID   string
@@ -106,8 +166,6 @@ type session struct {
 
 	mu       sync.Mutex
 	bmu      sync.Mutex
-	nextID   atomic.Int64
-	pending  map[int64]chan json.RawMessage
 	busy     atomic.Bool
 	live     atomic.Bool
 	prompted atomic.Bool
@@ -131,28 +189,12 @@ func (s *session) toBrowser(v any) error {
 }
 
 func (s *session) handshake() error {
-	s.pending = map[int64]chan json.RawMessage{}
-	go s.readAgent()
-
-	init, err := s.rpc("initialize", map[string]any{
-		"protocolVersion": 1,
-		"clientInfo": map[string]string{
-			"name":    "grok-pane",
-			"title":   "Grok Pane",
-			"version": "0.2.3",
-		},
-		"clientCapabilities": map[string]any{
-			"fs":       map[string]bool{"readTextFile": false, "writeTextFile": false},
-			"terminal": false,
-		},
-	})
-	if err != nil {
-		return err
+	if s.hub != nil {
+		s.imageCap = s.hub.imageCap
 	}
-	if err := rpcError(init); err != nil {
-		return err
+	if s.hub != nil && s.resumeID != "" {
+		s.hub.attach(s.resumeID, s)
 	}
-	s.imageCap = parsePromptCaps(init)
 
 	meta := map[string]any{
 		"yoloMode": false,
@@ -185,6 +227,9 @@ func (s *session) handshake() error {
 		s.id = out.SessionID
 	} else if s.resumeID != "" {
 		s.id = s.resumeID
+	}
+	if s.hub != nil && s.id != "" {
+		s.hub.attach(s.id, s)
 	}
 	if s.resumeID != "" && s.replay {
 		s.replayHistory()
@@ -320,30 +365,59 @@ func (s *session) prompt(text string, files []promptFile) {
 }
 
 func (s *session) rpc(method string, params any) (json.RawMessage, error) {
-	id := s.nextID.Add(1)
-	ch := make(chan json.RawMessage, 1)
-	s.mu.Lock()
-	s.pending[id] = ch
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.pending, id)
-		s.mu.Unlock()
-	}()
+	if s == nil || s.hub == nil {
+		return nil, errNoAgent
+	}
+	return s.hub.rpc(method, params)
+}
 
-	env := map[string]any{
+func (s *session) notify(method string, params any) {
+	if s == nil || s.hub == nil {
+		return
+	}
+	s.hub.notify(method, params)
+}
+
+var (
+	errTimeout = timeoutErr("agent rpc timeout")
+	errNoAgent = timeoutErr("no agent")
+)
+
+type timeoutErr string
+
+func (e timeoutErr) Error() string { return string(e) }
+
+func (h *agentHub) writeJSON(v any) error {
+	if h == nil || h.conn == nil || h.dead.Load() {
+		return errNoAgent
+	}
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	return h.conn.WriteJSON(v)
+}
+
+func (h *agentHub) rpc(method string, params any) (json.RawMessage, error) {
+	if h == nil || h.dead.Load() {
+		return nil, errNoAgent
+	}
+	id := h.nextID.Add(1)
+	ch := make(chan json.RawMessage, 1)
+	h.mu.Lock()
+	h.pending[id] = ch
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		delete(h.pending, id)
+		h.mu.Unlock()
+	}()
+	if err := h.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  method,
 		"params":  params,
-	}
-	s.mu.Lock()
-	err := s.agent.WriteJSON(env)
-	s.mu.Unlock()
-	if err != nil {
+	}); err != nil {
 		return nil, err
 	}
-
 	select {
 	case raw := <-ch:
 		return raw, nil
@@ -352,28 +426,133 @@ func (s *session) rpc(method string, params any) (json.RawMessage, error) {
 	}
 }
 
-func (s *session) notify(method string, params any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.agent.WriteJSON(map[string]any{
+func (h *agentHub) notify(method string, params any) {
+	_ = h.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  method,
 		"params":  params,
 	})
 }
 
-var errTimeout = timeoutErr("agent rpc timeout")
+func (h *agentHub) attach(id string, s *session) {
+	id = strings.TrimSpace(id)
+	if h == nil || s == nil || id == "" {
+		return
+	}
+	h.mu.Lock()
+	h.sessions[id] = s
+	h.mu.Unlock()
+}
 
-type timeoutErr string
+func (h *agentHub) detach(s *session) {
+	if h == nil || s == nil {
+		return
+	}
+	h.mu.Lock()
+	for id, cur := range h.sessions {
+		if cur == s {
+			delete(h.sessions, id)
+		}
+	}
+	h.mu.Unlock()
+}
 
-func (e timeoutErr) Error() string { return string(e) }
+func (h *agentHub) drop(s *session) {
+	if h == nil || s == nil {
+		return
+	}
+	if s.busy.Load() && s.id != "" {
+		h.notify("session/cancel", map[string]any{"sessionId": s.id})
+	}
+	h.detach(s)
+}
 
-func (s *session) readAgent() {
-	for {
-		_, data, err := s.agent.ReadMessage()
-		if err != nil {
+func (h *agentHub) shutdown() {
+	if h == nil {
+		return
+	}
+	h.dead.Store(true)
+	if h.conn != nil {
+		_ = h.conn.Close()
+	}
+}
+
+func (h *agentHub) lookup(sid string) *session {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sid = strings.TrimSpace(sid)
+	if sid != "" {
+		return h.sessions[sid]
+	}
+	seen := map[*session]struct{}{}
+	var only, busy *session
+	n, nBusy := 0, 0
+	for _, s := range h.sessions {
+		if s == nil {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		n++
+		only = s
+		if s.busy.Load() {
+			busy = s
+			nBusy++
+		}
+	}
+	if n == 1 {
+		return only
+	}
+	if nBusy == 1 {
+		return busy
+	}
+	return nil
+}
+
+func (h *agentHub) readLoop() {
+	defer func() {
+		h.dead.Store(true)
+		h.mu.Lock()
+		list := make([]*session, 0, len(h.sessions))
+		seen := map[*session]struct{}{}
+		for _, s := range h.sessions {
+			if s == nil {
+				continue
+			}
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			list = append(list, s)
+		}
+		h.sessions = map[string]*session{}
+		pending := h.pending
+		h.pending = map[int64]chan json.RawMessage{}
+		h.mu.Unlock()
+		for _, ch := range pending {
+			select {
+			case ch <- json.RawMessage(`{"error":{"message":"agent closed"}}`):
+			default:
+			}
+		}
+		for _, s := range list {
 			_ = s.toBrowser(map[string]string{"type": "err", "text": "agent closed"})
-			_ = s.browser.Close()
+			if s.browser != nil {
+				_ = s.browser.Close()
+			}
+		}
+		if h.conn != nil {
+			_ = h.conn.Close()
+		}
+	}()
+	for {
+		_, data, err := h.conn.ReadMessage()
+		if err != nil {
 			return
 		}
 		var env struct {
@@ -389,25 +568,33 @@ func (s *session) readAgent() {
 		}
 
 		if env.Method == "session/request_permission" {
-			s.replyPermission(env.ID, data)
+			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
+				s.replyPermission(env.ID, data)
+			}
 			continue
 		}
 		if isAskMethod(env.Method) {
-			s.offerAsk(env.ID, env.Method, parseAskQuestions(env.Params))
+			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
+				s.offerAsk(env.ID, env.Method, parseAskQuestions(env.Params))
+			}
 			continue
 		}
 		if env.Method == "session/update" || env.Method == "x.ai/session/update" {
-			s.forwardUpdate(env.Params)
+			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
+				s.forwardUpdate(env.Params)
+			}
 			continue
 		}
 		if env.Method != "" && rpcIDSet(env.ID) {
-			s.replyMethodNotFound(env.ID, env.Method)
+			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
+				s.replyMethodNotFound(env.ID, env.Method)
+			}
 			continue
 		}
 		if n, ok := rpcIDInt(env.ID); ok {
-			s.mu.Lock()
-			ch := s.pending[n]
-			s.mu.Unlock()
+			h.mu.Lock()
+			ch := h.pending[n]
+			h.mu.Unlock()
 			if ch != nil {
 				if len(env.Error) > 0 && string(env.Error) != "null" {
 					ch <- json.RawMessage(`{"error":` + string(env.Error) + `}`)
@@ -417,6 +604,25 @@ func (s *session) readAgent() {
 			}
 		}
 	}
+}
+
+func paramsSessionID(params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	var wrap struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(params, &wrap)
+	return strings.TrimSpace(wrap.SessionID)
+}
+
+func (s *session) owns(sid string) bool {
+	sid = strings.TrimSpace(sid)
+	if sid == "" {
+		return true
+	}
+	return sid == s.id || sid == s.resumeID
 }
 
 func (s *session) replyPermission(id json.RawMessage, raw []byte) {
@@ -472,6 +678,9 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte) {
 }
 
 func (s *session) forwardUpdate(params json.RawMessage) {
+	if sid := paramsSessionID(params); !s.owns(sid) {
+		return
+	}
 	var wrap struct {
 		Update json.RawMessage `json:"update"`
 	}
@@ -513,9 +722,9 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	text := contentText(u.Content)
 	switch u.SessionUpdate {
 	case "agent_message_chunk":
-		_ = s.toBrowser(map[string]string{"type": "out", "text": text})
+		_ = s.toBrowser(map[string]string{"type": "out", "text": text, "session": s.id})
 	case "agent_thought_chunk":
-		_ = s.toBrowser(map[string]string{"type": "thought", "text": text})
+		_ = s.toBrowser(map[string]string{"type": "thought", "text": text, "session": s.id})
 	case "user_message_chunk":
 		// already echoed
 	case "tool_call", "tool_call_update":
@@ -1239,12 +1448,10 @@ func (s *session) clearPerm() {
 }
 
 func (s *session) writePermResult(id json.RawMessage, option string) {
-	if s == nil || s.agent == nil || !rpcIDSet(id) {
+	if s == nil || s.hub == nil || !rpcIDSet(id) {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.agent.WriteJSON(map[string]any{
+	_ = s.hub.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"result": map[string]any{
@@ -1257,12 +1464,10 @@ func (s *session) writePermResult(id json.RawMessage, option string) {
 }
 
 func (s *session) writeAskResult(id json.RawMessage, result any) {
-	if s == nil || s.agent == nil || !rpcIDSet(id) {
+	if s == nil || s.hub == nil || !rpcIDSet(id) {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.agent.WriteJSON(map[string]any{
+	_ = s.hub.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"result":  result,
@@ -1270,12 +1475,10 @@ func (s *session) writeAskResult(id json.RawMessage, result any) {
 }
 
 func (s *session) replyMethodNotFound(id json.RawMessage, method string) {
-	if s == nil || s.agent == nil || !rpcIDSet(id) {
+	if s == nil || s.hub == nil || !rpcIDSet(id) {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.agent.WriteJSON(map[string]any{
+	_ = s.hub.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"error": map[string]any{

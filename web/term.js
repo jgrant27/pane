@@ -966,6 +966,7 @@
     ws.onmessage = function (ev) {
       var msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (foreignSession(s, msg)) return;
       switch (msg.type) {
         case 'ready':
           s.reconnects = 0;
@@ -2413,6 +2414,45 @@
     setStatus('copied path', 'ok');
   });
 
+  function liveSessionFor(cwd) {
+    cwd = normPath(cwd);
+    if (!cwd) return null;
+    var lastSid = stored('pane-last-sid:' + cwd);
+    var list = sessions.filter(function (s) { return !s.dead && samePath(s.cwd, cwd); });
+    var i;
+    if (lastSid) {
+      for (i = 0; i < list.length; i++) {
+        if (list[i].id === lastSid || list[i].resumeID === lastSid) return list[i];
+      }
+    }
+    return list[0] || null;
+  }
+
+  function foreignSession(s, msg) {
+    var id = msg && msg.session;
+    if (!id || !s) return false;
+    if (s.id && s.id === id) return false;
+    if (s.resumeID && s.resumeID === id) return false;
+    return !!(s.id || s.resumeID);
+  }
+
+  function deactivateView() {
+    sessions.forEach(function (x) {
+      if (x.el) x.el.classList.remove('active');
+    });
+    if (!active) return;
+    active = null;
+    setStatus('', 'ok');
+    document.documentElement.dataset.busy = 'false';
+    document.documentElement.setAttribute('aria-busy', 'false');
+    syncSend();
+    paintQueue();
+    paintCatalog();
+    paintUsage();
+    syncJump();
+    highlightActiveSession();
+  }
+
   function setProject(path) {
     if (!path) return;
     path = normPath(path);
@@ -2426,9 +2466,16 @@
     try { localStorage.setItem('pane-project', path); } catch (e) {}
     paintCwd(path);
     loadProjects();
-    if (active && samePath(active.cwd, path)) {
+    sessPaintKey = '';
+    paintSessions();
+    var live = liveSessionFor(path);
+    if (live) {
+      activate(live);
       loadHistory(path);
       return;
+    }
+    if (active && !samePath(active.cwd, path)) {
+      deactivateView();
     }
     loadHistory(path, { resume: true });
   }

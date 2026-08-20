@@ -6,6 +6,68 @@ import (
 	"testing"
 )
 
+func TestSessionOwnsAndHubLookup(t *testing.T) {
+	s := &session{id: "aaa", resumeID: "bbb"}
+	if !s.owns("") || !s.owns("aaa") || !s.owns("bbb") || s.owns("ccc") {
+		t.Fatal("owns")
+	}
+	if paramsSessionID(nil) != "" || paramsSessionID([]byte(`{"sessionId":"x","update":{}}`)) != "x" {
+		t.Fatal("sessionId")
+	}
+	s.live.Store(true)
+	s.forwardUpdate([]byte(`{"sessionId":"nope","update":{"sessionUpdate":"agent_message_chunk","content":{"text":"LEAK"}}}`))
+
+	if _, err := (&session{}).rpc("x", nil); err == nil {
+		t.Fatal("rpc without hub")
+	}
+	(&session{}).notify("x", nil)
+
+	dead := &agentHub{}
+	dead.dead.Store(true)
+	if err := dead.writeJSON(map[string]string{"a": "b"}); err == nil {
+		t.Fatal("dead write")
+	}
+	if _, err := dead.rpc("x", nil); err == nil {
+		t.Fatal("dead rpc")
+	}
+
+	h := &agentHub{sessions: map[string]*session{}}
+	if h.lookup("x") != nil || (*agentHub)(nil).lookup("x") != nil {
+		t.Fatal("empty lookup")
+	}
+	a := &session{id: "a"}
+	b := &session{id: "b"}
+	h.attach("a", a)
+	h.attach("a-resume", a)
+	h.attach("", a)
+	if h.lookup("a") != a || h.lookup("") != a {
+		t.Fatal("single")
+	}
+	h.attach("b", b)
+	a.busy.Store(true)
+	if h.lookup("") != a || h.lookup("b") != b {
+		t.Fatal("busy untagged")
+	}
+	b.busy.Store(true)
+	if h.lookup("") != nil {
+		t.Fatal("two busy")
+	}
+	h.drop(a)
+	if h.lookup("a") != nil || h.lookup("b") != b {
+		t.Fatal("drop a")
+	}
+	h.detach(b)
+	if h.lookup("b") != nil {
+		t.Fatal("detach b")
+	}
+	(*agentHub)(nil).shutdown()
+	(*agentHub)(nil).drop(a)
+	(*agentHub)(nil).detach(a)
+	h.drop(nil)
+	h.detach(nil)
+	h.shutdown()
+}
+
 func TestContentText(t *testing.T) {
 	cases := []struct {
 		in   any

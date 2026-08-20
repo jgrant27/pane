@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -400,5 +402,266 @@ func TestSessionCwdAndForward(t *testing.T) {
 	}
 	if ctxn := (&session{contextN: 3}).contextFor("missing"); ctxn != 3 {
 		t.Fatal(ctxn)
+	}
+}
+
+func startSharedMockAgent(t *testing.T, secret string, upgrades *atomic.Int32) string {
+	t.Helper()
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "Invalid or missing authorization token", http.StatusUnauthorized)
+			return
+		}
+		upgrades.Add(1)
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go sharedMockACP(c, &n)
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+func sharedMockACP(c *websocket.Conn, n *atomic.Int64) {
+	defer c.Close()
+	for {
+		_, data, err := c.ReadMessage()
+		if err != nil {
+			return
+		}
+		var env struct {
+			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if json.Unmarshal(data, &env) != nil || env.Method == "" || env.ID == nil {
+			continue
+		}
+		switch env.Method {
+		case "initialize":
+			_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": map[string]any{}})
+		case "session/new", "session/load":
+			sid := fmt.Sprintf("01share%022d", n.Add(1))
+			_ = c.WriteJSON(map[string]any{
+				"jsonrpc": "2.0", "id": *env.ID,
+				"result": map[string]any{"sessionId": sid},
+			})
+		case "session/prompt":
+			var p struct {
+				SessionID string `json:"sessionId"`
+			}
+			_ = json.Unmarshal(env.Params, &p)
+			_ = c.WriteJSON(map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "session/update",
+				"params": map[string]any{
+					"sessionId": p.SessionID,
+					"update":    map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"text": "mine:" + p.SessionID}},
+				},
+			})
+			_ = c.WriteJSON(map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "session/update",
+				"params": map[string]any{
+					"sessionId": "01FOREIGNSESSIONNOTOURSXXXX",
+					"update":    map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"text": "LEAK"}},
+				},
+			})
+			_ = c.WriteJSON(map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "session/update",
+				"params": map[string]any{
+					"update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"text": "untagged"}},
+				},
+			})
+			_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": map[string]any{}})
+		default:
+			_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": map[string]any{}})
+		}
+	}
+}
+
+func dialPaneSession(t *testing.T, paneURL, cwd string) (*websocket.Conn, string) {
+	t.Helper()
+	u := "ws" + strings.TrimPrefix(paneURL, "http") + "/ws?cwd=" + cwd
+	c, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var ready map[string]any
+	if err := c.ReadJSON(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready["type"] != "ready" {
+		t.Fatalf("ready %v", ready)
+	}
+	sid, _ := ready["session"].(string)
+	if sid == "" {
+		t.Fatalf("no session id: %v", ready)
+	}
+	return c, sid
+}
+
+func readUntilIdle(t *testing.T, c *websocket.Conn, d time.Duration) []string {
+	t.Helper()
+	var texts []string
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		var msg map[string]any
+		if err := c.ReadJSON(&msg); err != nil {
+			continue
+		}
+		switch msg["type"] {
+		case "out":
+			if s, _ := msg["text"].(string); s != "" {
+				texts = append(texts, s)
+			}
+		case "idle":
+			return texts
+		}
+	}
+	return texts
+}
+
+func drainOut(c *websocket.Conn, d time.Duration) []string {
+	var texts []string
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
+		var msg map[string]any
+		if err := c.ReadJSON(&msg); err != nil {
+			return texts
+		}
+		if msg["type"] == "out" {
+			if s, _ := msg["text"].(string); s != "" {
+				texts = append(texts, s)
+			}
+		}
+	}
+	return texts
+}
+
+func TestHandleWSSharesAgentAndDoesNotCrossTalk(t *testing.T) {
+	secret := "hub-secret"
+	var upgrades atomic.Int32
+	agent := startSharedMockAgent(t, secret, &upgrades)
+	dir := t.TempDir()
+	p := &proxy{agentBase: agent, secret: secret, cwd: dir}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+
+	a, sidA := dialPaneSession(t, srv.URL, dir)
+	b, sidB := dialPaneSession(t, srv.URL, dir)
+	if sidA == sidB {
+		t.Fatalf("same session id %s", sidA)
+	}
+	if upgrades.Load() != 1 {
+		t.Fatalf("agent connections %d want 1", upgrades.Load())
+	}
+
+	if err := a.WriteJSON(map[string]any{"type": "in", "text": "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	got := readUntilIdle(t, a, 5*time.Second)
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "mine:"+sidA) {
+		t.Fatalf("missing own chunk: %v", got)
+	}
+	if !strings.Contains(joined, "untagged") {
+		t.Fatalf("untagged should follow the busy session: %v", got)
+	}
+	if strings.Contains(joined, "LEAK") {
+		t.Fatalf("foreign sessionId leaked onto A: %v", got)
+	}
+	if leak := drainOut(b, 300*time.Millisecond); len(leak) != 0 {
+		t.Fatalf("B saw A's turn: %v", leak)
+	}
+}
+
+func TestHandleWSResumeSession(t *testing.T) {
+	secret := "resume-secret"
+	agent := startMockAgent(t, secret)
+	dir := t.TempDir()
+	p := &proxy{agentBase: agent, secret: secret, cwd: dir}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?sid=01mocksessionxxxxxxxxxxxxxxxx&replay=1"
+	c, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var ready map[string]any
+	if err := c.ReadJSON(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready["type"] != "ready" || ready["session"] != "01mocksessionxxxxxxxxxxxxxxxx" {
+		t.Fatalf("%v", ready)
+	}
+}
+
+func TestEnsureHubAgentHangup(t *testing.T) {
+	secret := "hangup-secret"
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = c.Close()
+	}))
+	t.Cleanup(agent.Close)
+	p := &proxy{agentBase: "ws" + strings.TrimPrefix(agent.URL, "http"), secret: secret, cwd: t.TempDir()}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	c, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var msg map[string]any
+	if err := c.ReadJSON(&msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg["type"] != "err" {
+		t.Fatalf("%v", msg)
+	}
+}
+
+func TestHubAgentDeathClosesBrowsers(t *testing.T) {
+	secret := "die-secret"
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go mockACP(c)
+	}))
+	p := &proxy{agentBase: "ws" + strings.TrimPrefix(agent.URL, "http"), secret: secret, cwd: t.TempDir()}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	c, _ := dialPaneSession(t, srv.URL, p.cwd)
+	agent.Close()
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var msg map[string]any
+	if err := c.ReadJSON(&msg); err != nil {
+		return
+	}
+	if msg["type"] != "err" {
+		t.Fatalf("%v", msg)
 	}
 }
