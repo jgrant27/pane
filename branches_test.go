@@ -72,8 +72,8 @@ func TestUploadErrorBranches(t *testing.T) {
 		}
 	}
 	p := uniquePath(dir, "dup.txt")
-	if filepath.Base(p) == "dup.txt" && exists(filepath.Join(dir, "dup.txt")) {
-		// may be dup-N
+	if exists(p) {
+		t.Fatalf("uniquePath handed back a name that is already taken: %s", p)
 	}
 }
 
@@ -117,8 +117,8 @@ func TestUsageAndRenameBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	u = readSessionUsage(cwd, id)
-	if u.Model != "" && u.Used != 0 {
-		// invalid json returns empty
+	if u.Used != 0 || u.Pct != 0 || u.Model != "" {
+		t.Fatalf("unparseable signals.json must read as empty: %+v", u)
 	}
 
 	if err := renameGrokSession(cwd, "../x", "t"); err == nil {

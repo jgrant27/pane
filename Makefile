@@ -62,9 +62,12 @@ COVER_PKG ?= github.com/jgrant27/pane
 COVER_MIN ?= 90
 COVER_OUT ?= cover.out
 
+# -race is part of the gate, not an occasional extra: the proxy hands one
+# agent socket to many browser sessions, which is exactly where a race
+# would hide and exactly where it would cost most.
 test:
-	go test -count=1 $(filter-out $(COVER_PKG),$(TEST_PKGS))
-	go test -count=1 -covermode=atomic -coverprofile=$(COVER_OUT) $(COVER_PKG)
+	go test -count=1 -race $(filter-out $(COVER_PKG),$(TEST_PKGS))
+	go test -count=1 -race -covermode=atomic -coverprofile=$(COVER_OUT) $(COVER_PKG)
 	@go tool cover -func=$(COVER_OUT)
 	@go run ./cmd/covercheck -min=$(COVER_MIN) $(COVER_OUT)
 
@@ -80,7 +83,8 @@ deploy: test
 	fi; \
 	git fetch --tags origin; \
 	v=$$(go run ./cmd/bump -bump "$(BUMP)" -write); \
-	git add VERSION desktop/wails.json desktop/Info.plist proxy.go; \
+	git add VERSION desktop/wails.json desktop/Info.plist proxy.go \
+		mobile/ios/GrokPane/Info.plist mobile/android/app/build.gradle.kts; \
 	if git diff --cached --quiet; then \
 		echo "pane: files already at $$v"; \
 	else \

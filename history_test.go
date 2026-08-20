@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -380,5 +383,214 @@ func TestAppendReplay(t *testing.T) {
 	evs = appendReplay(evs, "out", "hi")
 	if len(evs) != 2 || evs[0].Text != "hello" || evs[1].Text != "hi" {
 		t.Fatalf("%+v", evs)
+	}
+}
+
+func TestAppendReplayWhitespace(t *testing.T) {
+	// A bubble may not open on whitespace: that is the empty first bubble a
+	// resumed session used to show.
+	if evs := appendReplay(nil, "out", "\n"); len(evs) != 0 {
+		t.Fatalf("whitespace-only chunk started a bubble: %+v", evs)
+	}
+	if evs := appendReplay(nil, "out", " \t\n"); len(evs) != 0 {
+		t.Fatalf("whitespace-only chunk started a bubble: %+v", evs)
+	}
+	// Inside a message the same chunk is a paragraph break and must survive.
+	evs := appendReplay(nil, "out", "one")
+	evs = appendReplay(evs, "out", "\n\n")
+	evs = appendReplay(evs, "out", "two")
+	if len(evs) != 1 || evs[0].Text != "one\n\ntwo" {
+		t.Fatalf("lost the blank line between paragraphs: %+v", evs)
+	}
+	// Types that never merge always open a bubble, so whitespace-only is
+	// dropped there too.
+	if evs := appendReplay([]replayEvent{{Type: "tool", Text: "x"}}, "tool", "  "); len(evs) != 1 {
+		t.Fatalf("%+v", evs)
+	}
+}
+
+// A session's updates.jsonl is mostly tool traffic, so a transcript request
+// walks a long way back. The walk must cost about what it reads, not the
+// square of it: /v1/transcript on a real 85 MB session took 4.6s and 6.5 GB
+// when every chunk re-parsed the whole accumulated tail.
+func TestReplayUpdatesTailCostStaysLinear(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	cwd := "/Users/jgrant/stuff/demo"
+	dir := filepath.Join(sessionGroupDir(cwd), "01big")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const chats = 200
+	path := filepath.Join(dir, "updates.jsonl")
+	writeSparseUpdates(t, path, chats)
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	evs := replayUpdates(cwd, "01big", 400)
+	runtime.ReadMemStats(&after)
+
+	if len(evs) != chats {
+		t.Fatalf("want %d events, got %d", chats, len(evs))
+	}
+	if evs[0].Text != "m0" || evs[len(evs)-1].Text != fmt.Sprintf("m%d", chats-1) {
+		t.Fatalf("first %+v last %+v", evs[0], evs[len(evs)-1])
+	}
+	// Reading the file once and parsing it once costs about its size. The
+	// version that re-parsed the accumulated tail allocated fifteen times it
+	// on this input, and much worse on a real 85 MB session.
+	if limit := uint64(st.Size()) * 4; after.TotalAlloc-before.TotalAlloc > limit {
+		t.Fatalf("allocated %d bytes for a %d byte file (limit %d)",
+			after.TotalAlloc-before.TotalAlloc, st.Size(), limit)
+	}
+}
+
+// writeSparseUpdates writes an updates.jsonl shaped like a real session: chat
+// lines are rare, buried in tool traffic, so the tail walk has to go a long
+// way back before it has enough of them.
+func writeSparseUpdates(t *testing.T, path string, chats int) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := bufio.NewWriterSize(f, 1<<20)
+	filler := `{"params":{"update":{"sessionUpdate":"tool_call","title":"` + strings.Repeat("x", 900) + `"}}}` + "\n"
+	for i := 0; i < chats; i++ {
+		for j := 0; j < 70; j++ {
+			if _, err := w.WriteString(filler); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Alternating speakers, because two chunks of the same speaker are
+		// one message and come back as one event.
+		kind := "user_message_chunk"
+		if i%2 == 1 {
+			kind = "agent_message_chunk"
+		}
+		if _, err := fmt.Fprintf(w, `{"params":{"update":{"sessionUpdate":%q,"content":{"text":"m%d"}}}}`+"\n", kind, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBoundedCarry(t *testing.T) {
+	if got := boundedCarry([]byte("half a line")); string(got) != "half a line" {
+		t.Fatalf("%q", got)
+	}
+	// A line the parser would skip anyway must not be dragged back through
+	// every chunk of the walk.
+	if got := boundedCarry(make([]byte, maxReplayLine+1)); got != nil {
+		t.Fatalf("carried %d bytes of a line that is too long to parse", len(got))
+	}
+}
+
+func TestReplayUpdatesMergesAcrossChunkBoundary(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	cwd := "/Users/jgrant/stuff/demo"
+	dir := filepath.Join(sessionGroupDir(cwd), "01seam")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// One message streamed as many chunks, long enough to straddle the 512 KB
+	// read boundary: it is one bubble, not one per chunk of the file.
+	var b strings.Builder
+	b.WriteString(`{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"q"}}}}` + "\n")
+	line := `{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"` + strings.Repeat("a", 100) + `"}}}}` + "\n"
+	for i := 0; i < 20_000; i++ {
+		b.WriteString(line)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "updates.jsonl"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	evs := replayUpdates(cwd, "01seam", 400)
+	if len(evs) != 2 || evs[0].Type != "you" || evs[1].Type != "out" {
+		t.Fatalf("one question and one answer came back as %d events", len(evs))
+	}
+	if want := 20_000 * 100; len(evs[1].Text) != want {
+		t.Fatalf("answer is %d bytes, want %d", len(evs[1].Text), want)
+	}
+}
+
+func TestListGrokProjectsCaching(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	cwd := t.TempDir()
+	id := "01cachexxxxxxxxxxxxxxxxxxxxx"
+	dir := filepath.Join(sessionGroupDir(cwd), id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(sid, updated string) {
+		t.Helper()
+		d := filepath.Join(sessionGroupDir(cwd), sid)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sum := []byte(`{"info":{"id":"` + sid + `","cwd":"` + cwd + `"},"generated_title":"T","updated_at":"` + updated + `","num_messages":2}`)
+		if err := os.WriteFile(filepath.Join(d, "summary.json"), sum, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(id, "2026-08-17T12:00:00Z")
+	first := listGrokProjects()
+	if len(first) != 1 || first[0].Updated != "2026-08-17T12:00:00Z" {
+		t.Fatalf("%+v", first)
+	}
+
+	// Rewriting a summary in place leaves every directory mtime alone, so the
+	// second call must be answered from the cache without reading it again.
+	write(id, "2026-08-18T12:00:00Z")
+	if got := listGrokProjects(); got[0].Updated != "2026-08-17T12:00:00Z" {
+		t.Fatalf("summary re-read on every call: %+v", got)
+	}
+
+	// A new session changes the group's mtime, and that has to be seen at once.
+	write("01cache2xxxxxxxxxxxxxxxxxxxx", "2026-08-19T12:00:00Z")
+	got := listGrokProjects()
+	if len(got) != 1 || got[0].Sessions != 2 || got[0].Updated != "2026-08-19T12:00:00Z" {
+		t.Fatalf("new session not picked up: %+v", got)
+	}
+
+	// So does a delete, which also invalidates the cache explicitly.
+	if err := deleteGrokSession(cwd, "01cache2xxxxxxxxxxxxxxxxxxxx"); err != nil {
+		t.Fatal(err)
+	}
+	if got := listGrokProjects(); len(got) != 1 || got[0].Sessions != 1 {
+		t.Fatalf("deleted session still listed: %+v", got)
+	}
+
+	// A rename overwrites .name in place; nothing else would notice.
+	if err := renameGrokProject(cwd, "Renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameGrokProject(cwd, "Renamed twice"); err != nil {
+		t.Fatal(err)
+	}
+	if got := listGrokProjects(); len(got) != 1 || got[0].Name != "Renamed twice" {
+		t.Fatalf("stale project name: %+v", got)
+	}
+}
+
+func TestProjectsFingerprintMissingRoot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GROK_HOME", root)
+	if projectsFingerprint(filepath.Join(root, "sessions")) != "" {
+		t.Fatal("no sessions dir must not fingerprint")
+	}
+	if len(listGrokProjects()) != 0 {
+		t.Fatal("no sessions dir")
 	}
 }

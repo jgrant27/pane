@@ -17,15 +17,17 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.2</string>
+	<string>0.2.6</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2006</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
+		<!-- NSAllowsLocalNetworking covers loopback, .local, unqualified names and
+		     RFC1918 literals, which is every cleartext pane there is; tailnet panes
+		     are https. ATS ignores NSAllowsArbitraryLoads whenever this key is
+		     present, so a blanket exemption bought nothing but App Review friction. -->
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>

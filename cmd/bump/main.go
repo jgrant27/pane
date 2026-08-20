@@ -107,7 +107,19 @@ var (
 	rePlistShort = regexp.MustCompile(`(<key>CFBundleShortVersionString</key>\s*<string>)(\d+\.\d+\.\d+)(</string>)`)
 	rePlistBuild = regexp.MustCompile(`(<key>CFBundleVersion</key>\s*<string>)(\d+\.\d+\.\d+)(</string>)`)
 	reProxy      = regexp.MustCompile(`("name":\s*"grok-pane",\s*"title":\s*"Grok Pane",\s*"version":\s*")(\d+\.\d+\.\d+)(")`)
+	// the phone shells carry a plain integer build counter next to the marketing
+	// version: CFBundleVersion on iOS, versionCode on Android.
+	rePlistBuildCode = regexp.MustCompile(`(<key>CFBundleVersion</key>\s*<string>)(\d+)(</string>)`)
+	reGradleName     = regexp.MustCompile(`(versionName\s*=\s*")(\d+\.\d+\.\d+)(")`)
+	reGradleCode     = regexp.MustCompile(`(versionCode\s*=\s*)(\d+)`)
 )
+
+// buildCode packs the version into one increasing integer. The stores reject an
+// upload whose counter did not climb, and deriving it from the version keeps it
+// monotone without a second piece of state to bump.
+func buildCode(v ver) string {
+	return strconv.Itoa(v.major*1_000_000 + v.minor*1_000 + v.patch)
+}
 
 func current(root string) ver {
 	var vs []ver
@@ -145,6 +157,10 @@ func replaceAll(path string, re *regexp.Regexp, next string, sub int) error {
 }
 
 func writeVersion(root, next string) error {
+	v, ok := parseVer(next)
+	if !ok {
+		return fmt.Errorf("bad version %q", next)
+	}
 	if err := os.WriteFile(filepath.Join(root, "VERSION"), []byte(next+"\n"), 0o644); err != nil {
 		return err
 	}
@@ -156,6 +172,21 @@ func writeVersion(root, next string) error {
 		return err
 	}
 	if err := replaceAll(plist, rePlistBuild, next, 2); err != nil {
+		return err
+	}
+	code := buildCode(v)
+	ios := filepath.Join(root, "mobile", "ios", "GrokPane", "Info.plist")
+	if err := replaceAll(ios, rePlistShort, next, 2); err != nil {
+		return err
+	}
+	if err := replaceAll(ios, rePlistBuildCode, code, 2); err != nil {
+		return err
+	}
+	gradle := filepath.Join(root, "mobile", "android", "app", "build.gradle.kts")
+	if err := replaceAll(gradle, reGradleName, next, 2); err != nil {
+		return err
+	}
+	if err := replaceAll(gradle, reGradleCode, code, 2); err != nil {
 		return err
 	}
 	return replaceAll(filepath.Join(root, "proxy.go"), reProxy, next, 2)

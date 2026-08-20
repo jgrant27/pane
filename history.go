@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 type sessionInfo struct {
@@ -200,6 +202,7 @@ func deleteGrokSession(cwd, id string) error {
 		return err
 	}
 	purgeSessionSearch(id)
+	invalidateProjects()
 	if _, err := os.Stat(dir); err == nil {
 		return fmt.Errorf("session %s still on disk", id)
 	}
@@ -255,6 +258,10 @@ func renameGrokProject(cwd, name string) error {
 		_ = os.WriteFile(filepath.Join(group, ".cwd"), []byte(cwd+"\n"), 0o600)
 	}
 	path := filepath.Join(group, ".name")
+	// A .name written over an existing one leaves the group's mtime alone,
+	// so the fingerprint would not notice the new display name. Invalidate
+	// after the write, or a list built in between would be cached as current.
+	defer invalidateProjects()
 	if name == "" || name == filepath.Base(strings.TrimRight(cwd, `/\`)) {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
@@ -264,8 +271,66 @@ func renameGrokProject(cwd, name string) error {
 	return os.WriteFile(path, []byte(name+"\n"), 0o600)
 }
 
+// The project list costs one os.ReadFile plus a json.Unmarshal per session on
+// disk, and the UI asks for it after every turn as well as on every session
+// switch, rename and delete. Cache it behind a fingerprint of the session
+// group directories: adding or removing a session changes its group's mtime,
+// so a new or deleted session is never served stale. A summary.json rewritten
+// in place leaves every mtime alone, which is what the short TTL is for, and
+// the code that edits one calls invalidateProjects to skip even that wait.
+var (
+	projectsMu    sync.Mutex
+	projectsStamp string
+	projectsAt    time.Time
+	projectsList  []projectInfo
+)
+
+const projectsTTL = 2 * time.Second
+
+func invalidateProjects() {
+	projectsMu.Lock()
+	projectsStamp, projectsList = "", nil
+	projectsMu.Unlock()
+}
+
+// projectsFingerprint changes whenever a session group is added, removed or
+// gains or loses a session. It is one stat per project, against one file read
+// per session for the real scan.
+func projectsFingerprint(root string) string {
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(root)
+	for _, e := range ents {
+		info, err := e.Info()
+		if err != nil {
+			return ""
+		}
+		fmt.Fprintf(&b, "\x00%s:%d", e.Name(), info.ModTime().UnixNano())
+	}
+	return b.String()
+}
+
 func listGrokProjects() []projectInfo {
 	root := filepath.Join(grokHome(), "sessions")
+	stamp := projectsFingerprint(root)
+	projectsMu.Lock()
+	if stamp != "" && stamp == projectsStamp && time.Since(projectsAt) < projectsTTL {
+		cached := projectsList
+		projectsMu.Unlock()
+		return cached
+	}
+	projectsMu.Unlock()
+	out := scanGrokProjects(root)
+	projectsMu.Lock()
+	projectsStamp, projectsAt, projectsList = stamp, time.Now(), out
+	projectsMu.Unlock()
+	return out
+}
+
+func scanGrokProjects(root string) []projectInfo {
 	ents, err := os.ReadDir(root)
 	if err != nil {
 		return []projectInfo{}
@@ -329,6 +394,7 @@ func deleteGrokProject(cwd string) error {
 	if err := os.RemoveAll(group); err != nil {
 		return err
 	}
+	invalidateProjects()
 	log.Printf("deleted project cwd=%s", cwd)
 	return nil
 }
@@ -567,13 +633,24 @@ func readSummary(path string) (sessionInfo, bool) {
 	}, true
 }
 
+// mergeableReplay says whether two neighbouring events of this type are two
+// chunks of one message rather than two separate ones.
+func mergeableReplay(typ string) bool {
+	return typ == "you" || typ == "out" || typ == "thought"
+}
+
 func appendReplay(evs []replayEvent, typ, text string) []replayEvent {
-	text = strings.TrimRight(text, "")
-	if text == "" {
+	n := len(evs)
+	merge := n > 0 && evs[n-1].Type == typ && mergeableReplay(typ)
+	// Inside a message a whitespace-only chunk is real formatting — grok
+	// streams "\n\n" as a token of its own — but a chunk that would open a
+	// bubble with nothing but whitespace is the blank leading bubble this
+	// guard has always meant to drop. (It used to TrimRight with an empty
+	// cutset, which trims nothing, so only an exactly empty chunk was cut.)
+	if !merge && strings.TrimSpace(text) == "" {
 		return evs
 	}
-	n := len(evs)
-	if n > 0 && evs[n-1].Type == typ && (typ == "you" || typ == "out" || typ == "thought") {
+	if merge {
 		evs[n-1].Text += text
 		return evs
 	}
@@ -610,38 +687,81 @@ func replayUpdates(cwd, id string, max int) []replayEvent {
 		return nil
 	}
 	const chunk = 512 << 10
-	var tail []byte
-	off := st.Size()
+	// Walk backwards a chunk at a time and parse each chunk exactly once.
+	// Re-parsing the whole accumulated tail on every step — and rebuilding
+	// that tail with a prepending append — is quadratic in the file, and a
+	// session's updates.jsonl is mostly tool and thought traffic, so the walk
+	// goes a long way back before it has enough chat to answer with.
 	var evs []replayEvent
-	for off > 0 {
+	// carry holds the head of the window that belongs to a line starting in
+	// an earlier chunk; it is handed back to the next read to be completed.
+	var carry []byte
+	off := st.Size()
+	for off > 0 && len(evs) < max {
 		n := int64(chunk)
 		if n > off {
 			n = off
 		}
 		off -= n
-		piece := make([]byte, n)
-		if _, err := f.ReadAt(piece, off); err != nil {
+		window := make([]byte, n+int64(len(carry)))
+		if _, err := f.ReadAt(window[:n], off); err != nil {
 			break
 		}
-		tail = append(piece, tail...)
-		data := tail
+		copy(window[n:], carry)
+		data := window
+		carry = nil
 		if off > 0 {
 			i := bytes.IndexByte(data, '\n')
 			if i < 0 {
+				// no line ends in this window, so all of it is the middle of
+				// a line that starts further back.
+				carry = boundedCarry(data)
 				continue
 			}
-			data = data[i+1:]
+			carry, data = boundedCarry(data[:i+1]), data[i+1:]
 		}
-		evs = parseChatReplay(data)
-		if len(evs) >= max {
-			return evs[len(evs)-max:]
-		}
+		evs = joinReplay(parseChatReplay(data), evs)
 	}
 	if len(evs) > max {
 		return evs[len(evs)-max:]
 	}
 	return evs
 }
+
+// boundedCarry drops a partial line once it is longer than parseChatReplay
+// would ever accept, so one absurd line cannot make the walk quadratic again
+// by being copied forward at every step. Its truncated remains parse as
+// nothing, which is what the whole line would have done anyway.
+func boundedCarry(b []byte) []byte {
+	if len(b) > maxReplayLine {
+		return nil
+	}
+	return b
+}
+
+// joinReplay puts an earlier chunk's events in front of the ones already
+// found. A single message is many chunks in the file and parseChatReplay
+// merges them, so a message straddling a chunk boundary has to be merged at
+// the seam too, or it comes back as two bubbles.
+func joinReplay(earlier, later []replayEvent) []replayEvent {
+	if len(earlier) == 0 {
+		return later
+	}
+	if len(later) == 0 {
+		return earlier
+	}
+	last := len(earlier) - 1
+	if earlier[last].Type == later[0].Type && mergeableReplay(earlier[last].Type) {
+		earlier[last].Text += later[0].Text
+		later = later[1:]
+	}
+	return append(earlier, later...)
+}
+
+// maxReplayLine is the longest line the replay parser will look at: a tool
+// call carrying a whole file is not chat, and unmarshalling it would cost
+// more than the transcript is worth.
+const maxReplayLine = 1 << 20
 
 func parseChatReplay(data []byte) []replayEvent {
 	var evs []replayEvent
@@ -654,7 +774,7 @@ func parseChatReplay(data []byte) []replayEvent {
 			line = data
 			data = nil
 		}
-		if len(line) == 0 || len(line) > 1<<20 {
+		if len(line) == 0 || len(line) > maxReplayLine {
 			continue
 		}
 		if !bytes.Contains(line, []byte(`"user_message_chunk"`)) && !bytes.Contains(line, []byte(`"agent_message_chunk"`)) {
