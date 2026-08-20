@@ -100,13 +100,20 @@ func TestServePaneHealthzAndMeta(t *testing.T) {
 	if meta["name"] != "Grok Pane" {
 		t.Fatalf("%+v", meta)
 	}
-	opt, err := http.NewRequest(http.MethodOptions, "http://"+addr+"/healthz", nil)
+	// A preflight from the desktop app's origin, which is what actually
+	// needs the CORS headers.
+	opt, err := http.NewRequest(http.MethodOptions, "http://"+addr+"/v1/sessions", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	opt.Header.Set("Origin", "wails://wails")
+	opt.Header.Set("Access-Control-Request-Method", "GET")
 	ores, err := http.DefaultClient.Do(opt)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := ores.Header.Get("Access-Control-Allow-Origin"); got != "wails://wails" {
+		t.Fatalf("preflight CORS %q", got)
 	}
 	_ = ores.Body.Close()
 	if ores.StatusCode != http.StatusNoContent {
