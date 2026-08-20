@@ -102,7 +102,8 @@ deploy: test
 	git fetch --tags origin; \
 	v=$$(go run ./cmd/bump -bump "$(BUMP)" -write); \
 	git add VERSION desktop/wails.json desktop/Info.plist proxy.go \
-		mobile/ios/GrokPane/Info.plist mobile/android/app/build.gradle.kts; \
+		mobile/ios/GrokPane/Info.plist mobile/android/app/build.gradle.kts \
+		mobile/ios/GrokPane.xcodeproj/project.pbxproj; \
 	if git diff --cached --quiet; then \
 		echo "pane: files already at $$v"; \
 	else \
