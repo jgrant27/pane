@@ -135,8 +135,11 @@ func TestGrokHomeAndSessionID(t *testing.T) {
 	if grokHome() != "/tmp/x" {
 		t.Fatal(grokHome())
 	}
-	if grokBin() == "" {
-		// may be empty if grok not installed and GROK_BIN unset
+	// With GROK_BIN unset this is a PATH lookup, which finds nothing on a
+	// machine without grok — but whatever it finds is something to exec, so
+	// it has to be a full path.
+	if p := grokBin(); p != "" && !filepath.IsAbs(p) {
+		t.Fatalf("grokBin must be an absolute path: %s", p)
 	}
 	t.Setenv("GROK_BIN", "/opt/grok")
 	if grokBin() != "/opt/grok" {

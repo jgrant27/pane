@@ -26,8 +26,9 @@ type proxy struct {
 	secret    string
 	cwd       string
 
-	hubMu sync.Mutex
-	hub   *agentHub
+	hubMu   sync.Mutex
+	hub     *agentHub
+	dialing *hubDial
 
 	// Files pane copied into a project on the user's behalf, and so may
 	// remove again on request.
@@ -44,11 +45,27 @@ type agentHub struct {
 	imageCap bool
 	dead     atomic.Bool
 
-	wmu      sync.Mutex
-	mu       sync.Mutex
-	nextID   atomic.Int64
-	pending  map[int64]chan json.RawMessage
-	sessions map[string]*session
+	wmu     sync.Mutex
+	mu      sync.Mutex
+	nextID  atomic.Int64
+	pending map[int64]chan json.RawMessage
+	// Every browser watching an ACP session id, not just the last one to
+	// arrive. A reconnect or a second tab used to overwrite the routing
+	// entry, and the reply to a turn already in flight reached nobody.
+	sessions map[string]map[*session]struct{}
+	// Turns in flight per ACP session id. Whether an update is live output
+	// or the session/load transcript is a fact about the session, not about
+	// one socket — a tab that never prompted itself still has to see it.
+	prompts map[string]int
+}
+
+func newAgentHub(conn *websocket.Conn) *agentHub {
+	return &agentHub{
+		conn:     conn,
+		pending:  map[int64]chan json.RawMessage{},
+		sessions: map[string]map[*session]struct{}{},
+		prompts:  map[string]int{},
+	}
 }
 
 func (p *proxy) handleMeta(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +122,9 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 		permSeen:   map[string]bool{},
 	}
 	defer h.drop(s)
+	// Runs before the deferred Close above it, so the frame that says what
+	// went wrong is on the wire before the socket goes away.
+	defer s.stopWriting()
 	if err := s.handshake(); err != nil {
 		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
 		return
@@ -115,21 +135,52 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.loop()
 }
 
+// hubDial is one attempt to bring the shared agent connection up. Both the
+// dial and initialize block on the network, so they happen outside hubMu:
+// held across them, a wedged agent made every new tab queue behind the last
+// one's full timeout and then re-dial it — N tabs waited N×8s to be told the
+// same thing. Now they share the attempt that is already running.
+type hubDial struct {
+	done chan struct{}
+	h    *agentHub
+	err  error
+}
+
 func (p *proxy) ensureHub() (*agentHub, error) {
 	p.hubMu.Lock()
-	defer p.hubMu.Unlock()
 	if p.hub != nil && !p.hub.dead.Load() {
-		return p.hub, nil
+		h := p.hub
+		p.hubMu.Unlock()
+		return h, nil
 	}
+	if d := p.dialing; d != nil {
+		p.hubMu.Unlock()
+		<-d.done
+		return d.h, d.err
+	}
+	d := &hubDial{done: make(chan struct{})}
+	p.dialing = d
+	p.hubMu.Unlock()
+
+	h, err := p.newHub()
+
+	p.hubMu.Lock()
+	d.h, d.err = h, err
+	if err == nil {
+		p.hub = h
+	}
+	p.dialing = nil
+	p.hubMu.Unlock()
+	close(d.done)
+	return h, err
+}
+
+func (p *proxy) newHub() (*agentHub, error) {
 	conn, err := dialAgent(p.agentBase, p.secret, 8*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	h := &agentHub{
-		conn:     conn,
-		pending:  map[int64]chan json.RawMessage{},
-		sessions: map[string]*session{},
-	}
+	h := newAgentHub(conn)
 	go h.readLoop()
 	init, err := h.rpc("initialize", map[string]any{
 		"protocolVersion": 1,
@@ -152,7 +203,6 @@ func (p *proxy) ensureHub() (*agentHub, error) {
 		return nil, err
 	}
 	h.imageCap = parsePromptCaps(init)
-	p.hub = h
 	return h, nil
 }
 
@@ -171,8 +221,17 @@ type session struct {
 	models     []modelInfo
 	imageCap   bool
 
+	// Frames for the browser go through a bounded queue drained by one
+	// writer goroutine, so whoever produced the frame — including the single
+	// readLoop that feeds every session on the shared agent connection —
+	// hands it off instead of waiting on a socket it does not own.
+	wOnce   sync.Once
+	cOnce   sync.Once
+	outCh   chan any
+	closing chan struct{}
+	written chan struct{}
+
 	mu       sync.Mutex
-	bmu      sync.Mutex
 	busy     atomic.Bool
 	live     atomic.Bool
 	prompted atomic.Bool
@@ -196,13 +255,104 @@ type session struct {
 	permDeny  string
 }
 
+const (
+	// Deep enough for a burst of stream chunks, shallow enough that a
+	// browser which has genuinely stopped reading is noticed rather than
+	// buffered forever.
+	browserQueue     = 256
+	browserWriteWait = 10 * time.Second
+)
+
+// toBrowser queues a frame for this session's browser. It never blocks: a
+// tab that stopped draining — backgrounded phone, dead Wi-Fi, closed lid —
+// used to park whichever goroutine wrote to it, and the readLoop that feeds
+// every other session writes here too.
 func (s *session) toBrowser(v any) error {
 	if s == nil || s.browser == nil {
 		return nil
 	}
-	s.bmu.Lock()
-	defer s.bmu.Unlock()
+	s.wOnce.Do(s.startWriter)
+	select {
+	case <-s.closing:
+		return errBrowserGone
+	default:
+	}
+	select {
+	case s.outCh <- v:
+		return nil
+	default:
+		// The queue is full, so this browser is not keeping up with its own
+		// output. Dropping it is the only answer that does not charge every
+		// other session for it.
+		s.dropBrowser()
+		return errBrowserGone
+	}
+}
+
+func (s *session) startWriter() {
+	s.outCh = make(chan any, browserQueue)
+	s.closing = make(chan struct{})
+	s.written = make(chan struct{})
+	go s.writeLoop()
+}
+
+func (s *session) writeLoop() {
+	defer func() {
+		_ = s.browser.Close()
+		close(s.written)
+	}()
+	for {
+		select {
+		case v := <-s.outCh:
+			if s.writeFrame(v) != nil {
+				return
+			}
+		case <-s.closing:
+			// Flush what is already queued: the last frame of a session is
+			// usually the one that explains why it ended. The write deadline
+			// bounds how long that courtesy can take.
+			for {
+				select {
+				case v := <-s.outCh:
+					if s.writeFrame(v) != nil {
+						return
+					}
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *session) writeFrame(v any) error {
+	// Without a deadline a full kernel send buffer blocks WriteJSON with no
+	// way back out.
+	_ = s.browser.SetWriteDeadline(time.Now().Add(browserWriteWait))
 	return s.browser.WriteJSON(v)
+}
+
+// dropBrowser cuts a browser loose and unhooks it from the hub, so routing
+// stops pointing at a socket nobody is reading.
+func (s *session) dropBrowser() {
+	s.cOnce.Do(func() { close(s.closing) })
+	_ = s.browser.Close()
+	s.hub.detach(s)
+}
+
+// stopWriting ends the session's write side: the queue is flushed, then the
+// socket is closed. It waits for that to finish so a caller closing the
+// connection behind it cannot cut the last frame off.
+func (s *session) stopWriting() {
+	if s == nil || s.browser == nil {
+		return
+	}
+	s.wOnce.Do(s.startWriter)
+	s.cOnce.Do(func() { close(s.closing) })
+	select {
+	case <-s.written:
+	case <-time.After(browserWriteWait):
+	}
 }
 
 func (s *session) handshake() error {
@@ -326,7 +476,14 @@ func (s *session) loop() {
 		}
 		switch msg.Type {
 		case "in":
-			if (msg.Text == "" && len(msg.Files) == 0) || s.busy.Load() {
+			if msg.Text == "" && len(msg.Files) == 0 {
+				continue
+			}
+			// The turn is claimed here, not in the goroutine: prompt() could
+			// be scheduled after the next message had already been read, and
+			// two turns then ran on one ACP session with their replies
+			// interleaved.
+			if !s.busy.CompareAndSwap(false, true) {
 				continue
 			}
 			go s.prompt(msg.Text, msg.Files)
@@ -343,23 +500,48 @@ func (s *session) loop() {
 			if id == "" {
 				continue
 			}
-			if raw, err := s.rpc("session/set_model", map[string]any{"sessionId": s.id, "modelId": id}); err == nil && rpcError(raw) == nil {
-				s.model = id
-				_ = s.toBrowser(map[string]any{"type": "model", "id": id, "models": s.models, "effort": s.effort, "context": s.contextFor(id)})
-			} else if err != nil {
-				_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
-			}
+			// Off the reader, the way "in" already is. This loop is the only
+			// thing reading the browser socket: an RPC run inline leaves the
+			// Allow/Deny click, the answer and Escape sitting unread — and
+			// the agent may be blocked on exactly the one being answered.
+			go s.setModel(id)
 		case "effort":
 			id := strings.TrimSpace(firstNonEmpty(msg.ID, msg.Text))
 			if id == "" {
 				continue
 			}
-			if _, err := s.rpc("session/set_mode", map[string]any{"sessionId": s.id, "modeId": id}); err == nil {
-				s.effort = id
-				_ = s.toBrowser(map[string]any{"type": "effort", "id": id})
-			}
+			go s.setEffort(id)
 		}
 	}
+}
+
+func (s *session) setModel(id string) {
+	raw, err := s.rpc("session/set_model", map[string]any{"sessionId": s.id, "modelId": id})
+	if err != nil {
+		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
+		return
+	}
+	if rpcError(raw) != nil {
+		return
+	}
+	// Off the reader, a model change and an effort change can now be in
+	// flight together, so the state they share takes turns. The RPC above
+	// stays outside the lock — that is the wait this fix was about.
+	s.mu.Lock()
+	s.model = id
+	frame := map[string]any{"type": "model", "id": id, "models": s.models, "effort": s.effort, "context": s.contextFor(id)}
+	s.mu.Unlock()
+	_ = s.toBrowser(frame)
+}
+
+func (s *session) setEffort(id string) {
+	if _, err := s.rpc("session/set_mode", map[string]any{"sessionId": s.id, "modeId": id}); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.effort = id
+	s.mu.Unlock()
+	_ = s.toBrowser(map[string]any{"type": "effort", "id": id})
 }
 
 func (s *session) prompt(text string, files []promptFile) {
@@ -371,12 +553,16 @@ func (s *session) prompt(text string, files []promptFile) {
 	s.askReply = nil
 	s.askDone = false
 	s.mu.Unlock()
-	s.busy.Store(true)
+	// busy is already true — loop() claimed the turn before starting this
+	// goroutine. Counting it on the hub as well is what lets a second tab on
+	// the same ACP session tell live output from the load transcript.
+	s.hub.turnBegin(s.id)
 	_ = s.toBrowser(map[string]string{"type": "busy"})
 	res, err := s.rpc("session/prompt", map[string]any{
 		"sessionId": s.id,
 		"prompt":    buildPrompt(text, files, s.cwd, s.imageCap),
 	})
+	s.hub.turnEnd(s.id)
 	s.busy.Store(false)
 	s.clearAsk()
 	s.clearPerm()
@@ -403,8 +589,9 @@ func (s *session) notify(method string, params any) {
 }
 
 var (
-	errTimeout = timeoutErr("agent rpc timeout")
-	errNoAgent = timeoutErr("no agent")
+	errTimeout     = timeoutErr("agent rpc timeout")
+	errNoAgent     = timeoutErr("no agent")
+	errBrowserGone = timeoutErr("browser gone")
 )
 
 type timeoutErr string
@@ -420,6 +607,24 @@ func (h *agentHub) writeJSON(v any) error {
 	return h.conn.WriteJSON(v)
 }
 
+// rpcDeadline is per method because the methods are not alike. In ACP
+// session/prompt only returns when the whole turn ends, so a deadline on it
+// is a cap on how long the agent may work — pane used to call a live turn
+// dead after ten minutes, deny the permission it was blocked on and go idle
+// while it kept streaming. Control calls answer immediately, so a slow one
+// means the agent is wedged and the user should hear that in seconds.
+func rpcDeadline(method string) time.Duration {
+	switch method {
+	case "session/prompt":
+		return 12 * time.Hour
+	case "session/new", "session/load":
+		// Loading a long transcript is real work, but still bounded.
+		return 2 * time.Minute
+	default:
+		return 30 * time.Second
+	}
+}
+
 func (h *agentHub) rpc(method string, params any) (json.RawMessage, error) {
 	if h == nil || h.dead.Load() {
 		return nil, errNoAgent
@@ -427,6 +632,15 @@ func (h *agentHub) rpc(method string, params any) (json.RawMessage, error) {
 	id := h.nextID.Add(1)
 	ch := make(chan json.RawMessage, 1)
 	h.mu.Lock()
+	// The hub can die between the check above and this line; the teardown
+	// takes the same lock, so seeing it here means we would wait forever.
+	if h.dead.Load() {
+		h.mu.Unlock()
+		return nil, errNoAgent
+	}
+	if h.pending == nil {
+		h.pending = map[int64]chan json.RawMessage{}
+	}
 	h.pending[id] = ch
 	h.mu.Unlock()
 	defer func() {
@@ -442,10 +656,14 @@ func (h *agentHub) rpc(method string, params any) (json.RawMessage, error) {
 	}); err != nil {
 		return nil, err
 	}
+	// A timer rather than time.After: a turn's deadline is hours long and
+	// its timer would sit in the heap until then.
+	t := time.NewTimer(rpcDeadline(method))
+	defer t.Stop()
 	select {
 	case raw := <-ch:
 		return raw, nil
-	case <-time.After(10 * time.Minute):
+	case <-t.C:
 		return nil, errTimeout
 	}
 }
@@ -464,21 +682,38 @@ func (h *agentHub) attach(id string, s *session) {
 		return
 	}
 	h.mu.Lock()
-	h.sessions[id] = s
+	if h.sessions == nil {
+		h.sessions = map[string]map[*session]struct{}{}
+	}
+	set := h.sessions[id]
+	if set == nil {
+		set = map[*session]struct{}{}
+		h.sessions[id] = set
+	}
+	set[s] = struct{}{}
 	h.mu.Unlock()
 }
 
-func (h *agentHub) detach(s *session) {
+// detach unhooks a browser and reports whether its ACP session is now
+// unwatched. Only then may the caller cancel the turn: with a second tab, or
+// a reconnect that raced the old socket's teardown, the browser leaving must
+// not cancel the turn the one still there is watching.
+func (h *agentHub) detach(s *session) bool {
 	if h == nil || s == nil {
-		return
+		return false
 	}
 	h.mu.Lock()
-	for id, cur := range h.sessions {
-		if cur == s {
+	defer h.mu.Unlock()
+	for id, set := range h.sessions {
+		if _, ok := set[s]; !ok {
+			continue
+		}
+		delete(set, s)
+		if len(set) == 0 {
 			delete(h.sessions, id)
 		}
 	}
-	h.mu.Unlock()
+	return len(h.sessions[strings.TrimSpace(s.id)]) == 0
 }
 
 func (h *agentHub) drop(s *session) {
@@ -490,10 +725,48 @@ func (h *agentHub) drop(s *session) {
 	// the agent blocked on a reply that is never coming.
 	s.clearPerm()
 	s.clearAsk()
-	if s.busy.Load() && s.id != "" {
+	last := h.detach(s)
+	if last && s.busy.Load() && s.id != "" {
 		h.notify("session/cancel", map[string]any{"sessionId": s.id})
 	}
-	h.detach(s)
+}
+
+// turnBegin, turnEnd and turnActive count prompts in flight per ACP session
+// id. A second tab has never prompted anything itself, so asking its own
+// socket whether a turn is running answers "no" and the reply gets thrown
+// away with the session/load transcript.
+func (h *agentHub) turnBegin(sid string) {
+	if h == nil || sid == "" {
+		return
+	}
+	h.mu.Lock()
+	if h.prompts == nil {
+		h.prompts = map[string]int{}
+	}
+	h.prompts[sid]++
+	h.mu.Unlock()
+}
+
+func (h *agentHub) turnEnd(sid string) {
+	if h == nil || sid == "" {
+		return
+	}
+	h.mu.Lock()
+	if n := h.prompts[sid] - 1; n > 0 {
+		h.prompts[sid] = n
+	} else {
+		delete(h.prompts, sid)
+	}
+	h.mu.Unlock()
+}
+
+func (h *agentHub) turnActive(sid string) bool {
+	if h == nil || sid == "" {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.prompts[sid] > 0
 }
 
 func (h *agentHub) shutdown() {
@@ -506,6 +779,34 @@ func (h *agentHub) shutdown() {
 	}
 }
 
+// lookupAll returns every browser watching an ACP session id, because they
+// all have to see the turn. An update with no id still has to be guessed at,
+// and that guess can only ever name one session.
+func (h *agentHub) lookupAll(sid string) []*session {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if sid = strings.TrimSpace(sid); sid == "" {
+		if s := h.guessLocked(); s != nil {
+			return []*session{s}
+		}
+		return nil
+	}
+	set := h.sessions[sid]
+	out := make([]*session, 0, len(set))
+	for s := range set {
+		if s != nil {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// lookup picks the single session that owns bookkeeping which cannot be
+// duplicated — a permission card, an interaction record. With several tabs
+// on one id the turn belongs to the busy one; a tie belongs to nobody.
 func (h *agentHub) lookup(sid string) *session {
 	if h == nil {
 		return nil
@@ -513,25 +814,50 @@ func (h *agentHub) lookup(sid string) *session {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	sid = strings.TrimSpace(sid)
-	if sid != "" {
-		return h.sessions[sid]
+	if sid == "" {
+		return h.guessLocked()
 	}
+	set := h.sessions[sid]
+	if len(set) == 1 {
+		for s := range set {
+			return s
+		}
+	}
+	var busy *session
+	n := 0
+	for s := range set {
+		if s != nil && s.busy.Load() {
+			busy = s
+			n++
+		}
+	}
+	if n == 1 {
+		return busy
+	}
+	return nil
+}
+
+// guessLocked names the session an untagged message must have meant: the
+// only one attached, or the only one with a turn in flight.
+func (h *agentHub) guessLocked() *session {
 	seen := map[*session]struct{}{}
 	var only, busy *session
 	n, nBusy := 0, 0
-	for _, s := range h.sessions {
-		if s == nil {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		n++
-		only = s
-		if s.busy.Load() {
-			busy = s
-			nBusy++
+	for _, set := range h.sessions {
+		for s := range set {
+			if s == nil {
+				continue
+			}
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			n++
+			only = s
+			if s.busy.Load() {
+				busy = s
+				nBusy++
+			}
 		}
 	}
 	if n == 1 {
@@ -561,17 +887,19 @@ func (h *agentHub) lookupRequest(sid string) *session {
 	seen := map[*session]struct{}{}
 	var busy *session
 	n := 0
-	for _, s := range h.sessions {
-		if s == nil {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		if s.busy.Load() {
-			busy = s
-			n++
+	for _, set := range h.sessions {
+		for s := range set {
+			if s == nil {
+				continue
+			}
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			if s.busy.Load() {
+				busy = s
+				n++
+			}
 		}
 	}
 	// A session with no turn in flight cannot be the one being asked, so
@@ -584,21 +912,28 @@ func (h *agentHub) lookupRequest(sid string) *session {
 
 func (h *agentHub) readLoop() {
 	defer func() {
-		h.dead.Store(true)
 		h.mu.Lock()
+		// Marked dead under the same lock the pending map is drained under,
+		// so a call registering right now either lands in the map and is
+		// answered below, or sees the hub is gone. Otherwise it would wait
+		// out its whole deadline for a reply that can never arrive.
+		h.dead.Store(true)
 		list := make([]*session, 0, len(h.sessions))
 		seen := map[*session]struct{}{}
-		for _, s := range h.sessions {
-			if s == nil {
-				continue
+		for _, set := range h.sessions {
+			for s := range set {
+				if s == nil {
+					continue
+				}
+				if _, ok := seen[s]; ok {
+					continue
+				}
+				seen[s] = struct{}{}
+				list = append(list, s)
 			}
-			if _, ok := seen[s]; ok {
-				continue
-			}
-			seen[s] = struct{}{}
-			list = append(list, s)
 		}
-		h.sessions = map[string]*session{}
+		h.sessions = map[string]map[*session]struct{}{}
+		h.prompts = map[string]int{}
 		pending := h.pending
 		h.pending = map[int64]chan json.RawMessage{}
 		h.mu.Unlock()
@@ -610,9 +945,10 @@ func (h *agentHub) readLoop() {
 		}
 		for _, s := range list {
 			_ = s.toBrowser(map[string]string{"type": "err", "text": "agent closed"})
-			if s.browser != nil {
-				_ = s.browser.Close()
-			}
+			// Off this goroutine: flushing waits on the browser, and a
+			// browser that stopped reading must not hold up the teardown of
+			// every other session.
+			go s.stopWriting()
 		}
 		if h.conn != nil {
 			_ = h.conn.Close()
@@ -655,7 +991,7 @@ func (h *agentHub) readLoop() {
 			continue
 		}
 		if env.Method == "session/update" || env.Method == "x.ai/session/update" {
-			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
+			for _, s := range h.lookupAll(paramsSessionID(env.Params)) {
 				s.forwardUpdate(env.Params)
 			}
 			continue
@@ -676,14 +1012,21 @@ func (h *agentHub) readLoop() {
 			continue
 		}
 		if n, ok := rpcIDInt(env.ID); ok {
+			// Claimed under the lock that reads it, and handed over without
+			// blocking: an agent that answers one id more than once must not
+			// be able to park the loop that feeds every session on this hub.
 			h.mu.Lock()
 			ch := h.pending[n]
+			delete(h.pending, n)
 			h.mu.Unlock()
 			if ch != nil {
+				raw := env.Result
 				if len(env.Error) > 0 && string(env.Error) != "null" {
-					ch <- json.RawMessage(`{"error":` + string(env.Error) + `}`)
-				} else {
-					ch <- env.Result
+					raw = json.RawMessage(`{"error":` + string(env.Error) + `}`)
+				}
+				select {
+				case ch <- raw:
+				default:
 				}
 			}
 		}
@@ -889,7 +1232,10 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	// session/load dumps the whole transcript as updates. We already
 	// painted a short chat tail — ignore the flood until the user talks.
 	// Mid-turn asks still have to land, or the agent sits on working….
-	if s.resumeID != "" && !s.prompted.Load() && !s.busy.Load() && !askTool {
+	// "The user" is the ACP session, not this socket: a reconnected tab, or
+	// a second one, has never prompted anything itself, and used to discard
+	// the answer to a turn that was already running.
+	if s.resumeID != "" && !s.prompted.Load() && !s.busy.Load() && !s.hub.turnActive(s.id) && !askTool {
 		return
 	}
 	text := contentText(u.Content)
@@ -984,6 +1330,23 @@ func isImageMIME(m string) bool {
 
 const maxImageEmbed = 8 << 20
 
+// underCwdResolved answers the question underCwd only appears to answer:
+// does this path stay inside the project once the filesystem has its say.
+// Both ends are resolved, since the project directory itself is reached
+// through a link often enough (/tmp, /home) that comparing a resolved file
+// against an unresolved root would reject legitimate attachments.
+func underCwdResolved(cwd, path string) bool {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	root, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		root = cwd
+	}
+	return underCwd(root, real)
+}
+
 func buildPrompt(text string, files []promptFile, cwd string, imageCap bool) []map[string]any {
 	var out []map[string]any
 	text = strings.TrimSpace(text)
@@ -1023,8 +1386,17 @@ func buildPrompt(text string, files []promptFile, cwd string, imageCap bool) []m
 		if !imageCap || !isImageMIME(f.Mime) {
 			continue
 		}
-		st, err := os.Stat(path)
-		if err != nil || st.Size() > maxImageEmbed {
+		// From here pane reads the file itself and ships the bytes inline,
+		// which skips the agent's own read-permission prompt — so the escape
+		// check has to be the real one. underCwd is lexical while ReadFile
+		// follows links, so <cwd>/diagram.png -> ~/.ssh/id_rsa passed it and
+		// the private key went to the model as an image. Lstat on top of
+		// that, so a link is judged as a link rather than as its target.
+		if !underCwdResolved(cwd, path) {
+			continue
+		}
+		st, err := os.Lstat(path)
+		if err != nil || !st.Mode().IsRegular() || st.Size() > maxImageEmbed {
 			continue
 		}
 		data, err := os.ReadFile(path)

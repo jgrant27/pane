@@ -12,3 +12,6 @@ DerivedData/
 mobile/android/.gradle/
 mobile/android/local.properties
 mobile/android/app/build/
+
+# Claude Code agent worktrees
+.claude/

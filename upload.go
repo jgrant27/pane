@@ -118,7 +118,12 @@ func attachPath(cwd, src string) (uploadInfo, error) {
 	}
 	dest := abs
 	copied := false
-	if !underCwd(cwd, abs) {
+	// Whether the file is already in the project decides whether pane
+	// hands the agent a link to it where it lies. That has to be the real
+	// answer, not the lexical one: a link inside the project pointing out
+	// of it would otherwise be passed along in place. Resolved, it fails
+	// the test and gets copied in, which is the safe outcome.
+	if !underCwdResolved(cwd, abs) {
 		dest = uniquePath(cwd, filepath.Base(abs))
 		if err := copyFile(abs, dest); err != nil {
 			return uploadInfo{}, err

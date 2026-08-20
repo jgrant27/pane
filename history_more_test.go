@@ -4,7 +4,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -46,8 +45,10 @@ func TestGrokBinPurgeDecode(t *testing.T) {
 	if decodeSessionGroup(name, t.TempDir()) != "/Users/x/y" {
 		t.Fatal(decodeSessionGroup(name, t.TempDir()))
 	}
-	if !strings.Contains(decodeSessionGroup("%zz", t.TempDir()), "") {
-		// invalid unescape may return ""
+	// A group directory whose name is not a valid escape of a path names no
+	// project, so it must decode to nothing rather than to itself.
+	if got := decodeSessionGroup("%zz", t.TempDir()); got != "" {
+		t.Fatalf("undecodable group name became %q", got)
 	}
 }
 

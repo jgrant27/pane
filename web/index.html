@@ -2,6 +2,16 @@
 <html lang="en" data-busy="false">
 <head>
   <meta charset="utf-8">
+  <!-- Agent output is rendered as markdown in this document, so the page
+       must not be able to reach the network on its behalf: no remote
+       images (a bare <img> is an exfiltration beacon), no injected
+       stylesheet that could repaint the permission card, no inline
+       script. The two script hashes below are this file's own inline
+       scripts — web/layout_test.go recomputes them, so editing either
+       script without updating this header fails the build. connect-src
+       stays wide because a pane can be reached at any tailnet or LAN
+       origin the user points the UI at. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; img-src 'self' data: blob:; font-src 'self'; style-src 'self'; script-src 'self' 'sha256-FtCLLCuXZ4bf0ctbzf+Eas875DptT8GVKDkugsdXXs8=' 'sha256-cLXj8kQk6Fr6BhYbPqy/BCeBGWh3swZBh8Zx92+f3k8='; connect-src 'self' http: https: ws: wss:">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Grok Pane</title>
   <meta name="color-scheme" content="light">

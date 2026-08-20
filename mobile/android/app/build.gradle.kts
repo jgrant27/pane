@@ -10,8 +10,10 @@ android {
         applicationId = "com.jgrant27.grokpane"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.2.2"
+        // both are stamped by cmd/bump: versionName from VERSION, versionCode from
+        // it as major*1000000 + minor*1000 + patch so Play always sees it climb.
+        versionCode = 2006
+        versionName = "0.2.6"
     }
     buildTypes {
         release {

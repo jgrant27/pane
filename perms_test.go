@@ -96,11 +96,7 @@ func outcome(t *testing.T, m map[string]any) (string, string) {
 func permSession(t *testing.T) (*session, *frameSink) {
 	t.Helper()
 	c, sink := newSinkConn(t)
-	h := &agentHub{
-		conn:     c,
-		pending:  map[int64]chan json.RawMessage{},
-		sessions: map[string]*session{},
-	}
+	h := newAgentHub(c)
 	return &session{
 		id:       "s1",
 		hub:      h,
@@ -220,7 +216,7 @@ func TestIsDenyAction(t *testing.T) {
 // Requests carrying an id must never be routed by guesswork to whichever
 // browser happens to be around: approving a command is a side effect.
 func TestLookupRequestRefusesToGuess(t *testing.T) {
-	h := &agentHub{sessions: map[string]*session{}}
+	h := newAgentHub(nil)
 	a := &session{id: "a"}
 	b := &session{id: "b"}
 	h.attach("a", a)
@@ -248,7 +244,7 @@ func TestLookupRequestRefusesToGuess(t *testing.T) {
 // A request nobody can own still gets an answer, or the agent blocks on it.
 func TestUnroutableRequestsAreAnswered(t *testing.T) {
 	c, sink := newSinkConn(t)
-	h := &agentHub{conn: c, pending: map[int64]chan json.RawMessage{}, sessions: map[string]*session{}}
+	h := newAgentHub(c)
 
 	h.writePermOutcome(json.RawMessage(`3`), "")
 	if kind, _ := outcome(t, sink.next(t)); kind != "cancelled" {
@@ -506,7 +502,7 @@ func hubWithAgent(t *testing.T) (*agentHub, *frameSink, chan []byte) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	h := &agentHub{conn: c, pending: map[int64]chan json.RawMessage{}, sessions: map[string]*session{}}
+	h := newAgentHub(c)
 	go h.readLoop()
 	t.Cleanup(func() { h.shutdown() })
 	return h, sink, toPane
@@ -553,7 +549,7 @@ func TestIsSessionNotify(t *testing.T) {
 
 // A resumed session is attached under two ids; requests must still reach it.
 func TestLookupRequestFindsSessionAttachedTwice(t *testing.T) {
-	h := &agentHub{sessions: map[string]*session{}}
+	h := newAgentHub(nil)
 	s := &session{id: "new-id"}
 	s.busy.Store(true)
 	h.attach("resume-id", s)
@@ -568,7 +564,7 @@ func TestLookupRequestFindsSessionAttachedTwice(t *testing.T) {
 
 // Idle tabs must neither claim an untagged request nor block the busy one.
 func TestLookupRequestIgnoresIdleTabs(t *testing.T) {
-	h := &agentHub{sessions: map[string]*session{}}
+	h := newAgentHub(nil)
 	busy := &session{id: "busy"}
 	idle := &session{id: "idle"}
 	busy.busy.Store(true)
@@ -594,6 +590,149 @@ func TestDropAnswersOutstandingCards(t *testing.T) {
 	h.drop(s)
 	if kind, opt := outcome(t, sink.next(t)); kind != "cancelled" || opt != "" {
 		t.Fatalf("closing the tab answered %q/%q", kind, opt)
+	}
+}
+
+// A tab leaving must not cancel a turn another tab is still watching. drop
+// used to cancel for any busy session it dropped, so the socket that lost
+// the race on reconnect killed the turn the user had just reattached to.
+func TestDropDoesNotCancelWhileAnotherTabWatches(t *testing.T) {
+	s, sink := permSession(t)
+	h := s.hub
+	other := &session{id: "s1", hub: h}
+	h.attach("s1", s)
+	h.attach("s1", other)
+	s.busy.Store(true)
+
+	h.drop(s)
+	sink.quiet(t)
+
+	other.busy.Store(true)
+	h.drop(other)
+	if m := sink.next(t); m["method"] != "session/cancel" {
+		t.Fatalf("the last tab leaving must cancel the turn, got %v", m)
+	}
+}
+
+// A model change the agent never completes must say so rather than leave
+// the picker showing something that was never applied.
+func TestSetModelReportsFailure(t *testing.T) {
+	s, _ := permSession(t)
+	browser, bsink := newSinkConn(t)
+	s.browser = browser
+	s.hub.dead.Store(true)
+
+	s.setModel("grok-4.6")
+	if m := bsink.next(t); m["type"] != "err" {
+		t.Fatalf("a failed model change said %v", m)
+	}
+	if s.model == "grok-4.6" {
+		t.Fatal("the model was never actually set")
+	}
+
+	s.setEffort("high")
+	bsink.quiet(t)
+	if s.effort == "high" {
+		t.Fatal("the effort was never actually set")
+	}
+}
+
+// deafBrowser is an upgraded socket whose peer never reads a byte: the
+// backgrounded phone, the closed lid, the dropped Wi-Fi.
+func deafBrowser(t *testing.T) *websocket.Conn {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+	}))
+	t.Cleanup(srv.Close)
+	c, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// Writing to a browser must never park the writer. The shared agent
+// readLoop writes here for every session, so one tab that stopped draining
+// used to freeze output, RPC demuxing and new connections for all of them.
+func TestStuckBrowserIsDroppedNotWaitedOn(t *testing.T) {
+	h := newAgentHub(nil)
+	s := &session{id: "stuck", hub: h, browser: deafBrowser(t)}
+	h.attach("stuck", s)
+
+	done := make(chan error, 1)
+	go func() {
+		big := strings.Repeat("x", 32<<10)
+		var err error
+		for i := 0; i < 4000 && err == nil; i++ {
+			err = s.toBrowser(map[string]string{"type": "out", "text": big})
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a browser that never reads was never dropped")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("toBrowser parked on a browser that stopped reading")
+	}
+	if h.lookup("stuck") != nil {
+		t.Fatal("updates are still routed to the dropped browser")
+	}
+}
+
+// One id answered more than once must not park the read loop: it is the
+// only reader of the agent socket, so every session on the hub stops with
+// it. A pending call with no receiver is the state rpc is in between its
+// answer arriving and its cleanup running.
+func TestRepeatedResponseDoesNotFreezeTheHub(t *testing.T) {
+	h, sink, toPane := hubWithAgent(t)
+	h.mu.Lock()
+	h.pending[7] = make(chan json.RawMessage, 1)
+	h.mu.Unlock()
+
+	for range 3 {
+		toPane <- []byte(`{"jsonrpc":"2.0","id":7,"result":{}}`)
+	}
+
+	toPane <- []byte(`{"jsonrpc":"2.0","id":8,"method":"session/request_permission","params":{"sessionId":"ghost","options":[]}}`)
+	if kind, _ := outcome(t, sink.next(t)); kind != "cancelled" {
+		t.Fatalf("the hub stopped routing after a repeated response: %q", kind)
+	}
+}
+
+// A prompt is deliberately given no useful deadline, so the hub dying is
+// what has to free it — otherwise the tab sits on "working…" for hours.
+func TestPromptUnblocksWhenTheHubDies(t *testing.T) {
+	h, _, _ := hubWithAgent(t)
+	type result struct {
+		raw json.RawMessage
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		raw, err := h.rpc("session/prompt", map[string]any{"sessionId": "s1"})
+		done <- result{raw, err}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	h.shutdown()
+
+	select {
+	case got := <-done:
+		if got.err == nil && rpcError(got.raw) == nil {
+			t.Fatalf("a prompt freed by the agent dying reported success: %s", got.raw)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("prompt still waiting on a hub that is gone")
+	}
+	if _, err := h.rpc("session/prompt", nil); err != errNoAgent {
+		t.Fatalf("a call on a dead hub must not wait: %v", err)
 	}
 }
 

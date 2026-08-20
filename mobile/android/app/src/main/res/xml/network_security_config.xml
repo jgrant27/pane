@@ -1,4 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  pane serves cleartext, so the loopback/LAN case genuinely needs http. A
+  domain-config can only name hosts one at a time and the LAN address is
+  whatever the user types, so the whole of RFC1918 cannot be expressed here;
+  narrowing the base-config would break the LAN case the app advertises.
+  Public hosts are kept off cleartext in code instead: MainActivity.load()
+  upgrades http to https unless the host is loopback, private, link-local,
+  .local or unqualified. The manifest no longer repeats this as
+  usesCleartextTraffic — this file is the one place that decides.
+-->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

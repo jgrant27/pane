@@ -260,9 +260,6 @@ func TestHelpers(t *testing.T) {
 	if listenPort("127.0.0.1:9") != "9" || listenPort("bad") != "7420" {
 		t.Fatal("listenPort")
 	}
-	if !tcpBusy("127.0.0.1:1") && tcpBusy(freeAddr(t)) {
-		// 127.0.0.1:1 may or may not be busy; just exercise tcpBusy false path
-	}
 	addr := freeAddr(t)
 	if tcpBusy(addr) {
 		t.Fatal("expected free")

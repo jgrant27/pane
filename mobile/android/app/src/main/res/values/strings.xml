@@ -1,5 +1,8 @@
 <resources>
     <string name="app_name">Grok Pane</string>
     <string name="pane_url">Pane URL</string>
-    <string name="pane_url_help">Tailscale or LAN address of pane. Example: https://beelz.tailnet.ts.net</string>
+    <string name="pane_url_help">Tailscale or LAN address of pane. Examples: https://beelz.tailnet.ts.net or 192.168.1.5:7420</string>
+    <string name="no_handler">No app can open %1$s</string>
+    <string name="bad_scheme">Pane URL must start with http:// or https://</string>
+    <string name="forced_https">Only https to hosts outside your LAN — loading over https instead.</string>
 </resources>
