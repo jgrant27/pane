@@ -149,27 +149,70 @@ func writeUploadJSON(w http.ResponseWriter, info uploadInfo) {
 	_ = json.NewEncoder(w).Encode(info)
 }
 
-func handleUpload(w http.ResponseWriter, r *http.Request) {
+// noteUpload remembers a file pane copied into a project, so it can be
+// taken back out again later.
+func (p *proxy) noteUpload(path string) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	p.upMu.Lock()
+	defer p.upMu.Unlock()
+	if p.uploads == nil {
+		p.uploads = map[string]bool{}
+	}
+	if len(p.uploads) < 4096 {
+		p.uploads[abs] = true
+	}
+}
+
+// knownUpload reports whether this names a copy pane made, and returns the
+// path pane recorded. The recorded path is what gets removed: resolving
+// the caller's string again could land somewhere else entirely if a
+// symlink along the way has changed.
+func (p *proxy) knownUpload(path string) (string, bool) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false
+	}
+	p.upMu.Lock()
+	defer p.upMu.Unlock()
+	if !p.uploads[abs] {
+		return "", false
+	}
+	return abs, true
+}
+
+func (p *proxy) forgetUpload(path string) {
+	p.upMu.Lock()
+	defer p.upMu.Unlock()
+	delete(p.uploads, path)
+}
+
+func (p *proxy) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// Delete only ever takes back a copy pane itself made. The caller used
+	// to supply both the file and the directory it had to be under, and
+	// cwd=/ satisfies that for every path on the system — an arbitrary
+	// delete. It also means a file the user attached in place, which pane
+	// merely pointed at, is never removed.
 	if r.Method == http.MethodDelete {
-		cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
 		path := strings.TrimSpace(r.URL.Query().Get("path"))
-		if cwd == "" || path == "" {
+		if strings.TrimSpace(r.URL.Query().Get("cwd")) == "" || path == "" {
 			http.Error(w, "cwd and path required", http.StatusBadRequest)
 			return
 		}
-		abs, err := filepath.Abs(cwd)
-		if err != nil {
-			http.Error(w, "cwd", http.StatusBadRequest)
+		dest, ok := p.knownUpload(path)
+		if !ok {
+			http.Error(w, "not an upload", http.StatusBadRequest)
 			return
 		}
-		if !underCwd(abs, path) {
-			http.Error(w, "not in project", http.StatusBadRequest)
-			return
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// Keep the record until the file is really gone, so a failed
+		// delete can be retried instead of orphaning the copy.
+		if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		p.forgetUpload(dest)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -211,6 +254,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Only a copy is ours to delete later; a file attached where it
+		// already lived belongs to the user.
+		if info.Copied {
+			p.noteUpload(info.Path)
+		}
 		writeUploadJSON(w, info)
 		return
 	}
@@ -248,6 +296,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		head = head[:n]
 		_ = rf.Close()
 	}
+	p.noteUpload(dest)
 	writeUploadJSON(w, uploadInfo{
 		Name:   filepath.Base(dest),
 		Path:   dest,

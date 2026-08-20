@@ -213,7 +213,7 @@ func TestMoreUploadAndPrompt(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir+"&path="+src, nil)
 	rec := httptest.NewRecorder()
-	handleUpload(rec, req)
+	newTestProxy().handleUpload(rec, req)
 	if rec.Code != 200 {
 		t.Fatal(rec.Body.String())
 	}
@@ -371,8 +371,8 @@ func TestCopyFileExistsAndDeleteDir(t *testing.T) {
 	}
 	_ = os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0o644)
 	rec := httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+sub, nil))
-	if rec.Code != http.StatusInternalServerError {
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+sub, nil))
+	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
 }

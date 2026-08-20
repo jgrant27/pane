@@ -47,7 +47,10 @@ func TestRunReplaceRequiresServe(t *testing.T) {
 	}
 }
 
+const testToken = "test-ui-token"
+
 func TestServePaneHealthzAndMeta(t *testing.T) {
+	t.Setenv("PANE_TOKEN", testToken)
 	dir := t.TempDir()
 	addr := freeAddr(t)
 	stop := make(chan struct{})
@@ -74,7 +77,18 @@ func TestServePaneHealthzAndMeta(t *testing.T) {
 	if res.StatusCode != 200 || !strings.Contains(string(body), "ok") {
 		t.Fatalf("%d %s", res.StatusCode, body)
 	}
-	res, err = http.Get("http://" + addr + "/meta")
+	// /meta reaches the agent's world, so it needs the UI token.
+	noTok, err := http.Get("http://" + addr + "/meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = noTok.Body.Close()
+	if noTok.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("untokened /meta %d", noTok.StatusCode)
+	}
+	metaReq, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/meta", nil)
+	metaReq.Header.Set(tokenHeader, testToken)
+	res, err = http.DefaultClient.Do(metaReq)
 	if err != nil {
 		t.Fatal(err)
 	}

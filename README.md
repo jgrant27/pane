@@ -168,6 +168,8 @@ Leave the app running. Quit with ⌘Q / Alt+F4, or close the window.
 
 The server writes a secret to `~/.grok/pane.secret` on first run (or uses `-secret` / `$GROK_AGENT_SECRET` / `$PANE_SECRET`). You do not normally need to touch this.
 
+It also writes a UI token to `~/.grok/pane.token` (or uses `$PANE_TOKEN`). The secret authenticates **pane to Grok**; the token authenticates **the UI to pane**, so that a random web page you happen to have open cannot reach `127.0.0.1:7420` and drive your agent. Pane serves the token inside its own page, where only a same-origin document can read it, and the desktop app reads it off disk. You do not normally need to touch this either — but if you delete it, reload the page.
+
 ---
 
 ## Browser only (no desktop app)
@@ -207,7 +209,12 @@ On the **machine that has the project and Grok**:
 ./pane -tailscale
 ```
 
-That keeps `pane` on `127.0.0.1:7420`, puts `tailscale serve` in front, and requires `Tailscale-User-Login`. Loopback hits get 403. The log prints `https://<host>.<tailnet>.ts.net/`.
+That keeps `pane` on `127.0.0.1:7420`, puts `tailscale serve` in front, and requires a Tailscale identity on every request. Loopback hits get 403. The log prints `https://<host>.<tailnet>.ts.net/`.
+
+Two things that gate does **not** do:
+
+- It does not check *which* tailnet member is calling. Everyone who can reach that URL can drive the agent.
+- It cannot tell the Serve proxy apart from another program on the same machine, since both connect over loopback — so a local program that sets the identity header itself gets in. A web page cannot do this (the browser will not send that header cross-origin without permission pane never grants), and a local program already runs as you and could just read `~/.grok/pane.token` or run `grok` directly. Treat it as one more reason not to run untrusted code on the box.
 
 On a **laptop on the same tailnet**:
 

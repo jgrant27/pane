@@ -181,6 +181,29 @@ func (a *App) CopyText(s string) {
 	_ = runtime.ClipboardSetText(a.ctx, s)
 }
 
+// PaneToken hands the UI the local server's token. The desktop app serves
+// its own page, so it cannot be given the token the way a browser is — but
+// it does run on the same machine as a local pane, so it can read it.
+// A remote pane's token lives on that machine; there the tailnet identity
+// is the credential, and this is deliberately empty.
+func (a *App) PaneToken() string {
+	if a.remote || !localOrigin(a.origin) {
+		return ""
+	}
+	if v := strings.TrimSpace(os.Getenv("PANE_TOKEN")); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".grok", "pane.token"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func (a *App) OpenURL(raw string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

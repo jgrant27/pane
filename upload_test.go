@@ -66,7 +66,7 @@ func TestHandleUpload(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir, &body)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	rec := httptest.NewRecorder()
-	handleUpload(rec, req)
+	newTestProxy().handleUpload(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("code %d %s", rec.Code, rec.Body.String())
 	}
@@ -109,28 +109,48 @@ func TestHandleUpload(t *testing.T) {
 		t.Fatalf("in-cwd reattach %s vs %s", again.Path, info.Path)
 	}
 
+	// One proxy for attach-then-delete: only a copy pane made is a copy
+	// pane may remove.
+	px := newTestProxy()
 	reqJSON := httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir, strings.NewReader(`{"path":"`+src+`"}`))
 	reqJSON.Header.Set("Content-Type", "application/json")
 	recJSON := httptest.NewRecorder()
-	handleUpload(recJSON, reqJSON)
+	px.handleUpload(recJSON, reqJSON)
 	if recJSON.Code != 200 {
 		t.Fatalf("json attach %d %s", recJSON.Code, recJSON.Body.String())
+	}
+	var made uploadInfo
+	if err := json.Unmarshal(recJSON.Body.Bytes(), &made); err != nil {
+		t.Fatal(err)
+	}
+	if !made.Copied {
+		t.Fatalf("expected a copy: %+v", made)
 	}
 
 	bad := httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir, bytes.NewReader(nil))
 	rec2 := httptest.NewRecorder()
-	handleUpload(rec2, bad)
+	newTestProxy().handleUpload(rec2, bad)
 	if rec2.Code == 200 {
 		t.Fatal("empty upload accepted")
 	}
 
-	del := httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+info.Path, nil)
+	// A file pane did not copy in stays put, whatever the caller claims.
+	recKeep := httptest.NewRecorder()
+	px.handleUpload(recKeep, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+info.Path, nil))
+	if recKeep.Code != http.StatusBadRequest {
+		t.Fatalf("unregistered delete %d", recKeep.Code)
+	}
+	if _, err := os.Stat(info.Path); err != nil {
+		t.Fatal("pane deleted a file it did not create")
+	}
+
+	del := httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+made.Path, nil)
 	recDel := httptest.NewRecorder()
-	handleUpload(recDel, del)
+	px.handleUpload(recDel, del)
 	if recDel.Code != http.StatusNoContent {
 		t.Fatalf("delete %d %s", recDel.Code, recDel.Body.String())
 	}
-	if _, err := os.Stat(info.Path); !os.IsNotExist(err) {
+	if _, err := os.Stat(made.Path); !os.IsNotExist(err) {
 		t.Fatal("copied file still there")
 	}
 
@@ -147,17 +167,17 @@ func TestHandleUpload(t *testing.T) {
 		t.Fatal("dir attach")
 	}
 	rec = httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodGet, "/v1/upload?cwd="+dir, nil))
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodGet, "/v1/upload?cwd="+dir, nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatal(rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodPost, "/v1/upload", nil))
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodPost, "/v1/upload", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload", nil))
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}

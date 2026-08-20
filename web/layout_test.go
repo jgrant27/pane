@@ -182,8 +182,20 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "ArrowUp") || !strings.Contains(src, "ArrowDown") {
 		t.Fatal("composer history must use the arrow keys")
 	}
-	if !strings.Contains(src, "fetchJSON(url)") {
+	if !strings.Contains(src, "fetchJSON(url") {
 		t.Fatal("loadHistory must retry pane HTTP")
+	}
+	if !strings.Contains(src, "function authFetch") || !strings.Contains(src, "X-Pane-Token") {
+		t.Fatal("API calls must carry the UI token")
+	}
+	if !strings.Contains(src, "function ownsToken") {
+		t.Fatal("the token must not be sent to a pane the page does not belong to")
+	}
+	if strings.Contains(src, "\n    return fetch(paneHTTP()") {
+		t.Fatal("every pane call must go through authFetch")
+	}
+	if !strings.Contains(src, "opts.prune ? { method: 'POST' }") {
+		t.Fatal("pruning deletes sessions and must not ride on a GET")
 	}
 	if !strings.Contains(src, "function paintProjectList") {
 		t.Fatal("projects rail must paint the current project even when pane is down")

@@ -4,16 +4,44 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	neturl "net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+// uiToken is what pane serves into its own page; a command-line client
+// reads it off disk instead.
+func uiToken() string {
+	if v := strings.TrimSpace(os.Getenv("PANE_TOKEN")); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".grok", "pane.token"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func main() {
 	url := "ws://127.0.0.1:7420/ws"
 	if len(os.Args) > 1 {
 		url = os.Args[1]
+	}
+	if t := uiToken(); t != "" {
+		if u, err := neturl.Parse(url); err == nil && u.Query().Get("t") == "" {
+			q := u.Query()
+			q.Set("t", t)
+			u.RawQuery = q.Encode()
+			url = u.String()
+		}
 	}
 	c, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {

@@ -5,19 +5,24 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -183,8 +188,24 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 		cwd:       cfg.cwd,
 	}
 
+	tok, err := resolveUIToken()
+	if err != nil {
+		return err
+	}
+	g := &gate{token: tok, listen: cfg.listen, tailscale: cfg.tailscale}
+	if cfg.tailscale {
+		g.tsDNS = tailscaleDNS()
+	}
+
+	// Behind tailscale serve the token is not the credential, so there is
+	// no reason to hand a machine-local secret to every tailnet visitor.
+	pageToken := tok
+	if cfg.tailscale {
+		pageToken = ""
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("/", noStore(http.FileServer(http.FS(web.FS))))
+	mux.Handle("/", noStore(tokenIndex(pageToken, http.FileServer(http.FS(web.FS)))))
 	mux.HandleFunc("/ws", p.handleWS)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -196,16 +217,15 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 	mux.HandleFunc("/v1/rename", handleRename)
 	mux.HandleFunc("/v1/transcript", handleTranscript)
 	mux.HandleFunc("/v1/usage", handleUsage)
-	mux.HandleFunc("/v1/upload", handleUpload)
+	mux.HandleFunc("/v1/upload", p.handleUpload)
 	mux.HandleFunc("/v1/remote-sessions", handleRemoteSessions)
 
-	h := http.Handler(withCORS(mux))
 	if cfg.tailscale {
 		if _, err := lookPath("tailscale"); err != nil {
 			return fmt.Errorf("tailscale not on PATH")
 		}
-		h = requireTailscale(h)
 	}
+	h := g.wrap(mux)
 
 	if tcpBusy(cfg.listen) {
 		return fmt.Errorf("already listening on %s", cfg.listen)
@@ -260,17 +280,199 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 	return nil
 }
 
-func withCORS(next http.Handler) http.Handler {
+// gate is everything standing between a stranger and the agent: which
+// Host we answer to, which page may talk to us, and whether the caller
+// proved it is the UI.
+type gate struct {
+	token     string
+	listen    string
+	tailscale bool
+
+	dnsMu sync.Mutex
+	tsDNS string
+}
+
+const tokenHeader = "X-Pane-Token"
+
+// hostOK rejects a request whose Host we do not serve. Without this a page
+// on any domain can point its own DNS at 127.0.0.1 and reach us with an
+// origin the browser believes is its own.
+func (g *gate) hostOK(host string) bool {
+	if host == "" {
+		return false
+	}
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host
+	}
+	h = strings.ToLower(strings.TrimSuffix(h, "."))
+	if n := g.tailnetName(); n != "" && h == strings.ToLower(n) {
+		return true
+	}
+	if h == "localhost" {
+		return true
+	}
+	// A bare IP cannot be rebound — an attacker's page has to reach us
+	// through a *name* it controls — so addressing pane by address is
+	// always allowed. That keeps the LAN and phone flows working when
+	// pane is bound to a wildcard address.
+	if net.ParseIP(strings.Trim(h, "[]")) != nil {
+		return true
+	}
+	if lh, _, err := net.SplitHostPort(g.listen); err == nil && lh != "" && lh != "0.0.0.0" && lh != "::" {
+		return h == strings.ToLower(lh)
+	}
+	return false
+}
+
+// originOK decides whether a page may read our answers. Same-origin needs
+// no allowance; the desktop app runs on its own scheme and identifies
+// itself with the token instead.
+func (g *gate) originOK(origin, host string) bool {
+	if origin == "" {
+		return true // not a browser, or a same-origin navigation
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Host != "" && strings.EqualFold(u.Host, host) {
+		return true
+	}
+	// The desktop app's page is served by Wails, not by pane, so it is
+	// cross-origin by construction: wails:// on macOS and Linux,
+	// http://wails.localhost on Windows. Nothing else is allowed in —
+	// the phone shells load pane's own page and are same-origin.
+	if strings.EqualFold(u.Scheme, "wails") {
+		return true
+	}
+	if strings.EqualFold(u.Hostname(), "wails.localhost") {
+		return true
+	}
+	// Guard the empty case: an origin like file:// has no hostname, and
+	// must not match an unset tailnet name.
+	n := g.tailnetName()
+	return n != "" && strings.EqualFold(u.Hostname(), n)
+}
+
+// tailnetName is looked up lazily and remembered. Reading it once at
+// startup meant a single failed `tailscale status` left pane refusing its
+// own tailnet hostname for the rest of the run.
+func (g *gate) tailnetName() string {
+	g.dnsMu.Lock()
+	defer g.dnsMu.Unlock()
+	if g.tsDNS == "" && g.tailscale {
+		g.tsDNS = tailscaleDNS()
+	}
+	return g.tsDNS
+}
+
+// tailnetOK is only satisfied by a request that really came through the
+// local `tailscale serve` proxy. The identity header alone proves nothing:
+// anything that can reach the port can set it.
+func (g *gate) tailnetOK(r *http.Request) bool {
+	if !g.tailscale || r.Header.Get("Tailscale-User-Login") == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// tokenOK reads the token from a header, and from the query string only on
+// /ws — a WebSocket handshake cannot carry headers. Everywhere else the
+// header is required, so a bare <img>, <script> or link cannot present a
+// credential even if the token has leaked into a URL somewhere.
+func (g *gate) tokenOK(r *http.Request) bool {
+	if g.token == "" {
+		return false
+	}
+	got := r.Header.Get(tokenHeader)
+	if got == "" && gatePath(r) == "/ws" {
+		got = r.URL.Query().Get("t")
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(g.token)) == 1
+}
+
+// gatePath is the path the router will actually dispatch on, so the gate
+// and ServeMux cannot disagree about which handler a request reaches.
+func gatePath(r *http.Request) string {
+	p := r.URL.Path
+	if p == "" {
+		return "/"
+	}
+	c := path.Clean(p)
+	if c == "." {
+		return "/"
+	}
+	if !strings.HasPrefix(c, "/") {
+		c = "/" + c
+	}
+	return c
+}
+
+func (g *gate) authOK(r *http.Request) bool {
+	return g.tokenOK(r) || g.tailnetOK(r)
+}
+
+// wrap applies the gate. Static files stay readable so the UI can boot —
+// they carry the token, and without a matching origin no other page can
+// read the response — but everything that reaches the agent needs auth.
+func (g *gate) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		if !g.hostOK(r.Host) {
+			http.Error(w, "bad host", http.StatusForbidden)
+			return
+		}
+		origin := r.Header.Get("Origin")
+		if !g.originOK(origin, r.Host) {
+			http.Error(w, "bad origin", http.StatusForbidden)
+			return
+		}
+		// Only an origin we already accept gets this far, so it is the
+		// origin — not the token — that decides CORS. A preflight never
+		// carries the token (browsers do not send custom headers on it),
+		// and withholding the headers here would block the real request
+		// before it could present one. The token still guards the data.
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, "+tokenHeader)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		}
+		// The page holds a credential and drives a shell. Nobody frames it.
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		// Behind tailscale serve the tailnet identity is the whole gate,
+		// on every path: a loopback caller has not come through the proxy
+		// and has no business here.
+		if g.tailscale {
+			if !g.tailnetOK(r) {
+				http.Error(w, "tailnet only", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Otherwise the page and its assets are open — they have to be, to
+		// bootstrap — and everything that can reach the agent is not.
+		if needsAuth(gatePath(r)) && !g.authOK(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func needsAuth(path string) bool {
+	return path == "/ws" || path == "/meta" || strings.HasPrefix(path, "/v1/")
 }
 
 func noStore(next http.Handler) http.Handler {
@@ -368,13 +570,62 @@ func tailscaleDNS() string {
 	return strings.TrimSuffix(st.Self.DNSName, ".")
 }
 
-func requireTailscale(next http.Handler) http.Handler {
+// resolveUIToken is the browser's half of the story: the agent secret
+// authenticates pane to grok, and this authenticates the UI to pane.
+func resolveUIToken() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(home, ".grok", "pane.token")
+	given := strings.TrimSpace(env("PANE_TOKEN", ""))
+	if given == "" {
+		if b, err := os.ReadFile(path); err == nil {
+			if s := strings.TrimSpace(string(b)); s != "" {
+				return s, nil
+			}
+		}
+		var raw [32]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", err
+		}
+		given = hex.EncodeToString(raw[:])
+	}
+	// The file is how the desktop app and cmd/probe find the token, so an
+	// operator-supplied one is written there too. Otherwise they would
+	// read a stale token and be refused by the server that set it.
+	if b, err := os.ReadFile(path); err != nil || strings.TrimSpace(string(b)) != given {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(path, []byte(given+"\n"), 0o600); err != nil {
+			return "", err
+		}
+		log.Printf("wrote %s", path)
+	}
+	return given, nil
+}
+
+const tokenMeta = `<meta name="pane-token" content="">`
+
+// tokenIndex hands the page its token. Only a same-origin document can
+// read the result, so this is how the UI gets in without the token ever
+// being readable by another site.
+func tokenIndex(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Tailscale-User-Login") == "" {
-			http.Error(w, "tailnet only", http.StatusForbidden)
+		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		b, err := web.FS.ReadFile("index.html")
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		out := strings.Replace(string(b), tokenMeta,
+			`<meta name="pane-token" content="`+html.EscapeString(token)+`">`, 1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, out)
 	})
 }
 

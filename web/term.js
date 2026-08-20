@@ -51,19 +51,60 @@
     return !!(window.runtime || window.wails || (window.go && window.go.main));
   }
 
-  function fetchJSON(url, tries) {
+  function fetchJSON(url, tries, opts) {
     tries = tries == null ? 16 : tries;
-    return fetch(url).then(function (r) {
+    return authFetch(url, opts).then(function (r) {
       if (!r.ok) throw new Error(String(r.status));
       return r.json();
     }).catch(function (err) {
       if (tries <= 1) throw err;
       return new Promise(function (resolve, reject) {
         setTimeout(function () {
-          fetchJSON(url, tries - 1).then(resolve, reject);
+          fetchJSON(url, tries - 1, opts).then(resolve, reject);
         }, 400);
       });
     });
+  }
+
+  // The token pane put in the page, or the one the desktop app read off
+  // disk. Empty is normal for a remote pane reached over the tailnet,
+  // where Tailscale identity is the credential instead.
+  var paneToken = (function () {
+    try {
+      var m = document.querySelector('meta[name="pane-token"]');
+      return (m && m.content) || '';
+    } catch (e) { return ''; }
+  })();
+
+  function setPaneToken(t) {
+    paneToken = String(t || '');
+  }
+
+  // The token belongs to one pane: the one that served this page, or the
+  // local one the desktop app read it from. `?pane=` and the stored
+  // pane-url can point everything at another host, and handing this to a
+  // host of someone else's choosing would give away the credential.
+  function ownsToken(target) {
+    var u;
+    try { u = new URL(target, location.href); } catch (e) { return false; }
+    // Compare hosts, not origins: ws:// and http:// to the same server
+    // are the same pane, but URL.origin says otherwise.
+    if (u.host === location.host) return true;
+    if (!isDesktop()) return false;
+    var h = u.hostname;
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+  }
+
+  // Same-origin calls carry the token in a header; a WebSocket cannot set
+  // headers, so /ws takes it as a query parameter instead.
+  function authFetch(url, opts) {
+    opts = opts || {};
+    if (paneToken && ownsToken(url)) {
+      var h = opts.headers || {};
+      h['X-Pane-Token'] = paneToken;
+      opts.headers = h;
+    }
+    return fetch(url, opts);
   }
 
   function paneHTTP() {
@@ -92,6 +133,7 @@
     var effort = stored('pane-effort');
     if (model) u.searchParams.set('model', model);
     if (effort) u.searchParams.set('effort', effort);
+    if (paneToken && ownsToken(u.toString())) u.searchParams.set('t', paneToken);
     return u.toString();
   }
 
@@ -298,7 +340,7 @@
       s.title = val;
       s.named = true;
       if (id && cwd) {
-        fetch(paneHTTP() + '/v1/rename?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), {
+        authFetch(paneHTTP() + '/v1/rename?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title: val })
@@ -1223,7 +1265,8 @@
       url += '&prune=1';
       if (keep.length) url += '&keep=' + keep.map(encodeURIComponent).join(',');
     }
-    fetchJSON(url)
+    // Pruning deletes sessions, so it goes out as a POST.
+    fetchJSON(url, null, opts.prune ? { method: 'POST' } : null)
       .then(function (list) {
         diskSessions = Array.isArray(list) ? list : [];
         sessPaintKey = '';
@@ -1269,7 +1312,7 @@
       loadProjects();
       return;
     }
-    fetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(cwd), {
+    authFetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(cwd), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: val })
@@ -1430,7 +1473,7 @@
 
   function loadRemote() {
     if (!remoteEl) return;
-    fetch(paneHTTP() + '/v1/remote-sessions')
+    authFetch(paneHTTP() + '/v1/remote-sessions')
       .then(function (r) { return r.ok ? r.json() : []; })
       .then(function (list) {
         remoteEl.textContent = '';
@@ -1574,7 +1617,7 @@
         if (s.cwd === p.cwd) doomed.push(s);
       });
       doomed.forEach(dropTab);
-      fetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(p.cwd), { method: 'DELETE' })
+      authFetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(p.cwd), { method: 'DELETE' })
         .then(function (r) {
           if (!r.ok) throw new Error('delete failed');
           setStatus('deleted project', 'ok');
@@ -1590,7 +1633,7 @@
             paintCwd('');
             loadProjects();
             if (!sessions.length) {
-              fetch(paneHTTP() + '/v1/projects')
+              authFetch(paneHTTP() + '/v1/projects')
                 .then(function (r) { return r.ok ? r.json() : []; })
                 .then(function (list) {
                   if (list && list[0] && list[0].cwd) setProject(list[0].cwd);
@@ -1632,7 +1675,7 @@
         loadHistory(cwd);
         return;
       }
-      fetch(paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), { method: 'DELETE' })
+      authFetch(paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), { method: 'DELETE' })
         .then(function (r) {
           if (!r.ok) throw new Error('delete failed');
           setStatus('deleted', 'ok');
@@ -1909,7 +1952,7 @@
       if (s === active) paintUsage();
       return;
     }
-    fetch(paneHTTP() + '/v1/usage?cwd=' + encodeURIComponent(s.cwd) + '&id=' + encodeURIComponent(s.id))
+    authFetch(paneHTTP() + '/v1/usage?cwd=' + encodeURIComponent(s.cwd) + '&id=' + encodeURIComponent(s.id))
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (u) {
         if (!u) return;
@@ -2244,7 +2287,7 @@
     if (f.copied && f.path) {
       var cwd = (active && active.cwd) || project;
       if (cwd) {
-        fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd) + '&path=' + encodeURIComponent(f.path), { method: 'DELETE' }).catch(function () {});
+        authFetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd) + '&path=' + encodeURIComponent(f.path), { method: 'DELETE' }).catch(function () {});
       }
     }
     paintChips();
@@ -2304,7 +2347,7 @@
       }
       var fd = new FormData();
       fd.append('file', file, file.name || 'upload');
-      fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), { method: 'POST', body: fd })
+      authFetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), { method: 'POST', body: fd })
         .then(function (r) {
           if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.statusText); });
           return r.json();
@@ -2337,7 +2380,7 @@
       if (!p) return;
       var dup = pending.some(function (f) { return f.path === p || f.name === basename(p); });
       if (dup) return;
-      fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), {
+      authFetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: p })
@@ -2773,6 +2816,20 @@
       }
       if (path) setProject(path);
     }
+    // The desktop app serves its own page, so there is no token in it.
+    // Ask the app for the local server's token before anything connects.
+    function withToken(done) {
+      var api = desktopAPI();
+      if (paneToken || !api || typeof api.PaneToken !== 'function') {
+        done();
+        return;
+      }
+      Promise.resolve(api.PaneToken()).then(function (t) {
+        setPaneToken(t);
+        done();
+      }).catch(function () { done(); });
+    }
+
     var api = desktopAPI();
     if (api && typeof api.PaneOrigin === 'function') {
       Promise.resolve(api.PaneOrigin()).then(function (o) {
@@ -2780,11 +2837,11 @@
           window.__paneOrigin = o;
           try { localStorage.setItem('pane-url', o); } catch (e) {}
         }
-        start();
-      }).catch(function () { start(); });
+        withToken(start);
+      }).catch(function () { withToken(start); });
       return;
     }
-    start();
+    withToken(start);
   }
   boot();
 })();
