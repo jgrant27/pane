@@ -112,6 +112,10 @@ var (
 	rePlistBuildCode = regexp.MustCompile(`(<key>CFBundleVersion</key>\s*<string>)(\d+)(</string>)`)
 	reGradleName     = regexp.MustCompile(`(versionName\s*=\s*")(\d+\.\d+\.\d+)(")`)
 	reGradleCode     = regexp.MustCompile(`(versionCode\s*=\s*)(\d+)`)
+	// Xcode build settings override the Info.plist they are built with, so
+	// stamping only the plist leaves the app reporting the older number.
+	reXcodeMarketing = regexp.MustCompile(`(MARKETING_VERSION = )(\d+\.\d+\.\d+)(;)`)
+	reXcodeBuild     = regexp.MustCompile(`(CURRENT_PROJECT_VERSION = )(\d+)(;)`)
 )
 
 // buildCode packs the version into one increasing integer. The stores reject an
@@ -191,6 +195,13 @@ func writeVersion(root, next string) error {
 		return err
 	}
 	if err := replaceAll(ios, rePlistBuildCode, code, 2); err != nil {
+		return err
+	}
+	pbx := filepath.Join(root, "mobile", "ios", "GrokPane.xcodeproj", "project.pbxproj")
+	if err := replaceAll(pbx, reXcodeMarketing, next, 2); err != nil {
+		return err
+	}
+	if err := replaceAll(pbx, reXcodeBuild, code, 2); err != nil {
 		return err
 	}
 	gradle := filepath.Join(root, "mobile", "android", "app", "build.gradle.kts")

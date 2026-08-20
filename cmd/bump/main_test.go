@@ -35,7 +35,7 @@ func TestParseAndBump(t *testing.T) {
 func stampTree(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for _, sub := range []string{"desktop", "mobile/ios/GrokPane", "mobile/android/app"} {
+	for _, sub := range []string{"desktop", "mobile/ios/GrokPane", "mobile/ios/GrokPane.xcodeproj", "mobile/android/app"} {
 		if err := os.MkdirAll(filepath.Join(dir, filepath.FromSlash(sub)), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -55,6 +55,8 @@ func stampTree(t *testing.T) string {
 	<string>2000</string>`,
 		"mobile/android/app/build.gradle.kts": `        versionCode = 2000
         versionName = "0.2.0"`,
+		"mobile/ios/GrokPane.xcodeproj/project.pbxproj": `				MARKETING_VERSION = 0.2.0;
+				CURRENT_PROJECT_VERSION = 2000;`,
 	}
 	for rel, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(rel)), []byte(body), 0o644); err != nil {
@@ -194,6 +196,19 @@ func TestRepoMobileFilesMatchVERSION(t *testing.T) {
 	}
 	if !strings.Contains(string(gradle), "versionCode = "+buildCode(v)) {
 		t.Fatalf("gradle versionCode is not %s: %s", buildCode(v), gradle)
+	}
+	// Xcode build settings win over the Info.plist they are built with, so a
+	// stale MARKETING_VERSION here means the app reports the old number
+	// however well the plist was stamped.
+	pbx, err := os.ReadFile(filepath.Join(root, filepath.FromSlash("mobile/ios/GrokPane.xcodeproj/project.pbxproj")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(pbx), "MARKETING_VERSION = "+v.String()+";") {
+		t.Fatalf("xcodeproj MARKETING_VERSION is not %s", v)
+	}
+	if !strings.Contains(string(pbx), "CURRENT_PROJECT_VERSION = "+buildCode(v)+";") {
+		t.Fatalf("xcodeproj CURRENT_PROJECT_VERSION is not %s", buildCode(v))
 	}
 }
 
