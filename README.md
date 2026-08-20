@@ -220,7 +220,8 @@ On a **laptop on the same tailnet**:
 
 ## What it is (and is not)
 
-- Auto-approves tool permission prompts (`yoloMode`). Treat it like a local shell with a window attached.
+- Asks before commands that execute or write. Pane requests a gated session and shows an **Allow / Deny** card; denying, closing the tab, or leaving the card unanswered all reject the call.
+- **That gate is only as good as Grok's own setting.** With `permission_mode = "always-approve"` (or yolo) in `~/.grok/config.toml`, Grok approves tool calls itself and never asks Pane — the card never appears and commands run unreviewed. Pane detects this and prints a warning in the transcript. Until you change that setting, treat it like a local shell with a window attached.
 - Parallel sessions, each with its own cwd.
 - Not a clone of Claude’s diff viewer, in-app browser, or git-isolated worktrees. The agent already does the coding.
 
