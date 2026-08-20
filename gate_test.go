@@ -13,14 +13,14 @@ func testGate() *gate {
 	return &gate{token: "secret-token", listen: "127.0.0.1:7420"}
 }
 
-func req(method, target string) *http.Request {
+func gateReq(method, target string) *http.Request {
 	r := httptest.NewRequest(method, target, nil)
 	r.Host = "127.0.0.1:7420"
 	r.RemoteAddr = "127.0.0.1:54321"
 	return r
 }
 
-func serve(g *gate, r *http.Request) *httptest.ResponseRecorder {
+func gateServe(g *gate, r *http.Request) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	g.wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -34,13 +34,13 @@ func serve(g *gate, r *http.Request) *httptest.ResponseRecorder {
 func TestGateRejectsUnauthenticatedAPI(t *testing.T) {
 	g := testGate()
 	for _, path := range []string{"/ws", "/meta", "/v1/sessions", "/v1/upload", "/v1/projects"} {
-		if code := serve(g, req(http.MethodGet, path)).Code; code != http.StatusUnauthorized {
+		if code := gateServe(g, gateReq(http.MethodGet, path)).Code; code != http.StatusUnauthorized {
 			t.Fatalf("%s answered %d without a token", path, code)
 		}
 	}
 	// The page itself has to load, or nothing can bootstrap.
 	for _, path := range []string{"/", "/term.js", "/healthz"} {
-		if code := serve(g, req(http.MethodGet, path)).Code; code != http.StatusOK {
+		if code := gateServe(g, gateReq(http.MethodGet, path)).Code; code != http.StatusOK {
 			t.Fatalf("%s answered %d", path, code)
 		}
 	}
@@ -48,16 +48,16 @@ func TestGateRejectsUnauthenticatedAPI(t *testing.T) {
 
 func TestGateAcceptsToken(t *testing.T) {
 	g := testGate()
-	r := req(http.MethodGet, "/v1/sessions")
+	r := gateReq(http.MethodGet, "/v1/sessions")
 	r.Header.Set(tokenHeader, "secret-token")
-	if code := serve(g, r).Code; code != http.StatusOK {
+	if code := gateServe(g, r).Code; code != http.StatusOK {
 		t.Fatalf("header token rejected: %d", code)
 	}
 	// A WebSocket cannot set headers, so /ws takes the token in the query.
-	if code := serve(g, req(http.MethodGet, "/ws?t=secret-token")).Code; code != http.StatusOK {
+	if code := gateServe(g, gateReq(http.MethodGet, "/ws?t=secret-token")).Code; code != http.StatusOK {
 		t.Fatalf("query token rejected: %d", code)
 	}
-	if code := serve(g, req(http.MethodGet, "/ws?t=wrong")).Code; code != http.StatusUnauthorized {
+	if code := gateServe(g, gateReq(http.MethodGet, "/ws?t=wrong")).Code; code != http.StatusUnauthorized {
 		t.Fatalf("wrong token accepted: %d", code)
 	}
 }
@@ -66,9 +66,9 @@ func TestGateAcceptsToken(t *testing.T) {
 // read the reply, which is what would leak the token and the transcript.
 func TestGateWithholdsCORSFromStrangers(t *testing.T) {
 	g := testGate()
-	r := req(http.MethodGet, "/v1/sessions")
+	r := gateReq(http.MethodGet, "/v1/sessions")
 	r.Header.Set("Origin", "https://evil.example")
-	rec := serve(g, r)
+	rec := gateServe(g, r)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("foreign origin answered %d", rec.Code)
 	}
@@ -77,10 +77,10 @@ func TestGateWithholdsCORSFromStrangers(t *testing.T) {
 	}
 
 	// The desktop app runs on its own scheme and proves itself with the token.
-	r = req(http.MethodGet, "/v1/sessions")
+	r = gateReq(http.MethodGet, "/v1/sessions")
 	r.Header.Set("Origin", "wails://wails")
 	r.Header.Set(tokenHeader, "secret-token")
-	rec = serve(g, r)
+	rec = gateServe(g, r)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("desktop origin answered %d", rec.Code)
 	}
@@ -89,10 +89,10 @@ func TestGateWithholdsCORSFromStrangers(t *testing.T) {
 	}
 
 	// Same origin needs no allowance and gets none.
-	r = req(http.MethodGet, "/v1/sessions")
+	r = gateReq(http.MethodGet, "/v1/sessions")
 	r.Header.Set("Origin", "http://127.0.0.1:7420")
 	r.Header.Set(tokenHeader, "secret-token")
-	if code := serve(g, r).Code; code != http.StatusOK {
+	if code := gateServe(g, r).Code; code != http.StatusOK {
 		t.Fatalf("same origin answered %d", code)
 	}
 }
@@ -101,16 +101,16 @@ func TestGateWithholdsCORSFromStrangers(t *testing.T) {
 // the page is same-origin. The Host header is what gives it away.
 func TestGateRejectsForeignHost(t *testing.T) {
 	g := testGate()
-	r := req(http.MethodGet, "/v1/sessions")
+	r := gateReq(http.MethodGet, "/v1/sessions")
 	r.Host = "evil.example"
 	r.Header.Set(tokenHeader, "secret-token")
-	if code := serve(g, r).Code; code != http.StatusForbidden {
+	if code := gateServe(g, r).Code; code != http.StatusForbidden {
 		t.Fatalf("rebound host answered %d", code)
 	}
 	for _, h := range []string{"127.0.0.1:7420", "localhost:7420", "127.0.0.1", "[::1]:7420"} {
-		r = req(http.MethodGet, "/healthz")
+		r = gateReq(http.MethodGet, "/healthz")
 		r.Host = h
-		if code := serve(g, r).Code; code != http.StatusOK {
+		if code := gateServe(g, r).Code; code != http.StatusOK {
 			t.Fatalf("host %s answered %d", h, code)
 		}
 	}
@@ -121,34 +121,34 @@ func TestGateRejectsForeignHost(t *testing.T) {
 func TestGateTailnetNeedsTheProxy(t *testing.T) {
 	g := &gate{token: "secret-token", listen: "127.0.0.1:7420", tailscale: true, tsDNS: "box.tailnet.ts.net"}
 
-	r := req(http.MethodGet, "/healthz")
-	if code := serve(g, r).Code; code != http.StatusForbidden {
+	r := gateReq(http.MethodGet, "/healthz")
+	if code := gateServe(g, r).Code; code != http.StatusForbidden {
 		t.Fatalf("bare loopback answered %d", code)
 	}
 	// Even with a valid token: in tailnet mode identity is the gate.
-	r = req(http.MethodGet, "/v1/sessions")
+	r = gateReq(http.MethodGet, "/v1/sessions")
 	r.Header.Set(tokenHeader, "secret-token")
-	if code := serve(g, r).Code; code != http.StatusForbidden {
+	if code := gateServe(g, r).Code; code != http.StatusForbidden {
 		t.Fatalf("token bypassed the tailnet gate: %d", code)
 	}
 	// Through the proxy, which connects over loopback, with an identity.
-	r = req(http.MethodGet, "/v1/sessions")
+	r = gateReq(http.MethodGet, "/v1/sessions")
 	r.Header.Set("Tailscale-User-Login", "jgrant@example.com")
-	if code := serve(g, r).Code; code != http.StatusOK {
+	if code := gateServe(g, r).Code; code != http.StatusOK {
 		t.Fatalf("proxied request answered %d", code)
 	}
 	// Same header from somewhere that is not the local proxy.
-	r = req(http.MethodGet, "/v1/sessions")
+	r = gateReq(http.MethodGet, "/v1/sessions")
 	r.Header.Set("Tailscale-User-Login", "jgrant@example.com")
 	r.RemoteAddr = "10.1.2.3:5555"
-	if code := serve(g, r).Code; code != http.StatusForbidden {
+	if code := gateServe(g, r).Code; code != http.StatusForbidden {
 		t.Fatalf("forged identity from off-box answered %d", code)
 	}
 	// The tailnet name is a Host we answer to.
-	r = req(http.MethodGet, "/healthz")
+	r = gateReq(http.MethodGet, "/healthz")
 	r.Host = "box.tailnet.ts.net"
 	r.Header.Set("Tailscale-User-Login", "jgrant@example.com")
-	if code := serve(g, r).Code; code != http.StatusOK {
+	if code := gateServe(g, r).Code; code != http.StatusOK {
 		t.Fatalf("tailnet host answered %d", code)
 	}
 }
@@ -157,7 +157,7 @@ func TestGateTailnetNeedsTheProxy(t *testing.T) {
 // nothing else can.
 func TestTokenIndexInjects(t *testing.T) {
 	rec := httptest.NewRecorder()
-	tokenIndex("abc123", http.NotFoundHandler()).ServeHTTP(rec, req(http.MethodGet, "/"))
+	tokenIndex("abc123", http.NotFoundHandler()).ServeHTTP(rec, gateReq(http.MethodGet, "/"))
 	body := rec.Body.String()
 	if !strings.Contains(body, `<meta name="pane-token" content="abc123">`) {
 		t.Fatalf("token not injected: %s", firstLines(body))
@@ -167,7 +167,7 @@ func TestTokenIndexInjects(t *testing.T) {
 	}
 	// Anything else falls through to the file server.
 	rec = httptest.NewRecorder()
-	tokenIndex("abc123", http.NotFoundHandler()).ServeHTTP(rec, req(http.MethodGet, "/style.css"))
+	tokenIndex("abc123", http.NotFoundHandler()).ServeHTTP(rec, gateReq(http.MethodGet, "/style.css"))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("non-index path handled here: %d", rec.Code)
 	}
@@ -224,11 +224,11 @@ func TestSessionDirStaysInsideTheGroup(t *testing.T) {
 // desktop app's real request before it ever got to present one.
 func TestGateOptionsPreflightNeedsNoToken(t *testing.T) {
 	g := testGate()
-	r := req(http.MethodOptions, "/v1/sessions")
+	r := gateReq(http.MethodOptions, "/v1/sessions")
 	r.Header.Set("Origin", "wails://wails")
 	r.Header.Set("Access-Control-Request-Method", "GET")
 	r.Header.Set("Access-Control-Request-Headers", tokenHeader)
-	rec := serve(g, r)
+	rec := gateServe(g, r)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("preflight %d", rec.Code)
 	}
@@ -239,8 +239,8 @@ func TestGateOptionsPreflightNeedsNoToken(t *testing.T) {
 		t.Fatalf("preflight does not allow the token header: %q", rec.Header().Get("Access-Control-Allow-Headers"))
 	}
 	// The preflight is open; the data behind it is not.
-	if code := serve(g, func() *http.Request {
-		x := req(http.MethodGet, "/v1/sessions")
+	if code := gateServe(g, func() *http.Request {
+		x := gateReq(http.MethodGet, "/v1/sessions")
 		x.Header.Set("Origin", "wails://wails")
 		return x
 	}()).Code; code != http.StatusUnauthorized {
@@ -252,10 +252,10 @@ func TestGateOptionsPreflightNeedsNoToken(t *testing.T) {
 // WebSocket handshake, which cannot carry a header, may use one.
 func TestGateQueryTokenOnlyForWebSocket(t *testing.T) {
 	g := testGate()
-	if code := serve(g, req(http.MethodGet, "/v1/sessions?t=secret-token")).Code; code != http.StatusUnauthorized {
+	if code := gateServe(g, gateReq(http.MethodGet, "/v1/sessions?t=secret-token")).Code; code != http.StatusUnauthorized {
 		t.Fatalf("query token accepted on a REST route: %d", code)
 	}
-	if code := serve(g, req(http.MethodGet, "/ws?t=secret-token")).Code; code != http.StatusOK {
+	if code := gateServe(g, gateReq(http.MethodGet, "/ws?t=secret-token")).Code; code != http.StatusOK {
 		t.Fatalf("query token refused on /ws: %d", code)
 	}
 }
@@ -267,7 +267,7 @@ func TestGatePathIsNormalised(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7420"+p, nil)
 		r.Host = "127.0.0.1:7420"
 		r.RemoteAddr = "127.0.0.1:5555"
-		if code := serve(g, r).Code; code != http.StatusUnauthorized {
+		if code := gateServe(g, r).Code; code != http.StatusUnauthorized {
 			t.Fatalf("%s slipped past the gate: %d", p, code)
 		}
 	}
@@ -275,7 +275,7 @@ func TestGatePathIsNormalised(t *testing.T) {
 
 // The page holds a credential and drives a shell; it must not be framed.
 func TestGateForbidsFraming(t *testing.T) {
-	rec := serve(testGate(), req(http.MethodGet, "/"))
+	rec := gateServe(testGate(), gateReq(http.MethodGet, "/"))
 	if rec.Header().Get("X-Frame-Options") != "DENY" {
 		t.Fatalf("X-Frame-Options %q", rec.Header().Get("X-Frame-Options"))
 	}
@@ -289,18 +289,18 @@ func TestGateForbidsFraming(t *testing.T) {
 func TestGateOriginAllowList(t *testing.T) {
 	g := testGate()
 	for _, o := range []string{"file://", "capacitor://localhost", "ionic://localhost", "http://localhost:9999", "https://evil.example"} {
-		r := req(http.MethodGet, "/v1/sessions")
+		r := gateReq(http.MethodGet, "/v1/sessions")
 		r.Header.Set("Origin", o)
 		r.Header.Set(tokenHeader, "secret-token")
-		if code := serve(g, r).Code; code != http.StatusForbidden {
+		if code := gateServe(g, r).Code; code != http.StatusForbidden {
 			t.Fatalf("origin %s answered %d", o, code)
 		}
 	}
 	for _, o := range []string{"wails://wails", "http://wails.localhost"} {
-		r := req(http.MethodGet, "/v1/sessions")
+		r := gateReq(http.MethodGet, "/v1/sessions")
 		r.Header.Set("Origin", o)
 		r.Header.Set(tokenHeader, "secret-token")
-		if code := serve(g, r).Code; code != http.StatusOK {
+		if code := gateServe(g, r).Code; code != http.StatusOK {
 			t.Fatalf("desktop origin %s answered %d", o, code)
 		}
 	}
@@ -311,16 +311,16 @@ func TestGateOriginAllowList(t *testing.T) {
 func TestGateWildcardBindAllowsAddresses(t *testing.T) {
 	g := &gate{token: "secret-token", listen: "0.0.0.0:7420"}
 	for _, h := range []string{"192.168.1.5:7420", "10.0.0.9:7420", "127.0.0.1:7420", "localhost:7420", "[fe80::1]:7420"} {
-		r := req(http.MethodGet, "/healthz")
+		r := gateReq(http.MethodGet, "/healthz")
 		r.Host = h
-		if code := serve(g, r).Code; code != http.StatusOK {
+		if code := gateServe(g, r).Code; code != http.StatusOK {
 			t.Fatalf("host %s answered %d", h, code)
 		}
 	}
 	// A name is what rebinding needs, and a name we do not serve is refused.
-	r := req(http.MethodGet, "/healthz")
+	r := gateReq(http.MethodGet, "/healthz")
 	r.Host = "evil.example"
-	if code := serve(g, r).Code; code != http.StatusForbidden {
+	if code := gateServe(g, r).Code; code != http.StatusForbidden {
 		t.Fatalf("foreign name answered %d", code)
 	}
 }

@@ -134,13 +134,17 @@ func TestHandleUpload(t *testing.T) {
 		t.Fatal("empty upload accepted")
 	}
 
-	// A file pane did not copy in stays put, whatever the caller claims.
+	// A file pane did not put there stays put, whatever the caller claims.
+	theirs := filepath.Join(dir, "not-an-upload.txt")
+	if err := os.WriteFile(theirs, []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	recKeep := httptest.NewRecorder()
-	px.handleUpload(recKeep, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+info.Path, nil))
+	px.handleUpload(recKeep, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+theirs, nil))
 	if recKeep.Code != http.StatusBadRequest {
 		t.Fatalf("unregistered delete %d", recKeep.Code)
 	}
-	if _, err := os.Stat(info.Path); err != nil {
+	if _, err := os.Stat(theirs); err != nil {
 		t.Fatal("pane deleted a file it did not create")
 	}
 
