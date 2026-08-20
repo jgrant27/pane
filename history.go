@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -77,7 +78,10 @@ func handleSessions(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.URL.Query().Get("prune") == "1" {
+	// Pruning deletes sessions, so it does not happen on a GET. A GET is
+	// what a link, an image tag or a prefetch can trigger without anyone
+	// meaning to.
+	if r.URL.Query().Get("prune") == "1" && r.Method == http.MethodPost {
 		keep := map[string]bool{}
 		for _, id := range strings.Split(r.URL.Query().Get("keep"), ",") {
 			id = strings.TrimSpace(id)
@@ -92,11 +96,30 @@ func handleSessions(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(list)
 }
 
+// A session id names one directory under the project's session group. It
+// is matched against what an id may contain rather than against a list of
+// things it may not: a denylist let "." through, and filepath.Join then
+// cleaned it away to the group directory itself, so deleting one session
+// deleted the whole project's history.
+var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{2,}$`)
+
 func validSessionID(id string) bool {
-	if id == "" || strings.ContainsAny(id, `/\`) || strings.Contains(id, "..") || strings.ContainsAny(id, `'" ;`) {
-		return false
+	return sessionIDRe.MatchString(id)
+}
+
+// sessionDir resolves a session's directory and proves it is really inside
+// the group, so no id can walk out of it.
+func sessionDir(cwd, id string) (string, bool) {
+	if !validSessionID(id) {
+		return "", false
 	}
-	return true
+	group := sessionGroupDir(cwd)
+	dir := filepath.Join(group, id)
+	rel, err := filepath.Rel(group, dir)
+	if err != nil || rel != id {
+		return "", false
+	}
+	return dir, true
 }
 
 func grokBin() string {
@@ -156,10 +179,10 @@ func purgeSessionSearch(id string) {
 }
 
 func deleteGrokSession(cwd, id string) error {
-	if !validSessionID(id) {
+	dir, ok := sessionDir(cwd, id)
+	if !ok {
 		return os.ErrInvalid
 	}
-	dir := filepath.Join(sessionGroupDir(cwd), id)
 	// Official path talks to the grok leader + FTS index. Filesystem
 	// remove is the fallback when grok is missing or the session is
 	// only a leftover directory.

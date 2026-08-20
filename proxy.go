@@ -28,6 +28,11 @@ type proxy struct {
 
 	hubMu sync.Mutex
 	hub   *agentHub
+
+	// Files pane copied into a project on the user's behalf, and so may
+	// remove again on request.
+	upMu    sync.Mutex
+	uploads map[string]bool
 }
 
 // One ACP WebSocket to grok agent serve. Pane used to dial a new agent

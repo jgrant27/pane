@@ -12,6 +12,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// newTestProxy is a proxy with just enough state for the HTTP handlers.
+func newTestProxy() *proxy {
+	return &proxy{uploads: map[string]bool{}}
+}
+
 // frameSink collects the JSON frames pane writes to a socket, so a test can
 // assert on what the agent (or the browser) actually receives.
 type frameSink struct {
