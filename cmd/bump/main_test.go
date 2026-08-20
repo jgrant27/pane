@@ -236,6 +236,25 @@ func TestReleaseGateIsOneGate(t *testing.T) {
 	if !strings.Contains(string(mk), "$(DESKTOP_TEST)") {
 		t.Error("make test does not run the desktop package's tests")
 	}
+	// The release gate has to see the stamped tree. Running it before the
+	// bump is how a version-consistency test can pass locally and then fail
+	// on the tag build, which is exactly what happened to v0.2.7.
+	deploy := string(mk)[strings.Index(string(mk), "\ndeploy:"):]
+	if strings.HasPrefix(deploy, "\ndeploy: test") {
+		t.Error("deploy runs the gate as a prerequisite, before the version is stamped")
+	}
+	bump := strings.Index(deploy, "go run ./cmd/bump")
+	gate := strings.Index(deploy, "$(MAKE) test")
+	tag := strings.Index(deploy, "git tag ")
+	switch {
+	case bump < 0 || gate < 0 || tag < 0:
+		t.Errorf("deploy is missing a step: bump=%d gate=%d tag=%d", bump, gate, tag)
+	case !(bump < gate && gate < tag):
+		t.Error("deploy must stamp, then run the gate, then tag — in that order")
+	}
+	if strings.Count(deploy, "$(STAMPED)") < 2 {
+		t.Error("the gate's rollback and the release commit must use the same file list")
+	}
 	ci, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(".github/workflows/build.yml")))
 	if err != nil {
 		t.Fatal(err)
