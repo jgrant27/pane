@@ -256,7 +256,7 @@ func TestAskHelpers(t *testing.T) {
 	if len(s.askQ) != 0 {
 		t.Fatalf("execute became ask %+v", s.askQ)
 	}
-	s.replyPermission([]byte("9"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"Execute git push","kind":"execute","rawInput":{"command":"git push"}}}}`))
+	s.replyPermission([]byte("9"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"Execute git push","kind":"execute","rawInput":{"command":"git push"}}}}`), true)
 	if !rpcIDSet(s.permID) || s.permAllow != "allow_once" {
 		t.Fatalf("execute should wait %+v", s.permID)
 	}
@@ -264,11 +264,11 @@ func TestAskHelpers(t *testing.T) {
 	if rpcIDSet(s.permID) {
 		t.Fatal("perm cleared")
 	}
-	s.replyPermission([]byte("10"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"}],"toolCall":{"title":"Read file","kind":"read"}}}`))
+	s.replyPermission([]byte("10"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"}],"toolCall":{"title":"Read file","kind":"read"}}}`), true)
 	if rpcIDSet(s.permID) {
 		t.Fatal("read should auto-allow")
 	}
-	s.replyPermission([]byte("11"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"run_terminal_command","kind":"Other","rawInput":{"command":"git push origin main && git status"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute","read_only":false}}}}}`))
+	s.replyPermission([]byte("11"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"run_terminal_command","kind":"Other","rawInput":{"command":"git push origin main && git status"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute","read_only":false}}}}}`), true)
 	if !rpcIDSet(s.permID) {
 		t.Fatal("real ACP execute frame should wait")
 	}
@@ -365,6 +365,34 @@ func TestRPCDeadlineIsPerMethod(t *testing.T) {
 	}
 }
 
+// The table is only worth having if rpc consults it. The deadline used to be
+// hard-coded in rpc, where changing the table changed nothing.
+func TestRPCAsksTheTableForItsDeadline(t *testing.T) {
+	h, _, _ := hubWithAgent(t)
+	asked := make(chan string, 4)
+	h.deadline = func(method string) time.Duration {
+		asked <- method
+		return 40 * time.Millisecond
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.rpc("session/prompt", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != errTimeout {
+			t.Fatalf("a call the agent never answered returned %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rpc waited past the deadline it asked for")
+	}
+	if m := <-asked; m != "session/prompt" {
+		t.Fatalf("the deadline was chosen for %q", m)
+	}
+}
+
 // Several tabs on one session id: updates reach all of them, while a card
 // that can only be answered once goes to the tab whose turn it is.
 func TestLookupFansOutButCardsPickTheBusyTab(t *testing.T) {
@@ -409,27 +437,41 @@ func TestRPCWithoutASocketFails(t *testing.T) {
 	}
 }
 
-// Turns are counted per ACP session id, so a tab that never prompted can
-// still tell a live turn from the session/load transcript.
-func TestTurnCountingIsPerSession(t *testing.T) {
+// The turn is claimed per ACP session id, not per socket: a session runs one
+// prompt at a time however many tabs are watching, and a tab that never
+// prompted can still tell a live turn from the session/load transcript.
+func TestTurnIsClaimedPerSession(t *testing.T) {
 	h := newAgentHub(nil)
 	if h.turnActive("s") {
 		t.Fatal("no turn has started")
 	}
-	h.turnBegin("s")
-	h.turnBegin("s")
-	h.turnEnd("s")
+	if !h.claimTurn("s") {
+		t.Fatal("the first turn on an idle session must be allowed")
+	}
+	if h.claimTurn("s") {
+		t.Fatal("a second turn started on a session already working")
+	}
 	if !h.turnActive("s") {
-		t.Fatal("a second turn on the same session still counts")
+		t.Fatal("the claimed turn is not visible to the other tabs")
 	}
-	h.turnEnd("s")
+	if !h.claimTurn("other") {
+		t.Fatal("one busy session must not block another")
+	}
+	h.releaseTurn("s")
 	if h.turnActive("s") {
-		t.Fatal("the last turn ended")
+		t.Fatal("the turn ended")
 	}
-	h.turnBegin("")
-	h.turnEnd("")
-	(*agentHub)(nil).turnBegin("s")
-	(*agentHub)(nil).turnEnd("s")
+	if !h.claimTurn("s") {
+		t.Fatal("the next turn must be allowed once the last one released")
+	}
+
+	// With no id there is nothing to key a claim on, so the per-socket guard
+	// is left to do the job on its own.
+	if !h.claimTurn("") || !(*agentHub)(nil).claimTurn("s") {
+		t.Fatal("an unkeyable claim must not block the prompt")
+	}
+	h.releaseTurn("")
+	(*agentHub)(nil).releaseTurn("s")
 	if (*agentHub)(nil).turnActive("s") || h.turnActive("") {
 		t.Fatal("nil hub and empty ids have no turns")
 	}

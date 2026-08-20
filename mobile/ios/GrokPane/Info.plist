@@ -24,10 +24,15 @@
 	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<!-- NSAllowsLocalNetworking covers loopback, .local, unqualified names and
-		     RFC1918 literals, which is every cleartext pane there is; tailnet panes
-		     are https. ATS ignores NSAllowsArbitraryLoads whenever this key is
-		     present, so a blanket exemption bought nothing but App Review friction. -->
+		<!-- What this key buys is exactly the named-host case: an unqualified name
+		     (http://beelz) and a Bonjour name (http://beelz.local). It does nothing
+		     for an address literal, and it does not need to — since iOS 10 ATS is
+		     not applied to a URL whose host is an IP address at all, so the
+		     http://192.168.1.5:7420 the help text offers, 127.0.0.1, and a 100.64/10
+		     tailnet address are all reachable with no exemption. That is every
+		     cleartext pane there is; a tailnet MagicDNS name is https. ATS also
+		     ignores NSAllowsArbitraryLoads whenever this key is present, so the
+		     blanket exemption was buying nothing but an App Review justification. -->
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>

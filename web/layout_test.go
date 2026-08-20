@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -338,26 +340,67 @@ func TestPageDeniesRemoteLoadsAndInlineScript(t *testing.T) {
 	}
 }
 
+// arrayItems returns the elements of the `name: [...]` (or `name = [...]`)
+// literal that follows name in src. Membership in the array is the claim
+// worth making — the same word appearing somewhere else in the function
+// would satisfy a plain substring check while forbidding nothing.
+func arrayItems(t *testing.T, src, name string) []string {
+	t.Helper()
+	i := strings.Index(src, name)
+	if i < 0 {
+		t.Fatalf("term.js no longer has %s", name)
+	}
+	rest := src[i:]
+	open := strings.Index(rest, "[")
+	end := strings.Index(rest, "]")
+	if open < 0 || end < open {
+		t.Fatalf("%s is not an array literal: %.60q", name, rest)
+	}
+	var out []string
+	for _, p := range strings.Split(rest[open+1:end], ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func hasItem(items []string, want string) bool {
+	for _, it := range items {
+		if it == want {
+			return true
+		}
+	}
+	return false
+}
+
+// bareReturnHTML matches `return html;` at any indentation: pinning this to
+// one literal amount of leading space makes reindenting renderMd enough to
+// hand unsanitized markup back.
+var bareReturnHTML = regexp.MustCompile(`return\s+html\s*;`)
+
 func TestMarkdownSanitizerFailsClosed(t *testing.T) {
 	md := chunk(t, termJS(t), "function renderMd", "\n  function openExternal")
 	if !strings.Contains(md, "DOMPurify.isSupported") {
 		t.Fatal("a DOMPurify that reports itself unsupported returns its input unchanged — check isSupported")
 	}
-	if strings.Contains(md, "\n    return html;") {
+	if bareReturnHTML.MatchString(md) {
 		t.Fatal("renderMd must never hand unsanitized markup to innerHTML")
 	}
-	for _, tag := range []string{"'style'", "'form'", "'input'", "'button'", "'img'"} {
-		if !strings.Contains(md, "FORBID_TAGS") || !strings.Contains(md, tag) {
-			t.Fatalf("agent markdown must not be able to emit %s", tag)
+	// The last thing renderMd can do without a sanitizer is escape.
+	if i := strings.LastIndex(md, "return "); i < 0 || !strings.HasPrefix(md[i:], "return '<p>' + escapeText(raw)") {
+		t.Fatal("renderMd must fall back to escaped text, not to markup")
+	}
+	tags := arrayItems(t, md, "FORBID_TAGS")
+	for _, tag := range []string{"'style'", "'form'", "'input'", "'button'", "'img'", "'base'"} {
+		if !hasItem(tags, tag) {
+			t.Fatalf("FORBID_TAGS must list %s, has %v", tag, tags)
 		}
 	}
-	if !strings.Contains(md, "FORBID_ATTR") {
-		t.Fatal("renderMd must forbid attributes, not only tags")
-	}
-	attrs := chunk(t, md, "FORBID_ATTR", "]")
-	for _, a := range []string{"'style'", "'class'", "'id'", "'src'"} {
-		if !strings.Contains(attrs, a) {
-			t.Fatalf("%s lets agent markdown restyle or address the permission card", a)
+	attrs := arrayItems(t, md, "FORBID_ATTR")
+	for _, a := range []string{"'style'", "'class'", "'id'", "'src'", "'srcset'"} {
+		if !hasItem(attrs, a) {
+			t.Fatalf("%s lets agent markdown restyle or address the permission card, has %v", a, attrs)
 		}
 	}
 }
@@ -365,15 +408,15 @@ func TestMarkdownSanitizerFailsClosed(t *testing.T) {
 func TestStaleSessionIDIsNotResumedBlindly(t *testing.T) {
 	src := termJS(t)
 	resume := chunk(t, src, "function resumeLatest", "\n  function loadRemote")
-	if !strings.Contains(resume, "function resumeLatest(cwd, list, listOK)") {
-		t.Fatal("resumeLatest must know whether the session list actually arrived")
+	if !strings.Contains(resume, "function resumeLatest(cwd, list, listComplete)") {
+		t.Fatal("resumeLatest must know whether the session list is complete, not merely that it arrived")
 	}
-	if !strings.Contains(resume, "!listOK) pick = { id: lastSid") {
-		t.Fatal("a stored id missing from a list that did arrive is a deleted session, not a pick")
+	if !strings.Contains(resume, "!listComplete) pick = { id: lastSid") {
+		t.Fatal("a stored id missing from a complete list is a deleted session, not a pick")
 	}
 	load := chunk(t, src, "function loadHistory", "function applyGrokTitles")
-	if !strings.Contains(load, "resumeLatest(cwd, diskSessions, true)") {
-		t.Fatal("a list that loaded must be treated as authoritative")
+	if !strings.Contains(load, "resumeLatest(cwd, diskSessions, diskSessions.length < sessionListCap)") {
+		t.Fatal("only a list short enough to be the whole truth may be treated as authoritative")
 	}
 	if !strings.Contains(load, "resumeLatest(cwd, [], false)") {
 		t.Fatal("an unreachable pane must still let the stored id be retried")
@@ -523,5 +566,216 @@ func TestLinkGuardCoversEveryAnchor(t *testing.T) {
 	open := strings.Index(guard, "openExternal(")
 	if pd < 0 || open < 0 || pd > open {
 		t.Fatal("every anchor must be neutralized before any scheme check opens it")
+	}
+}
+
+// jsRegexp compiles the `name = /…/` literal from src with Go's engine, so
+// an assertion can feed it the strings the server actually sends instead of
+// checking that the source happens to mention them.
+func jsRegexp(t *testing.T, src, name string) *regexp.Regexp {
+	t.Helper()
+	head := name + " = /"
+	i := strings.Index(src, head)
+	if i < 0 {
+		t.Fatalf("term.js no longer declares %s as a regexp literal", name)
+	}
+	rest := src[i+len(head):]
+	end := strings.Index(rest, "/")
+	if end < 0 {
+		t.Fatalf("%s has no closing delimiter", name)
+	}
+	flags := ""
+	if strings.HasPrefix(rest[end+1:], "i") {
+		flags = "(?i)"
+	}
+	re, err := regexp.Compile(flags + rest[:end])
+	if err != nil {
+		t.Fatalf("%s does not compile as a Go regexp: %v", name, err)
+	}
+	return re
+}
+
+// jsNumber reads the value of a `var name = 1234;` declaration in src.
+func jsNumber(t *testing.T, src, name string) int {
+	t.Helper()
+	head := name + " = "
+	i := strings.Index(src, head)
+	if i < 0 {
+		t.Fatalf("term.js no longer declares %s", name)
+	}
+	rest := src[i+len(head):]
+	end := strings.IndexAny(rest, ";\n")
+	if end < 0 {
+		t.Fatalf("%s is not a plain declaration", name)
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(rest[:end]))
+	if err != nil {
+		t.Fatalf("%s is not a number: %v", name, err)
+	}
+	return v
+}
+
+// unloadable mirrors term.js's unloadableSession so the two regexps can be
+// judged on real error text rather than on how they are spelled.
+func unloadable(gone, sess *regexp.Regexp, text, id string) bool {
+	if !gone.MatchString(text) {
+		return false
+	}
+	if sess.MatchString(text) {
+		return true
+	}
+	return id != "" && strings.Contains(strings.ToLower(text), strings.ToLower(id))
+}
+
+func TestPreReadyErrorOnlyGivesUpOnADeadSession(t *testing.T) {
+	src := termJS(t)
+	errCase := chunk(t, src, "case 'err':", "case 'warn':")
+	if !strings.Contains(errCase, "unloadableSession(msg.text, s.resumeID)") {
+		t.Fatal("a pre-ready error must be read before the resumed id is thrown away")
+	}
+	gone := jsRegexp(t, src, "gonePhrase")
+	sess := jsRegexp(t, src, "sessionWord")
+	const id = "0199f0aa-1b2c"
+	// The agent between lives. Every one of these can arrive before ready
+	// and none of them says anything about the session the tab asked for.
+	for _, text := range []string{
+		"no grok agent at ws://127.0.0.1:2419/acp — start one with: make agent",
+		"agent closed",
+		"no agent",
+		"agent rpc timeout",
+		"browser gone",
+		"dial tcp 127.0.0.1:2419: connect: connection refused",
+	} {
+		if unloadable(gone, sess, text, id) {
+			t.Fatalf("%q is the agent restarting — the tab must keep its id and retry", text)
+		}
+	}
+	// The session really is gone; retrying the same id only repeats this.
+	for _, text := range []string{
+		"session not found",
+		"no such session: " + id,
+		"unknown session id",
+		"session " + id + " does not exist",
+		"invalid session",
+	} {
+		if !unloadable(gone, sess, text, id) {
+			t.Fatalf("%q means this id cannot be loaded — retrying it traps the tab", text)
+		}
+	}
+	if grace := jsNumber(t, src, "handshakeGraceMs"); grace < 45000 {
+		t.Fatalf("giving up after %dms is shorter than an agent restart", grace)
+	}
+	if !strings.Contains(errCase, "Date.now() - s.handshakeSince >= handshakeGraceMs") {
+		t.Fatal("the redial backs off, so the give-up threshold must be a clock and not a count")
+	}
+}
+
+func TestSessionListCapMatchesTheServer(t *testing.T) {
+	b, err := os.ReadFile("../history.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`listGrokSessions\(cwd, (\d+)\)`).FindStringSubmatch(string(b))
+	if m == nil {
+		t.Fatal("history.go no longer caps the per-project session list")
+	}
+	want, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jsNumber(t, termJS(t), "sessionListCap"); got != want {
+		t.Fatalf("term.js reads a full page as %d sessions, the server sends at most %d", got, want)
+	}
+}
+
+func TestComposerAttachmentsDieWithTheirTab(t *testing.T) {
+	src := termJS(t)
+	shut := chunk(t, src, "Session.prototype.shutdown", "function closeSession")
+	if !strings.Contains(shut, "releaseFiles(pending, cwd)") {
+		t.Fatal("closing a tab mid-compose leaks the copies its chips uploaded into the project")
+	}
+	if !strings.Contains(shut, "pending = [];") {
+		t.Fatal("the chips must go with the files they point at")
+	}
+	drop := chunk(t, src, "function dropTab", "function wipeProject")
+	shutAt := strings.Index(drop, "s.shutdown();")
+	clearAt := strings.Index(drop, "active = null;")
+	if shutAt < 0 || clearAt < 0 {
+		t.Fatalf("dropTab no longer shuts the tab down and clears active: %s", drop)
+	}
+	if shutAt > clearAt {
+		t.Fatal("shutdown only knows the composer is this tab's while it is still the active one")
+	}
+}
+
+func TestReconnectMidTurnOffersQueue(t *testing.T) {
+	ready := chunk(t, termJS(t), "case 'ready':", "case 'you':")
+	if !strings.Contains(ready, "msg.busy === true") {
+		t.Fatal("a tab that reattaches mid-turn must take the server's busy hint, not assume idle")
+	}
+	if !strings.Contains(ready, "s.busy = midTurn;") || !strings.Contains(ready, "setBusy(midTurn)") {
+		t.Fatal("the hint has to reach the composer, which is what says Queue instead of Send")
+	}
+	if strings.Contains(ready, "s.busy = false;") {
+		t.Fatal("ready must not overwrite the hint with an unconditional idle")
+	}
+	// `=== true` is the guard: a server too old to send the field leaves it
+	// undefined, and undefined has to keep reading as idle.
+	if strings.Contains(ready, "if (msg.busy)") || strings.Contains(ready, "!!msg.busy") {
+		t.Fatal("the busy hint must be compared strictly so a server that omits it still works")
+	}
+}
+
+func TestLinkGuardScrollsInPageAnchors(t *testing.T) {
+	src := termJS(t)
+	guard := chunk(t, src, "closest('a[href]')", "}, true);")
+	if !strings.Contains(guard, "sameDocument(u)") || !strings.Contains(guard, "scrollToAnchor(u.hash)") {
+		t.Fatal("an #anchor is a scroll, not a browser window")
+	}
+	if strings.Index(guard, "sameDocument(u)") > strings.Index(guard, "openExternal(") {
+		t.Fatal("the same-document case must be settled before anything is opened externally")
+	}
+	if !strings.Contains(guard, "if (web && u.origin === location.origin) return;") {
+		t.Fatal("opening a same-origin URL externally just moves the navigation into another window")
+	}
+	if !strings.Contains(guard, "externalSchemes.indexOf(u.protocol) < 0") {
+		t.Fatal("the allowlist must decide every scheme, not sit beside a second one")
+	}
+	same := chunk(t, src, "function sameDocument", "function scrollToAnchor")
+	if !strings.Contains(same, "u.hash") || !strings.Contains(same, "stripHash(location.href)") {
+		t.Fatal("same-document means the same URL but for the fragment — a relative path is not one")
+	}
+	schemes := arrayItems(t, src, "var externalSchemes")
+	for _, want := range []string{"'http:'", "'https:'", "'mailto:'", "'tel:'", "'sms:'"} {
+		if !hasItem(schemes, want) {
+			t.Fatalf("the shells forward %s — dropping it here makes the link do nothing, has %v", want, schemes)
+		}
+	}
+}
+
+func TestChangeProjectDimsOnlyWhenItRefuses(t *testing.T) {
+	b, err := FS.ReadFile("style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(b)
+	if strings.Contains(css, `html[data-busy="true"] #change-project`) {
+		t.Fatal("data-busy is also set when the socket is down, which is not a refusal — the CSS would undo the split")
+	}
+	// What is left has to still dim it, or a button that refuses looks live.
+	i := strings.Index(css, "#rail > button:disabled")
+	if i < 0 {
+		t.Fatal("style.css no longer dims a disabled rail button")
+	}
+	rule := css[i:]
+	if j := strings.Index(rule, "}"); j > 0 {
+		rule = rule[:j]
+	}
+	if !strings.Contains(rule, "opacity") || !strings.Contains(rule, "pointer-events: none") {
+		t.Fatalf("the disabled state railLocked sets must be the one that shows: %s", rule)
+	}
+	js := termJS(t)
+	if !strings.Contains(js, "changeBtn.disabled = pickingProject || locked") {
+		t.Fatal("with the CSS gone, changeBtn.disabled is the only thing left saying Change project refuses")
 	}
 }

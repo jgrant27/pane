@@ -6,9 +6,20 @@ ifeq ($(UNAME),Darwin)
 CGO_LDFLAGS += -framework UniformTypeIdentifiers
 endif
 DESKTOP_TAGS := production
+# WEBVIEW_TAGS is DESKTOP_TAGS without production: enough to compile the
+# desktop package and run its tests, without the release-only asset server
+# and the link flags that come with it.
+WEBVIEW_TAGS :=
+# The desktop tests only build where the platform webview does. On macOS and
+# Windows that is always; on Linux it needs gtk and webkit headers, and the
+# package will not compile without them.
+DESKTOP_TEST := ./desktop
 ifeq ($(UNAME),Linux)
   ifeq ($(shell pkg-config --exists webkit2gtk-4.1 && echo yes),yes)
     DESKTOP_TAGS := production,webkit2_41
+    WEBVIEW_TAGS := webkit2_41
+  else ifneq ($(shell pkg-config --exists gtk+-3.0 webkit2gtk-4.0 && echo yes),yes)
+    DESKTOP_TEST :=
   endif
 endif
 
@@ -57,6 +68,8 @@ icon:
 	go run ./cmd/mkicon desktop/build/appicon.png
 	sips -z 256 256 desktop/build/appicon.png --out web/favicon.png >/dev/null 2>&1 || cp desktop/build/appicon.png web/favicon.png
 
+# /desktop is out of this list because it needs its own build tags, not
+# because it is exempt — it runs as its own step in test below.
 TEST_PKGS := $(shell go list ./... | grep -v '/desktop$$' | grep -v '/cmd/mkicon$$' | grep -v '/cmd/probe$$')
 COVER_PKG ?= github.com/jgrant27/pane
 COVER_MIN ?= 90
@@ -66,6 +79,11 @@ COVER_OUT ?= cover.out
 # agent socket to many browser sessions, which is exactly where a race
 # would hide and exactly where it would cost most.
 test:
+ifeq ($(DESKTOP_TEST),)
+	@echo "pane: desktop tests NOT RUN — no webview headers here; apt install libgtk-3-dev libwebkit2gtk-4.1-dev"
+else
+	go test -count=1 -race -tags "$(WEBVIEW_TAGS)" $(DESKTOP_TEST)
+endif
 	go test -count=1 -race $(filter-out $(COVER_PKG),$(TEST_PKGS))
 	go test -count=1 -race -covermode=atomic -coverprofile=$(COVER_OUT) $(COVER_PKG)
 	@go tool cover -func=$(COVER_OUT)

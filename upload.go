@@ -59,20 +59,65 @@ func detectMIME(name string, head []byte) string {
 	return http.DetectContentType(head)
 }
 
-func underCwd(cwd, path string) bool {
+// relUnder places path inside cwd: where it sits relative to cwd, and whether
+// it stayed in there at all. Purely lexical — nothing here follows a link.
+func relUnder(cwd, path string) (string, bool) {
 	absCwd, err := filepath.Abs(cwd)
 	if err != nil {
-		return false
+		return "", false
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return false
+		return "", false
 	}
 	rel, err := filepath.Rel(absCwd, absPath)
 	if err != nil {
-		return false
+		return "", false
 	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return rel, true
+}
+
+func underCwd(cwd, path string) bool {
+	_, ok := relUnder(cwd, path)
+	return ok
+}
+
+// projectPath decides whether src already lives inside the project and, if it
+// does, gives back the spelling of it to pass on from here.
+//
+// Two different questions get asked about the same file. Deciding whether to
+// copy has to survive the filesystem, or a link inside the project pointing
+// out of it would be handed to the agent in place. But the path that comes
+// back is checked again downstream, and lexically: buildPrompt drops any
+// attachment that is not literally under cwd. A file reached through a link
+// *into* the project passes the first test and fails the second, so it has to
+// come back re-spelled under cwd or it silently never reaches the agent.
+// Re-spelling relative to the resolved root is also what keeps the macOS case
+// working, where cwd itself is the link (/tmp -> /private/tmp) and the file
+// under it must not start being copied.
+func projectPath(cwd, src string) (string, bool) {
+	real, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return "", false
+	}
+	root, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		root = cwd
+	}
+	rel, ok := relUnder(root, real)
+	if !ok {
+		return "", false
+	}
+	// The caller's own spelling already passes the lexical test, so keep it:
+	// a link that stays inside the project should still be the file the user
+	// pointed at, not its target.
+	if underCwd(cwd, src) {
+		return src, true
+	}
+	return filepath.Join(cwd, rel), true
 }
 
 func copyFile(src, dest string) error {
@@ -116,14 +161,16 @@ func attachPath(cwd, src string) (uploadInfo, error) {
 	if st.Size() > maxUpload {
 		return uploadInfo{}, fmt.Errorf("file too large (20MB)")
 	}
-	dest := abs
-	copied := false
 	// Whether the file is already in the project decides whether pane
 	// hands the agent a link to it where it lies. That has to be the real
 	// answer, not the lexical one: a link inside the project pointing out
 	// of it would otherwise be passed along in place. Resolved, it fails
-	// the test and gets copied in, which is the safe outcome.
-	if !underCwdResolved(cwd, abs) {
+	// the test and gets copied in, which is the safe outcome. Either way
+	// what comes back is spelled under cwd, since that is what the prompt
+	// builder gates on.
+	dest, inProject := projectPath(cwd, abs)
+	copied := false
+	if !inProject {
 		dest = uniquePath(cwd, filepath.Base(abs))
 		if err := copyFile(abs, dest); err != nil {
 			return uploadInfo{}, err

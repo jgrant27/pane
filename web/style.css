@@ -193,10 +193,6 @@ body {
 }
 .sess-row:hover .sess-close { opacity: 1; }
 .sess.active, .sess:hover, .sess-close:hover { color: var(--fg); background: var(--bg); }
-html[data-busy="true"] #change-project {
-  pointer-events: none;
-  opacity: 0.45;
-}
 .sess-edit {
   flex: 1 1 auto;
   min-width: 0;

@@ -53,10 +53,13 @@ type agentHub struct {
 	// arrive. A reconnect or a second tab used to overwrite the routing
 	// entry, and the reply to a turn already in flight reached nobody.
 	sessions map[string]map[*session]struct{}
-	// Turns in flight per ACP session id. Whether an update is live output
-	// or the session/load transcript is a fact about the session, not about
-	// one socket — a tab that never prompted itself still has to see it.
-	prompts map[string]int
+	// How long a call waits, by method. nil means the standard table.
+	deadline func(string) time.Duration
+	// The ACP session ids with a turn in flight. A turn belongs to the
+	// session, not to one socket: several browsers share an id, so this is
+	// both the single-turn guard and the answer to "is this session working?"
+	// for a tab that never prompted anything itself.
+	turns map[string]bool
 }
 
 func newAgentHub(conn *websocket.Conn) *agentHub {
@@ -64,7 +67,7 @@ func newAgentHub(conn *websocket.Conn) *agentHub {
 		conn:     conn,
 		pending:  map[int64]chan json.RawMessage{},
 		sessions: map[string]map[*session]struct{}{},
-		prompts:  map[string]int{},
+		turns:    map[string]bool{},
 	}
 }
 
@@ -230,6 +233,14 @@ type session struct {
 	outCh   chan any
 	closing chan struct{}
 	written chan struct{}
+	// The same fact as a closed closing channel, readable from anywhere.
+	// Routing has to skip a browser it can no longer write to, and it holds
+	// the hub lock while it decides.
+	closed atomic.Bool
+	// How long one frame gets to reach the browser before the socket is
+	// called dead. Filled in when the writer starts, so a test can set it to
+	// milliseconds and not spend ten seconds proving the deadline is there.
+	writeWait time.Duration
 
 	mu       sync.Mutex
 	busy     atomic.Bool
@@ -290,6 +301,9 @@ func (s *session) toBrowser(v any) error {
 }
 
 func (s *session) startWriter() {
+	if s.writeWait <= 0 {
+		s.writeWait = browserWriteWait
+	}
 	s.outCh = make(chan any, browserQueue)
 	s.closing = make(chan struct{})
 	s.written = make(chan struct{})
@@ -298,6 +312,12 @@ func (s *session) startWriter() {
 
 func (s *session) writeLoop() {
 	defer func() {
+		// However this writer got here — a failed write as much as a close —
+		// nothing will ever be sent again. Leaving the write side open would
+		// have toBrowser report frames delivered into a queue with no drainer,
+		// and leave the hub routing cards to a socket that cannot show them.
+		s.endWrites()
+		s.hub.detach(s)
 		_ = s.browser.Close()
 		close(s.written)
 	}()
@@ -328,14 +348,30 @@ func (s *session) writeLoop() {
 func (s *session) writeFrame(v any) error {
 	// Without a deadline a full kernel send buffer blocks WriteJSON with no
 	// way back out.
-	_ = s.browser.SetWriteDeadline(time.Now().Add(browserWriteWait))
+	_ = s.browser.SetWriteDeadline(time.Now().Add(s.writeWait))
 	return s.browser.WriteJSON(v)
+}
+
+// endWrites shuts the write side, once, from whichever goroutine gets here
+// first. Callers must have started the writer.
+func (s *session) endWrites() {
+	s.cOnce.Do(func() {
+		s.closed.Store(true)
+		close(s.closing)
+	})
+}
+
+// gone reports a browser that can no longer be written to. Routing asks
+// before it picks one: a card queued on a dead socket is a card the user is
+// never shown, and clearPerm denies it on their behalf when the turn ends.
+func (s *session) gone() bool {
+	return s == nil || s.closed.Load()
 }
 
 // dropBrowser cuts a browser loose and unhooks it from the hub, so routing
 // stops pointing at a socket nobody is reading.
 func (s *session) dropBrowser() {
-	s.cOnce.Do(func() { close(s.closing) })
+	s.endWrites()
 	_ = s.browser.Close()
 	s.hub.detach(s)
 }
@@ -348,10 +384,12 @@ func (s *session) stopWriting() {
 		return
 	}
 	s.wOnce.Do(s.startWriter)
-	s.cOnce.Do(func() { close(s.closing) })
+	s.endWrites()
 	select {
 	case <-s.written:
-	case <-time.After(browserWriteWait):
+	// One frame's deadline is all the flush can be waiting on; past that the
+	// writer is not coming back and the teardown must not queue behind it.
+	case <-time.After(s.writeWait):
 	}
 }
 
@@ -447,6 +485,10 @@ func (s *session) readyPayload() map[string]any {
 		"effort":  s.effort,
 		"context": s.contextN,
 		"models":  s.models,
+		// Whether the session is working, not whether this socket has ever
+		// prompted. A tab that reconnects mid-turn has never prompted
+		// anything itself and used to be handed an idle composer.
+		"busy": s.hub.turnActive(s.id),
 	}
 }
 
@@ -484,6 +526,18 @@ func (s *session) loop() {
 			// two turns then ran on one ACP session with their replies
 			// interleaved.
 			if !s.busy.CompareAndSwap(false, true) {
+				_ = s.toBrowser(map[string]string{"type": "busy"})
+				continue
+			}
+			// busy guards one socket, and several sockets now share one ACP
+			// session id: two tabs each passed their own guard and grok ran
+			// two turns on one session. The hub is the only thing that sees
+			// all of them, so the turn is claimed there too.
+			if !s.hub.claimTurn(s.id) {
+				s.busy.Store(false)
+				// Say so rather than swallowing the message: the composer has
+				// to stop offering to send what pane is not going to send.
+				_ = s.toBrowser(map[string]string{"type": "busy"})
 				continue
 			}
 			go s.prompt(msg.Text, msg.Files)
@@ -553,16 +607,14 @@ func (s *session) prompt(text string, files []promptFile) {
 	s.askReply = nil
 	s.askDone = false
 	s.mu.Unlock()
-	// busy is already true — loop() claimed the turn before starting this
-	// goroutine. Counting it on the hub as well is what lets a second tab on
-	// the same ACP session tell live output from the load transcript.
-	s.hub.turnBegin(s.id)
+	// Both guards are already held — loop() claimed the socket and the ACP
+	// session before starting this goroutine.
 	_ = s.toBrowser(map[string]string{"type": "busy"})
 	res, err := s.rpc("session/prompt", map[string]any{
 		"sessionId": s.id,
 		"prompt":    buildPrompt(text, files, s.cwd, s.imageCap),
 	})
-	s.hub.turnEnd(s.id)
+	s.hub.releaseTurn(s.id)
 	s.busy.Store(false)
 	s.clearAsk()
 	s.clearPerm()
@@ -625,6 +677,16 @@ func rpcDeadline(method string) time.Duration {
 	}
 }
 
+// rpcWait is how long this hub gives one call. Per hub so a test can watch
+// what rpc asks for and answer it in milliseconds, rather than proving the
+// table is consulted by waiting out a real deadline.
+func (h *agentHub) rpcWait(method string) time.Duration {
+	if h.deadline != nil {
+		return h.deadline(method)
+	}
+	return rpcDeadline(method)
+}
+
 func (h *agentHub) rpc(method string, params any) (json.RawMessage, error) {
 	if h == nil || h.dead.Load() {
 		return nil, errNoAgent
@@ -658,7 +720,7 @@ func (h *agentHub) rpc(method string, params any) (json.RawMessage, error) {
 	}
 	// A timer rather than time.After: a turn's deadline is hours long and
 	// its timer would sit in the heap until then.
-	t := time.NewTimer(rpcDeadline(method))
+	t := time.NewTimer(h.rpcWait(method))
 	defer t.Stop()
 	select {
 	case raw := <-ch:
@@ -731,32 +793,34 @@ func (h *agentHub) drop(s *session) {
 	}
 }
 
-// turnBegin, turnEnd and turnActive count prompts in flight per ACP session
-// id. A second tab has never prompted anything itself, so asking its own
-// socket whether a turn is running answers "no" and the reply gets thrown
-// away with the session/load transcript.
-func (h *agentHub) turnBegin(sid string) {
+// claimTurn takes the one turn an ACP session id may have in flight, and
+// reports whether it got it. ACP runs a session one prompt at a time, and a
+// second tab has never prompted anything itself, so neither its own busy
+// flag nor its own socket can answer either question — only the hub sees
+// every browser on the id.
+func (h *agentHub) claimTurn(sid string) bool {
 	if h == nil || sid == "" {
-		return
+		// Nothing to key a claim on. The per-socket guard is all there is.
+		return true
 	}
 	h.mu.Lock()
-	if h.prompts == nil {
-		h.prompts = map[string]int{}
+	defer h.mu.Unlock()
+	if h.turns == nil {
+		h.turns = map[string]bool{}
 	}
-	h.prompts[sid]++
-	h.mu.Unlock()
+	if h.turns[sid] {
+		return false
+	}
+	h.turns[sid] = true
+	return true
 }
 
-func (h *agentHub) turnEnd(sid string) {
+func (h *agentHub) releaseTurn(sid string) {
 	if h == nil || sid == "" {
 		return
 	}
 	h.mu.Lock()
-	if n := h.prompts[sid] - 1; n > 0 {
-		h.prompts[sid] = n
-	} else {
-		delete(h.prompts, sid)
-	}
+	delete(h.turns, sid)
 	h.mu.Unlock()
 }
 
@@ -766,7 +830,7 @@ func (h *agentHub) turnActive(sid string) bool {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.prompts[sid] > 0
+	return h.turns[sid]
 }
 
 func (h *agentHub) shutdown() {
@@ -869,27 +933,63 @@ func (h *agentHub) guessLocked() *session {
 	return nil
 }
 
-// lookupRequest resolves the target for an agent *request* — something
-// carrying a JSON-RPC id whose answer has a side effect, like approving a
-// command. Guessing is worse than admitting we do not know: an untagged
-// request is only matched to a lone session that actually has a turn in
-// flight. Anything more ambiguous returns nil, and the caller answers
-// "cancelled" rather than showing one browser a card meant for another.
-func (h *agentHub) lookupRequest(sid string) *session {
+// lookupRequestAll resolves the browsers to show an agent *request* —
+// something carrying a JSON-RPC id whose answer has a side effect, like
+// approving a command. Returning nobody means the caller answers
+// "cancelled", which denies the tool call behind the user's back, so a tie
+// between tabs on one session is fanned out to all of them instead and the
+// first answer wins. Sockets we can no longer write to are never picked:
+// they would swallow the card rather than show it.
+func (h *agentHub) lookupRequestAll(sid string) []*session {
 	if h == nil {
 		return nil
 	}
-	if strings.TrimSpace(sid) != "" {
-		return h.lookup(sid)
-	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if sid = strings.TrimSpace(sid); sid == "" {
+		if s := h.guessRequestLocked(); s != nil {
+			return []*session{s}
+		}
+		return nil
+	}
+	var live, busy []*session
+	for s := range h.sessions[sid] {
+		if s == nil || s.gone() {
+			continue
+		}
+		live = append(live, s)
+		if s.busy.Load() {
+			busy = append(busy, s)
+		}
+	}
+	// The turn belongs to one of them: that is the tab being asked.
+	if len(busy) == 1 {
+		return busy
+	}
+	return live
+}
+
+// lookupRequest is lookupRequestAll for callers that can only address one
+// browser. Anything ambiguous stays nil rather than showing one tab a
+// request meant for another.
+func (h *agentHub) lookupRequest(sid string) *session {
+	if list := h.lookupRequestAll(sid); len(list) == 1 {
+		return list[0]
+	}
+	return nil
+}
+
+// guessRequestLocked names the session an untagged request must have meant.
+// Guessing is worse than admitting we do not know, so it is only ever the
+// lone session that actually has a turn in flight: an idle tab cannot be the
+// one being asked, and two busy ones are ambiguous.
+func (h *agentHub) guessRequestLocked() *session {
 	seen := map[*session]struct{}{}
 	var busy *session
 	n := 0
 	for _, set := range h.sessions {
 		for s := range set {
-			if s == nil {
+			if s == nil || s.gone() {
 				continue
 			}
 			if _, ok := seen[s]; ok {
@@ -902,8 +1002,6 @@ func (h *agentHub) lookupRequest(sid string) *session {
 			}
 		}
 	}
-	// A session with no turn in flight cannot be the one being asked, so
-	// idle tabs neither claim the request nor make it ambiguous.
 	if n == 1 {
 		return busy
 	}
@@ -933,7 +1031,7 @@ func (h *agentHub) readLoop() {
 			}
 		}
 		h.sessions = map[string]map[*session]struct{}{}
-		h.prompts = map[string]int{}
+		h.turns = map[string]bool{}
 		pending := h.pending
 		h.pending = map[int64]chan json.RawMessage{}
 		h.mu.Unlock()
@@ -975,10 +1073,18 @@ func (h *agentHub) readLoop() {
 		// agent blocked on a reply that is never coming, and the turn hangs
 		// until something else tears the session down.
 		if env.Method == "session/request_permission" {
-			if s := h.lookupRequest(paramsSessionID(env.Params)); s != nil {
-				s.replyPermission(env.ID, data)
-			} else {
+			targets := h.lookupRequestAll(paramsSessionID(env.Params))
+			if len(targets) == 0 {
 				h.writePermOutcome(env.ID, "")
+				continue
+			}
+			for i, s := range targets {
+				// Every tab on the session records the ask, or the ones that
+				// did not get to answer would read the resolve as an approval
+				// grok made on its own and warn about it. Only one of them may
+				// put a reply on the wire: two responses to one JSON-RPC id is
+				// a protocol error, and for a card the user's click decides.
+				s.replyPermission(env.ID, data, i == 0)
 			}
 			continue
 		}
@@ -1052,7 +1158,11 @@ func (s *session) owns(sid string) bool {
 	return sid == s.id || sid == s.resumeID
 }
 
-func (s *session) replyPermission(id json.RawMessage, raw []byte) {
+// replyPermission shows one browser a permission request, or answers it on
+// the spot when the tool needs no gate. mayAnswer is false for every browser
+// but one when a card is fanned out to several tabs, so an auto-allowed call
+// is still only answered once.
+func (s *session) replyPermission(id json.RawMessage, raw []byte, mayAnswer bool) {
 	var req struct {
 		Params struct {
 			Options []struct {
@@ -1096,7 +1206,9 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte) {
 		if allow == "" && len(req.Params.Options) > 0 {
 			allow = req.Params.Options[0].OptionID
 		}
-		s.writePermResult(id, allow)
+		if mayAnswer {
+			s.writePermResult(id, allow)
+		}
 		return
 	}
 	title := strings.TrimSpace(tc.Title)
@@ -1219,7 +1331,7 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 		return
 	}
 	if u.Meta.TotalTokens > 0 && s.live.Load() {
-		_ = s.toBrowser(map[string]any{"type": "usage", "used": u.Meta.TotalTokens, "size": s.contextN})
+		_ = s.toBrowser(map[string]any{"type": "usage", "used": u.Meta.TotalTokens, "size": s.contextSize()})
 	}
 	if !s.live.Load() {
 		return
@@ -1264,6 +1376,15 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 			"status": u.Status,
 		})
 	}
+}
+
+// contextSize reads the token budget under the lock a model switch writes it
+// under. The switch runs on its own goroutine now and this read is on the
+// hub's readLoop, so the two meet whenever totals stream during a switch.
+func (s *session) contextSize() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.contextN
 }
 
 func (s *session) contextFor(id string) int {
@@ -2015,12 +2136,58 @@ func (s *session) completePerm(action string) {
 	if !rpcIDSet(id) {
 		return
 	}
+	// A fanned-out card is up in more than one tab. Take it away everywhere
+	// else before answering: the first click is the user's answer, and the
+	// other tab's turn ending would otherwise reject the same request a
+	// second time, after it was allowed.
+	s.hub.forgetPerm(s, id)
 	if isDenyAction(action) {
 		// deny with no reject option cancels. It must never mean allow.
 		s.writePermResult(id, deny)
 		return
 	}
 	s.writePermResult(id, allow)
+}
+
+// forgetPerm takes a card that has just been answered away from every other
+// browser holding it, so only one reply for that request id ever reaches the
+// agent.
+func (h *agentHub) forgetPerm(answered *session, id json.RawMessage) {
+	if h == nil || !rpcIDSet(id) {
+		return
+	}
+	h.mu.Lock()
+	seen := map[*session]struct{}{}
+	others := make([]*session, 0, len(h.sessions))
+	for _, set := range h.sessions {
+		for s := range set {
+			if s == nil || s == answered {
+				continue
+			}
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			others = append(others, s)
+		}
+	}
+	h.mu.Unlock()
+	for _, s := range others {
+		s.dropPerm(id)
+	}
+}
+
+// dropPerm forgets a card another browser has already answered. The stale
+// card is left on screen — clicking it now does nothing — rather than
+// putting a second answer on the wire for a request that is settled.
+func (s *session) dropPerm(id json.RawMessage) {
+	s.mu.Lock()
+	if string(s.permID) == string(id) {
+		s.permID = nil
+		s.permAllow = ""
+		s.permDeny = ""
+	}
+	s.mu.Unlock()
 }
 
 // isDenyAction is deliberately the inverse of a short allow list: an
