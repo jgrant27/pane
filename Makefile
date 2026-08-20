@@ -89,7 +89,18 @@ endif
 	@go tool cover -func=$(COVER_OUT)
 	@go run ./cmd/covercheck -min=$(COVER_MIN) $(COVER_OUT)
 
-deploy: test
+# The files cmd/bump stamps. Listed once so the gate's rollback and the
+# release commit cannot drift apart.
+STAMPED := VERSION desktop/wails.json desktop/Info.plist proxy.go \
+	mobile/ios/GrokPane/Info.plist mobile/android/app/build.gradle.kts \
+	mobile/ios/GrokPane.xcodeproj/project.pbxproj
+
+# The gate runs AFTER the stamp, not before it. Tested-then-stamped is how
+# v0.2.7 first went out: the suite passed at the old version, the bump
+# then put VERSION out of step with a file nothing had stamped, and the
+# tag build was the first thing to notice. A failed gate here puts the
+# tree back exactly as it was, so there is nothing to clean up.
+deploy:
 	@set -e; \
 	if [ "$$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then \
 		echo "pane: deploy from main (on $$(git rev-parse --abbrev-ref HEAD))"; \
@@ -101,9 +112,12 @@ deploy: test
 	fi; \
 	git fetch --tags origin; \
 	v=$$(go run ./cmd/bump -bump "$(BUMP)" -write); \
-	git add VERSION desktop/wails.json desktop/Info.plist proxy.go \
-		mobile/ios/GrokPane/Info.plist mobile/android/app/build.gradle.kts \
-		mobile/ios/GrokPane.xcodeproj/project.pbxproj; \
+	if ! $(MAKE) test; then \
+		echo "pane: gate failed at $$v — restoring the tree"; \
+		git checkout -- $(STAMPED); \
+		exit 1; \
+	fi; \
+	git add $(STAMPED); \
 	if git diff --cached --quiet; then \
 		echo "pane: files already at $$v"; \
 	else \
