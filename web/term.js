@@ -549,6 +549,8 @@
     this.toolCount = 0;
     this.askEl = null;
     this.asking = false;
+    this.askKey = '';
+    this.warned = false;
     this.stick = true;
     this.el = document.createElement('div');
     this.el.className = 'log-slot';
@@ -727,6 +729,14 @@
     var s = this;
     var questions = (msg && msg.questions) || [];
     if (!questions.length) return;
+    var key;
+    try { key = JSON.stringify(questions); } catch (e) { key = String(questions.length); }
+    // The same question can arrive more than once for one tool call.
+    // Rebuilding the card would throw away an answer already given and
+    // wipe anything typed into the free-text box. The key is cleared at
+    // the start of every turn, so a repeat next turn still shows.
+    if (key === s.askKey && s.askEl && s.askEl.parentNode) return;
+    s.askKey = key;
     if (s.askEl && s.askEl.parentNode) {
       s.askEl.parentNode.removeChild(s.askEl);
     }
@@ -846,17 +856,25 @@
 
     function finish(answers, action) {
       if (!s.asking) return;
+      // Nothing was sent, so do not claim it was. Leave the card live so
+      // the answer can be given again once the socket is back.
+      if (!s.ws || s.ws.readyState !== 1) {
+        s.setChrome('disconnected — answer not sent', 'err');
+        return;
+      }
       s.asking = false;
+      // Answered. The server will not restate this question, so release
+      // the key: if the agent genuinely asks the same thing again later
+      // in the turn, that card must render.
+      s.askKey = '';
       wrap.classList.add('done');
       var buttons = wrap.querySelectorAll('button');
       for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
-      if (s.ws && s.ws.readyState === 1) {
-        s.ws.send(JSON.stringify({
-          type: 'ask',
-          action: action || 'accept',
-          answers: answers || []
-        }));
-      }
+      s.ws.send(JSON.stringify({
+        type: 'ask',
+        action: action || 'accept',
+        answers: answers || []
+      }));
       var note = document.createElement('div');
       note.className = 'ask-picked';
       if (action === 'skip') {
@@ -878,6 +896,9 @@
     if (s.askEl && s.askEl.parentNode) {
       s.askEl.parentNode.removeChild(s.askEl);
     }
+    // askEl now points at a permission card, so the ask dedupe can no
+    // longer use it as evidence that the question is still on screen.
+    s.askKey = '';
     s.asking = true;
     var wrap = document.createElement('div');
     wrap.className = 'msg ask perm';
@@ -916,13 +937,16 @@
 
     function finish(action) {
       if (!s.asking) return;
+      // An Allow that never left the browser must not read as "allowed".
+      if (!s.ws || s.ws.readyState !== 1) {
+        s.setChrome('disconnected — not sent', 'err');
+        return;
+      }
       s.asking = false;
       wrap.classList.add('done');
       var buttons = wrap.querySelectorAll('button');
       for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
-      if (s.ws && s.ws.readyState === 1) {
-        s.ws.send(JSON.stringify({ type: 'perm', action: action }));
-      }
+      s.ws.send(JSON.stringify({ type: 'perm', action: action }));
       var note = document.createElement('div');
       note.className = 'ask-picked';
       note.textContent = action === 'deny' ? 'denied' : 'allowed';
@@ -935,6 +959,33 @@
     var wrap = document.createElement('div');
     wrap.className = 'msg err';
     wrap.textContent = text || 'error';
+    this.el.appendChild(wrap);
+    this.scroll();
+  };
+
+  // Close out a card that can no longer be answered. The server forgets a
+  // pending request when its socket goes, so a reconnected tab must not
+  // leave buttons that would report "allowed" while sending nothing.
+  Session.prototype.retireAsk = function (note) {
+    if (!this.asking || !this.askEl) return;
+    this.asking = false;
+    this.askKey = '';
+    this.askEl.classList.add('done');
+    var buttons = this.askEl.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+    var el = document.createElement('div');
+    el.className = 'ask-picked';
+    el.textContent = note || 'expired';
+    this.askEl.appendChild(el);
+  };
+
+  // Shown once per session when the agent approves its own tool calls.
+  Session.prototype.addWarn = function (text) {
+    if (!text || this.warned) return;
+    this.warned = true;
+    var wrap = document.createElement('div');
+    wrap.className = 'msg warn';
+    wrap.textContent = text;
     this.el.appendChild(wrap);
     this.scroll();
   };
@@ -969,6 +1020,9 @@
       if (foreignSession(s, msg)) return;
       switch (msg.type) {
         case 'ready':
+          // A reconnect is a new server-side session: whatever it was
+          // waiting on is gone, so an unanswered card cannot be answered.
+          if (s.seenReady) s.retireAsk('expired — reconnected');
           s.reconnects = 0;
           s.seenReady = true;
           s.id = msg.session || s.id;
@@ -1013,9 +1067,13 @@
           s.addErr(msg.text || 'error');
           s.setChrome(msg.text || 'error', 'err');
           break;
+        case 'warn':
+          s.addWarn(msg.text || '');
+          break;
         case 'busy':
           s.busy = true;
           s.asking = false;
+          s.askKey = '';
           s.startedReply = false;
           s.tools = {};
           s.toolsBox = null;
@@ -2157,7 +2215,9 @@
       }
     }
     if (e.key !== 'Escape' || !active) return;
-    if (active.asking && active.askEl) {
+    // Only let Escape answer a card that can actually be answered;
+    // otherwise fall through so it can still cancel the turn.
+    if (active.asking && active.askEl && active.ws && active.ws.readyState === 1) {
       var skip = active.askEl.querySelector('.ask-skip');
       if (skip && !skip.disabled) skip.click();
       return;

@@ -96,6 +96,8 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 		replay:     r.URL.Query().Get("replay") == "1",
 		wantModel:  strings.TrimSpace(r.URL.Query().Get("model")),
 		wantEffort: strings.TrimSpace(r.URL.Query().Get("effort")),
+		pendPerm:   map[string]bool{},
+		permSeen:   map[string]bool{},
 	}
 	defer h.drop(s)
 	if err := s.handshake(); err != nil {
@@ -169,11 +171,21 @@ type session struct {
 	busy     atomic.Bool
 	live     atomic.Bool
 	prompted atomic.Bool
+	autoWarn atomic.Bool
+
+	// Permission interactions the agent announced, and the subset it
+	// actually asked us to decide. A resolve with no matching ask means
+	// grok approved it on its own.
+	pendMu   sync.Mutex
+	pendPerm map[string]bool
+	permSeen map[string]bool
+	permLost bool
 
 	askID     json.RawMessage
 	askMethod string
 	askQ      []askQuestion
 	askReply  any
+	askDone   bool
 	permID    json.RawMessage
 	permAllow string
 	permDeny  string
@@ -347,6 +359,13 @@ func (s *session) loop() {
 
 func (s *session) prompt(text string, files []promptFile) {
 	s.prompted.Store(true)
+	// Start clean: a leftover answer or question list from the last turn
+	// must not be applied to this one.
+	s.mu.Lock()
+	s.askQ = nil
+	s.askReply = nil
+	s.askDone = false
+	s.mu.Unlock()
 	s.busy.Store(true)
 	_ = s.toBrowser(map[string]string{"type": "busy"})
 	res, err := s.rpc("session/prompt", map[string]any{
@@ -461,6 +480,11 @@ func (h *agentHub) drop(s *session) {
 	if h == nil || s == nil {
 		return
 	}
+	// Answer anything this browser was still holding before letting it go.
+	// A closed tab is not an approval, and an unanswered id would leave
+	// the agent blocked on a reply that is never coming.
+	s.clearPerm()
+	s.clearAsk()
 	if s.busy.Load() && s.id != "" {
 		h.notify("session/cancel", map[string]any{"sessionId": s.id})
 	}
@@ -509,6 +533,45 @@ func (h *agentHub) lookup(sid string) *session {
 		return only
 	}
 	if nBusy == 1 {
+		return busy
+	}
+	return nil
+}
+
+// lookupRequest resolves the target for an agent *request* — something
+// carrying a JSON-RPC id whose answer has a side effect, like approving a
+// command. Guessing is worse than admitting we do not know: an untagged
+// request is only matched to a lone session that actually has a turn in
+// flight. Anything more ambiguous returns nil, and the caller answers
+// "cancelled" rather than showing one browser a card meant for another.
+func (h *agentHub) lookupRequest(sid string) *session {
+	if h == nil {
+		return nil
+	}
+	if strings.TrimSpace(sid) != "" {
+		return h.lookup(sid)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	seen := map[*session]struct{}{}
+	var busy *session
+	n := 0
+	for _, s := range h.sessions {
+		if s == nil {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		if s.busy.Load() {
+			busy = s
+			n++
+		}
+	}
+	// A session with no turn in flight cannot be the one being asked, so
+	// idle tabs neither claim the request nor make it ambiguous.
+	if n == 1 {
 		return busy
 	}
 	return nil
@@ -567,15 +630,22 @@ func (h *agentHub) readLoop() {
 			continue
 		}
 
+		// Every request with an id gets an answer. Dropping one leaves the
+		// agent blocked on a reply that is never coming, and the turn hangs
+		// until something else tears the session down.
 		if env.Method == "session/request_permission" {
-			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
+			if s := h.lookupRequest(paramsSessionID(env.Params)); s != nil {
 				s.replyPermission(env.ID, data)
+			} else {
+				h.writePermOutcome(env.ID, "")
 			}
 			continue
 		}
 		if isAskMethod(env.Method) {
-			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
+			if s := h.lookupRequest(paramsSessionID(env.Params)); s != nil {
 				s.offerAsk(env.ID, env.Method, parseAskQuestions(env.Params))
+			} else {
+				h.writeAskOutcome(env.ID, buildAskResult("skip", nil, env.Method))
 			}
 			continue
 		}
@@ -585,10 +655,19 @@ func (h *agentHub) readLoop() {
 			}
 			continue
 		}
-		if env.Method != "" && rpcIDSet(env.ID) {
-			if s := h.lookup(paramsSessionID(env.Params)); s != nil {
-				s.replyMethodNotFound(env.ID, env.Method)
+		if isSessionNotify(env.Method) {
+			// Correlating a permission with the session that was asked only
+			// works on an exact match. A guess here would pin one session's
+			// interaction to another and warn about the wrong one.
+			if sid := paramsSessionID(env.Params); sid != "" {
+				if s := h.lookup(sid); s != nil {
+					s.noteInteraction(env.Params)
+				}
 			}
+			continue
+		}
+		if env.Method != "" && rpcIDSet(env.ID) {
+			h.writeMethodNotFound(env.ID, env.Method)
 			continue
 		}
 		if n, ok := rpcIDInt(env.ID); ok {
@@ -638,10 +717,11 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte) {
 	}
 	_ = json.Unmarshal(raw, &req)
 	var tc struct {
-		Title    string          `json:"title"`
-		Kind     string          `json:"kind"`
-		RawInput json.RawMessage `json:"rawInput"`
-		Meta     struct {
+		Title      string          `json:"title"`
+		Kind       string          `json:"kind"`
+		ToolCallID string          `json:"toolCallId"`
+		RawInput   json.RawMessage `json:"rawInput"`
+		Meta       struct {
 			Tool struct {
 				Name     string `json:"name"`
 				Kind     string `json:"kind"`
@@ -650,6 +730,7 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte) {
 		} `json:"_meta"`
 	}
 	_ = json.Unmarshal(req.Params.ToolCall, &tc)
+	s.markPermHandled(tc.ToolCallID)
 	var in struct {
 		Command string `json:"command"`
 	}
@@ -675,6 +756,93 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte) {
 		title = "Execute `" + hint.Command + "`"
 	}
 	s.offerPerm(id, title, hint.Command, allow, deny)
+}
+
+// grok reports permission interactions here rather than as ACP updates.
+// The wire uses the underscored form; the agent's own protocol table
+// documents it without one, so accept either.
+func isSessionNotify(method string) bool {
+	return method == "_x.ai/session_notification" || method == "x.ai/session_notification"
+}
+
+// noteInteraction watches permission interactions the agent resolves by
+// itself. When grok runs with permission_mode = "always-approve" (or yolo)
+// it never sends session/request_permission, so pane's Allow/Deny card
+// never appears and commands run unreviewed. Pane cannot override that
+// from here, but it can refuse to imply a gate that is not there.
+func (s *session) noteInteraction(params json.RawMessage) {
+	var wrap struct {
+		Update struct {
+			SessionUpdate string `json:"sessionUpdate"`
+			ToolCallID    string `json:"tool_call_id"`
+			Kind          string `json:"kind"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &wrap) != nil {
+		return
+	}
+	u := wrap.Update
+	if u.ToolCallID == "" {
+		return
+	}
+	switch u.SessionUpdate {
+	case "pending_interaction":
+		if u.Kind != "permission" {
+			return
+		}
+		s.pendMu.Lock()
+		if s.pendPerm == nil {
+			s.pendPerm = map[string]bool{}
+		}
+		if len(s.pendPerm) < 64 {
+			s.pendPerm[u.ToolCallID] = true
+		}
+		s.pendMu.Unlock()
+	case "interaction_resolved":
+		s.pendMu.Lock()
+		pending := s.pendPerm[u.ToolCallID]
+		handled := s.permSeen[u.ToolCallID]
+		lost := s.permLost
+		delete(s.pendPerm, u.ToolCallID)
+		delete(s.permSeen, u.ToolCallID)
+		s.pendMu.Unlock()
+		// If we ever failed to record a permission we handled, we can no
+		// longer tell "grok approved it" from "we forgot". Stay quiet:
+		// crying wolf right after the user clicked Deny is worse than
+		// missing a warning.
+		if pending && !handled && !lost {
+			s.warnAutoApproved()
+		}
+	}
+}
+
+// markPermHandled records that the agent did ask us about this tool call,
+// so resolving it is not evidence of auto-approval.
+func (s *session) markPermHandled(toolCallID string) {
+	if toolCallID == "" {
+		return
+	}
+	s.pendMu.Lock()
+	if s.permSeen == nil {
+		s.permSeen = map[string]bool{}
+	}
+	if len(s.permSeen) < 256 {
+		s.permSeen[toolCallID] = true
+	} else {
+		s.permLost = true
+	}
+	s.pendMu.Unlock()
+}
+
+func (s *session) warnAutoApproved() {
+	if !s.autoWarn.CompareAndSwap(false, true) {
+		return
+	}
+	log.Printf("session %s: agent auto-approved a tool permission — pane's approval card is bypassed", s.id)
+	_ = s.toBrowser(map[string]string{
+		"type": "warn",
+		"text": "Grok is set to auto-approve tool permissions, so Pane's Allow/Deny card is bypassed and tool calls run unreviewed. Set permission_mode in ~/.grok/config.toml to restore the prompt.",
+	})
 }
 
 func (s *session) forwardUpdate(params json.RawMessage) {
@@ -728,7 +896,10 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	case "user_message_chunk":
 		// already echoed
 	case "tool_call", "tool_call_update":
-		if askTool && (s.busy.Load() || len(askQ) > 0) {
+		// A finished ask tool is not a new question. Re-offering on the
+		// completion update deletes the answered card and puts an
+		// identical blank one in its place.
+		if askTool && !terminalToolStatus(u.Status) && (s.busy.Load() || len(askQ) > 0) {
 			s.offerAsk(nil, "", askQ)
 		}
 		title := u.Title
@@ -1316,34 +1487,67 @@ func buildAskResult(action string, answers []askAnswer, method string) any {
 }
 
 func (s *session) offerAsk(id json.RawMessage, method string, qs []askQuestion) {
+	var (
+		supersede    json.RawMessage
+		supersedeMet string
+		strand       json.RawMessage
+		strandMet    string
+		replyID      json.RawMessage
+		reply        any
+	)
+	// One critical section decides who owns which id, so the browser
+	// goroutine can never answer an id we have already closed out.
 	s.mu.Lock()
+	// A re-offer with no id is the agent restating a question we have
+	// already answered this turn. Showing it again would delete the
+	// answered card and put an identical blank one in its place.
+	if !rpcIDSet(id) && s.askDone {
+		s.mu.Unlock()
+		return
+	}
 	if rpcIDSet(id) {
 		if rpcIDSet(s.askID) && string(s.askID) != string(id) {
-			old := append(json.RawMessage(nil), s.askID...)
-			oldMethod := s.askMethod
-			s.mu.Unlock()
-			s.writeAskResult(old, buildAskResult("skip", nil, oldMethod))
-			s.mu.Lock()
+			supersede = s.askID
+			supersedeMet = s.askMethod
 		}
 		s.askID = append(json.RawMessage(nil), id...)
 		if method != "" {
 			s.askMethod = method
 		}
 		if s.askReply != nil {
-			reply := s.askReply
+			reply = s.askReply
 			s.askReply = nil
-			id2 := s.askID
+			replyID = s.askID
 			s.askID = nil
-			s.mu.Unlock()
-			s.writeAskResult(id2, reply)
-			return
+			// The held answer belongs to this request and is now spent.
+			s.askQ = nil
+			s.askDone = true
 		}
 	}
-	if len(qs) > 0 {
+	if reply == nil && len(qs) > 0 {
 		s.askQ = qs
 	}
 	out := s.askQ
+	if len(out) == 0 && reply == nil && rpcIDSet(s.askID) {
+		// Nothing to render. Answer now rather than sit on the request
+		// until the turn times out with the user staring at "working…".
+		strand = s.askID
+		strandMet = s.askMethod
+		s.askID = nil
+	}
 	s.mu.Unlock()
+
+	if rpcIDSet(supersede) {
+		s.writeAskResult(supersede, buildAskResult("skip", nil, supersedeMet))
+	}
+	if reply != nil {
+		s.writeAskResult(replyID, reply)
+		return
+	}
+	if rpcIDSet(strand) {
+		s.writeAskResult(strand, buildAskResult("skip", nil, strandMet))
+		return
+	}
 	if len(out) == 0 {
 		return
 	}
@@ -1353,18 +1557,28 @@ func (s *session) offerAsk(id json.RawMessage, method string, qs []askQuestion) 
 func (s *session) completeAsk(action string, answers []askAnswer) {
 	s.mu.Lock()
 	method := s.askMethod
-	s.mu.Unlock()
-	result := buildAskResult(action, answers, method)
-	s.mu.Lock()
+	offered := len(s.askQ) > 0
 	id := s.askID
 	s.askID = nil
-	if !rpcIDSet(id) {
-		s.askReply = result
-		s.mu.Unlock()
+	s.askQ = nil
+	s.askDone = true
+	s.mu.Unlock()
+
+	result := buildAskResult(action, answers, method)
+	if rpcIDSet(id) {
+		s.writeAskResult(id, result)
 		return
 	}
+	// The card can go up before the agent's request arrives, so an answer
+	// with nothing pending is held for it. With no card up there is nothing
+	// to answer, and stashing would quietly consume the next question of
+	// the turn with a reply the user never gave.
+	if !offered {
+		return
+	}
+	s.mu.Lock()
+	s.askReply = result
 	s.mu.Unlock()
-	s.writeAskResult(id, result)
 }
 
 func (s *session) clearAsk() {
@@ -1385,21 +1599,23 @@ func (s *session) offerPerm(id json.RawMessage, title, command, allow, deny stri
 	if !rpcIDSet(id) {
 		return
 	}
+	// Claim the superseded id under the same lock that installs the new
+	// one, so the browser goroutine cannot answer an id we are about to
+	// close out — that would put two replies on the wire for one request.
 	s.mu.Lock()
+	var supersede json.RawMessage
+	supersedeDeny := ""
 	if rpcIDSet(s.permID) && string(s.permID) != string(id) {
-		old := append(json.RawMessage(nil), s.permID...)
-		oldDeny := s.permDeny
-		if oldDeny == "" {
-			oldDeny = s.permAllow
-		}
-		s.mu.Unlock()
-		s.writePermResult(old, oldDeny)
-		s.mu.Lock()
+		supersede = s.permID
+		supersedeDeny = s.permDeny
 	}
 	s.permID = append(json.RawMessage(nil), id...)
 	s.permAllow = allow
 	s.permDeny = deny
 	s.mu.Unlock()
+	if rpcIDSet(supersede) {
+		s.writePermResult(supersede, supersedeDeny)
+	}
 	if title == "" {
 		title = "run a command"
 	}
@@ -1422,63 +1638,82 @@ func (s *session) completePerm(action string) {
 	if !rpcIDSet(id) {
 		return
 	}
-	opt := allow
-	if strings.EqualFold(strings.TrimSpace(action), "deny") || strings.EqualFold(action, "skip") {
-		if deny != "" {
-			opt = deny
-		}
+	if isDenyAction(action) {
+		// deny with no reject option cancels. It must never mean allow.
+		s.writePermResult(id, deny)
+		return
 	}
-	s.writePermResult(id, opt)
+	s.writePermResult(id, allow)
 }
 
+// isDenyAction is deliberately the inverse of a short allow list: an
+// action pane does not recognise must not run the command.
+func isDenyAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "allow", "allow_once", "allow_always", "accept", "approve", "yes":
+		return false
+	}
+	return true
+}
+
+func terminalToolStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "failed", "cancelled", "canceled", "rejected":
+		return true
+	}
+	return false
+}
+
+// clearPerm closes out a card nobody answered — the turn ended, the RPC
+// timed out, or the browser went away. Silence is not consent: reject when
+// the agent gave us a reject option, otherwise cancel.
 func (s *session) clearPerm() {
 	s.mu.Lock()
 	id := s.permID
 	deny := s.permDeny
-	if deny == "" {
-		deny = s.permAllow
-	}
 	s.permID = nil
 	s.permAllow = ""
 	s.permDeny = ""
 	s.mu.Unlock()
-	if rpcIDSet(id) {
-		s.writePermResult(id, deny)
-	}
+	s.writePermResult(id, deny)
 }
 
-func (s *session) writePermResult(id json.RawMessage, option string) {
-	if s == nil || s.hub == nil || !rpcIDSet(id) {
+// writePermOutcome answers a session/request_permission. An empty option is
+// not a selection: anything we cannot map to a real option is answered
+// "cancelled", the ACP way to say the user did not choose. Falling back to
+// the allow option would silently turn Deny — and a card nobody answered —
+// into an approval.
+func (h *agentHub) writePermOutcome(id json.RawMessage, option string) {
+	if h == nil || !rpcIDSet(id) {
 		return
 	}
-	_ = s.hub.writeJSON(map[string]any{
+	outcome := map[string]any{"outcome": "cancelled"}
+	if strings.TrimSpace(option) != "" {
+		outcome = map[string]any{"outcome": "selected", "optionId": option}
+	}
+	_ = h.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
-		"result": map[string]any{
-			"outcome": map[string]any{
-				"outcome":  "selected",
-				"optionId": option,
-			},
-		},
+		"result":  map[string]any{"outcome": outcome},
 	})
 }
 
-func (s *session) writeAskResult(id json.RawMessage, result any) {
-	if s == nil || s.hub == nil || !rpcIDSet(id) {
+func (h *agentHub) writeAskOutcome(id json.RawMessage, result any) {
+	if h == nil || !rpcIDSet(id) {
 		return
 	}
-	_ = s.hub.writeJSON(map[string]any{
+	_ = h.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"result":  result,
 	})
 }
 
-func (s *session) replyMethodNotFound(id json.RawMessage, method string) {
-	if s == nil || s.hub == nil || !rpcIDSet(id) {
+func (h *agentHub) writeMethodNotFound(id json.RawMessage, method string) {
+	if h == nil || !rpcIDSet(id) {
 		return
 	}
-	_ = s.hub.writeJSON(map[string]any{
+	_ = h.writeJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"error": map[string]any{
@@ -1486,4 +1721,18 @@ func (s *session) replyMethodNotFound(id json.RawMessage, method string) {
 			"message": "Method not found: " + method,
 		},
 	})
+}
+
+func (s *session) writePermResult(id json.RawMessage, option string) {
+	if s == nil {
+		return
+	}
+	s.hub.writePermOutcome(id, option)
+}
+
+func (s *session) writeAskResult(id json.RawMessage, result any) {
+	if s == nil {
+		return
+	}
+	s.hub.writeAskOutcome(id, result)
 }

@@ -279,7 +279,6 @@ func TestAskHelpers(t *testing.T) {
 	s.clearAsk()
 	s.completeAsk("skip", nil)
 	s.offerAsk([]byte("6"), "", qs)
-	s.replyMethodNotFound(nil, "x")
 	s.writeAskResult(nil, skip)
 }
 
