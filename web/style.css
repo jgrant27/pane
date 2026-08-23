@@ -233,10 +233,6 @@ body.rail-drag #workspace {
 }
 .sess-row:hover .sess-close { opacity: 1; }
 .sess.active, .sess:hover, .sess-close:hover { color: var(--fg); background: var(--bg); }
-html[data-busy="true"] #change-project {
-  pointer-events: none;
-  opacity: 0.45;
-}
 .sess-edit {
   flex: 1 1 auto;
   min-width: 0;
@@ -473,6 +469,13 @@ header > button[aria-pressed="false"] {
   padding: 0.04rem 0;
 }
 .msg.err { color: var(--err); }
+.msg.warn {
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  padding: 0.5rem 0.65rem;
+  max-width: 36rem;
+}
 .msg.ask {
   border: 1px solid var(--line);
   border-radius: 10px;

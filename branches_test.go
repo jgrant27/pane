@@ -21,33 +21,34 @@ func TestUploadErrorBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+fileAsCwd, nil))
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+fileAsCwd, nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
 	rec = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir, strings.NewReader("{"))
 	req.Header.Set("Content-Type", "application/json")
-	handleUpload(rec, req)
+	newTestProxy().handleUpload(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir, strings.NewReader(`{"path":"/no/such/file"}`))
 	req.Header.Set("Content-Type", "application/json")
-	handleUpload(rec, req)
+	newTestProxy().handleUpload(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path=/tmp/outside", nil))
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path=/tmp/outside", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
+	// A path pane never copied in is not pane's to remove.
 	inside := filepath.Join(dir, "gone.txt")
 	rec = httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+inside, nil))
-	if rec.Code != http.StatusNoContent {
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+inside, nil))
+	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
 
@@ -58,7 +59,7 @@ func TestUploadErrorBranches(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir, &body)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	rec = httptest.NewRecorder()
-	handleUpload(rec, req)
+	newTestProxy().handleUpload(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
@@ -71,8 +72,8 @@ func TestUploadErrorBranches(t *testing.T) {
 		}
 	}
 	p := uniquePath(dir, "dup.txt")
-	if filepath.Base(p) == "dup.txt" && exists(filepath.Join(dir, "dup.txt")) {
-		// may be dup-N
+	if exists(p) {
+		t.Fatalf("uniquePath handed back a name that is already taken: %s", p)
 	}
 }
 
@@ -116,8 +117,8 @@ func TestUsageAndRenameBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	u = readSessionUsage(cwd, id)
-	if u.Model != "" && u.Used != 0 {
-		// invalid json returns empty
+	if u.Used != 0 || u.Pct != 0 || u.Model != "" {
+		t.Fatalf("unparseable signals.json must read as empty: %+v", u)
 	}
 
 	if err := renameGrokSession(cwd, "../x", "t"); err == nil {

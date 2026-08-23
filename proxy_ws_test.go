@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,10 +77,13 @@ func mockACP(c *websocket.Conn) {
 		case "session/set_model", "session/set_mode":
 			_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": map[string]any{}})
 		case "session/prompt":
+			// Tagged with the session id, the way a real agent tags it: the
+			// routing that matters is per session, not "whoever is around".
 			_ = c.WriteJSON(map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "session/update",
 				"params": map[string]any{
+					"sessionId": paramsSessionID(env.Params),
 					"update": map[string]any{
 						"sessionUpdate": "agent_message_chunk",
 						"content":       map[string]any{"text": "hello"},
@@ -635,6 +639,397 @@ func TestEnsureHubAgentHangup(t *testing.T) {
 	}
 	if msg["type"] != "err" {
 		t.Fatalf("%v", msg)
+	}
+}
+
+// dialReady opens a pane socket at a full URL and waits for the ready frame.
+func dialReady(t *testing.T, u string) *websocket.Conn {
+	t.Helper()
+	c, _ := dialReadyFrame(t, u)
+	return c
+}
+
+// dialReadyFrame hands back the ready frame too, for tests that care what
+// the tab was told about the session it just joined.
+func dialReadyFrame(t *testing.T, u string) (*websocket.Conn, map[string]any) {
+	t.Helper()
+	c, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var ready map[string]any
+	if err := c.ReadJSON(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready["type"] != "ready" {
+		t.Fatalf("ready %v", ready)
+	}
+	return c, ready
+}
+
+// startHangingPromptAgent answers everything except session/prompt, which it
+// counts and then sits on — the turn stays in flight for as long as the test
+// needs it to.
+func startHangingPromptAgent(t *testing.T, secret, sid string, prompts *atomic.Int32) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			for {
+				_, data, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var env struct {
+					ID     *int64 `json:"id"`
+					Method string `json:"method"`
+				}
+				if json.Unmarshal(data, &env) != nil || env.Method == "" || env.ID == nil {
+					continue
+				}
+				if env.Method == "session/prompt" {
+					prompts.Add(1)
+					continue
+				}
+				res := map[string]any{}
+				if env.Method == "session/new" || env.Method == "session/load" {
+					res["sessionId"] = sid
+				}
+				_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": res})
+			}
+		}()
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+// waitFor polls until the condition holds, or fails the test.
+func waitFor(t *testing.T, d time.Duration, what string, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// A turn belongs to the ACP session, and ACP runs one at a time. The guard
+// was the socket's own busy flag, so once several tabs shared a session id
+// each one passed its own guard and grok was asked to run two turns on one
+// session with their replies interleaved.
+func TestOneTurnPerSessionAcrossTabs(t *testing.T) {
+	var prompts atomic.Int32
+	secret, sid := "shared-turn", "01hangsessionxxxxxxxxxxxxxxxx"
+	dir := t.TempDir()
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: dir}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + dir + "&sid=" + sid
+
+	a := dialReady(t, u)
+	b := dialReady(t, u)
+	if err := a.WriteJSON(map[string]any{"type": "in", "text": "one"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "the first turn to reach the agent", func() bool {
+		return prompts.Load() == 1
+	})
+
+	if err := b.WriteJSON(map[string]any{"type": "in", "text": "two"}); err != nil {
+		t.Fatal(err)
+	}
+	// The second tab is told the session is working rather than having its
+	// message quietly dropped.
+	if got := waitFrame(t, b, "busy"); got == nil {
+		t.Fatal("the second tab was never told the session is busy")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := prompts.Load(); n != 1 {
+		t.Fatalf("two tabs on one session started %d turns", n)
+	}
+}
+
+// A tab that joins mid-turn has never prompted anything itself, so only the
+// session's own state can tell it the agent is working. Without it the
+// composer comes up idle and offers to send into a turn already running.
+func TestReadyTellsANewTabTheSessionIsBusy(t *testing.T) {
+	var prompts atomic.Int32
+	secret, sid := "ready-busy", "01readysessionxxxxxxxxxxxxxxx"
+	dir := t.TempDir()
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: dir}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + dir + "&sid=" + sid
+
+	first, ready := dialReadyFrame(t, u)
+	if ready["busy"] != false {
+		t.Fatalf("an idle session reported %v", ready["busy"])
+	}
+	if err := first.WriteJSON(map[string]any{"type": "in", "text": "one"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "the turn to reach the agent", func() bool {
+		return prompts.Load() == 1
+	})
+
+	if _, ready = dialReadyFrame(t, u); ready["busy"] != true {
+		t.Fatalf("a tab joining mid-turn was told busy=%v", ready["busy"])
+	}
+}
+
+// waitFrame reads until a frame of the given type arrives.
+func waitFrame(t *testing.T, c *websocket.Conn, want string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		var msg map[string]any
+		if err := c.ReadJSON(&msg); err != nil {
+			continue
+		}
+		if msg["type"] == want {
+			return msg
+		}
+	}
+	return nil
+}
+
+// Two browsers on one session id must both see the turn. Routing used to be
+// a single slot per id, so the tab that attached last evicted the first and
+// the reply reached neither of them: the first was unreachable, and the
+// second threw it away as session/load transcript because it had never
+// prompted anything itself.
+func TestSecondTabOnOneSessionSeesTheReply(t *testing.T) {
+	secret := "fanout-secret"
+	agent := startMockAgent(t, secret)
+	dir := t.TempDir()
+	p := &proxy{agentBase: agent, secret: secret, cwd: dir}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") +
+		"/ws?cwd=" + dir + "&sid=01mocksessionxxxxxxxxxxxxxxxx"
+	a := dialReady(t, u)
+	b := dialReady(t, u)
+
+	if err := a.WriteJSON(map[string]any{"type": "in", "text": "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readUntilIdle(t, a, 5*time.Second); !strings.Contains(strings.Join(got, "\n"), "hello") {
+		t.Fatalf("the tab that prompted saw %v", got)
+	}
+	if got := drainOut(b, 2*time.Second); !strings.Contains(strings.Join(got, "\n"), "hello") {
+		t.Fatalf("the other tab on the same session saw %v", got)
+	}
+}
+
+// startCountingAgent answers everything at once and counts the prompts, so a
+// test can tell how many turns pane actually started.
+func startCountingAgent(t *testing.T, secret string, prompts *atomic.Int32) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			for {
+				_, data, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var env struct {
+					ID     *int64 `json:"id"`
+					Method string `json:"method"`
+				}
+				if json.Unmarshal(data, &env) != nil || env.Method == "" || env.ID == nil {
+					continue
+				}
+				if env.Method == "session/prompt" {
+					prompts.Add(1)
+				}
+				res := map[string]any{}
+				if env.Method == "session/new" || env.Method == "session/load" {
+					res["sessionId"] = "01countsessionxxxxxxxxxxxxxxx"
+				}
+				_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": res})
+			}
+		}()
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+// Two prompts sent back to back must start one turn. busy used to be set by
+// the prompt goroutine rather than by the reader, so the next message could
+// be read while the flag still said idle and a second turn started on the
+// same ACP session. Holding s.mu parks that goroutine exactly where the old
+// code set the flag, which is the window the race lives in.
+func TestBackToBackPromptsStartOneTurn(t *testing.T) {
+	var prompts atomic.Int32
+	secret := "one-turn"
+	dir := t.TempDir()
+	p := &proxy{agentBase: startCountingAgent(t, secret, &prompts), secret: secret, cwd: dir}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+
+	c, sid := dialPaneSession(t, srv.URL, dir)
+	p.hubMu.Lock()
+	h := p.hub
+	p.hubMu.Unlock()
+	s := h.lookup(sid)
+	if s == nil {
+		t.Fatal("session not attached")
+	}
+
+	s.mu.Lock()
+	if err := c.WriteJSON(map[string]any{"type": "in", "text": "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteJSON(map[string]any{"type": "in", "text": "two"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	s.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && prompts.Load() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := prompts.Load(); n != 1 {
+		t.Fatalf("two messages started %d turns on one session", n)
+	}
+}
+
+// A wedged agent must be dialled once per attempt, not once per tab.
+// ensureHub used to hold its mutex across the dial and initialize, so every
+// tab queued behind the whole failing attempt and then repeated it.
+func TestEnsureHubDialsOncePerAttempt(t *testing.T) {
+	var dials atomic.Int32
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dials.Add(1)
+		time.Sleep(300 * time.Millisecond)
+		http.Error(w, "no agent", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(agent.Close)
+	p := &proxy{agentBase: "ws" + strings.TrimPrefix(agent.URL, "http"), secret: "s", cwd: t.TempDir()}
+
+	start := time.Now()
+	errs := make([]error, 4)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = p.ensureHub()
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	for i, err := range errs {
+		if err == nil {
+			t.Fatalf("waiter %d was handed a hub by a dead agent", i)
+		}
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("one attempt dialled the agent %d times", n)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("tabs serialised behind each other: %v", elapsed)
+	}
+}
+
+// Changing the model must not stop pane reading the browser. model and
+// effort used to call the agent inline on the only goroutine reading that
+// socket, so Allow/Deny, answers and Escape sat unread behind them — while
+// the agent was often blocked on the very permission being answered.
+func TestModelRPCDoesNotStallTheReader(t *testing.T) {
+	secret := "stall-secret"
+	seen := make(chan string, 32)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			for {
+				_, data, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var env struct {
+					ID     *int64 `json:"id"`
+					Method string `json:"method"`
+				}
+				if json.Unmarshal(data, &env) != nil || env.Method == "" {
+					continue
+				}
+				select {
+				case seen <- env.Method:
+				default:
+				}
+				// The wedged call: never answered, exactly like an agent
+				// that is mid-turn waiting on a permission reply.
+				if env.Method == "session/set_model" || env.ID == nil {
+					continue
+				}
+				res := map[string]any{}
+				if env.Method == "session/new" || env.Method == "session/load" {
+					res["sessionId"] = "01stallsessionxxxxxxxxxxxxxxx"
+				}
+				_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": res})
+			}
+		}()
+	}))
+	t.Cleanup(agent.Close)
+
+	dir := t.TempDir()
+	p := &proxy{agentBase: "ws" + strings.TrimPrefix(agent.URL, "http"), secret: secret, cwd: dir}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	c, _ := dialPaneSession(t, srv.URL, dir)
+
+	if err := c.WriteJSON(map[string]any{"type": "model", "id": "grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteJSON(map[string]any{"type": "cancel"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case m := <-seen:
+			if m == "session/cancel" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("cancel never reached the agent: the reader was parked on session/set_model")
+		}
 	}
 }
 

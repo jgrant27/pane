@@ -36,7 +36,23 @@ var (
 	remoteAt         time.Time
 	remoteList       []remoteSession
 	remoteRefreshing bool
+	// remoteRefreshDone is closed when the goroutine below finishes. The
+	// refresh reads package-level hooks (lookPath, tailscaleJSON) and outlives
+	// the request that started it, so anything that swaps those — the tests —
+	// needs a way to join it first.
+	remoteRefreshDone chan struct{}
 )
+
+// waitRemoteRefresh blocks until the background refresh, if one is running,
+// has stopped touching the discovery hooks.
+func waitRemoteRefresh() {
+	remoteMu.Lock()
+	done := remoteRefreshDone
+	remoteMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
 
 func cachedRemoteSessions() []remoteSession {
 	const ttl = 30 * time.Second
@@ -46,7 +62,10 @@ func cachedRemoteSessions() []remoteSession {
 	needRefresh := list == nil || age >= ttl/2
 	if needRefresh && !remoteRefreshing {
 		remoteRefreshing = true
+		done := make(chan struct{})
+		remoteRefreshDone = done
 		go func() {
+			defer close(done)
 			next := discoverRemoteSessions(2500 * time.Millisecond)
 			if next == nil {
 				next = []remoteSession{}

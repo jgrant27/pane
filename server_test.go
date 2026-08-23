@@ -60,7 +60,10 @@ func TestRunReplaceRequiresServe(t *testing.T) {
 	}
 }
 
+const testToken = "test-ui-token"
+
 func TestServePaneHealthzAndMeta(t *testing.T) {
+	t.Setenv("PANE_TOKEN", testToken)
 	dir := t.TempDir()
 	addr := freeAddr(t)
 	stop := make(chan struct{})
@@ -87,7 +90,18 @@ func TestServePaneHealthzAndMeta(t *testing.T) {
 	if res.StatusCode != 200 || !strings.Contains(string(body), "ok") {
 		t.Fatalf("%d %s", res.StatusCode, body)
 	}
-	res, err = http.Get("http://" + addr + "/meta")
+	// /meta reaches the agent's world, so it needs the UI token.
+	noTok, err := http.Get("http://" + addr + "/meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = noTok.Body.Close()
+	if noTok.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("untokened /meta %d", noTok.StatusCode)
+	}
+	metaReq, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/meta", nil)
+	metaReq.Header.Set(tokenHeader, testToken)
+	res, err = http.DefaultClient.Do(metaReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,13 +113,20 @@ func TestServePaneHealthzAndMeta(t *testing.T) {
 	if meta["name"] != "Grok Pane" {
 		t.Fatalf("%+v", meta)
 	}
-	opt, err := http.NewRequest(http.MethodOptions, "http://"+addr+"/healthz", nil)
+	// A preflight from the desktop app's origin, which is what actually
+	// needs the CORS headers.
+	opt, err := http.NewRequest(http.MethodOptions, "http://"+addr+"/v1/sessions", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	opt.Header.Set("Origin", "wails://wails")
+	opt.Header.Set("Access-Control-Request-Method", "GET")
 	ores, err := http.DefaultClient.Do(opt)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := ores.Header.Get("Access-Control-Allow-Origin"); got != "wails://wails" {
+		t.Fatalf("preflight CORS %q", got)
 	}
 	_ = ores.Body.Close()
 	if ores.StatusCode != http.StatusNoContent {
@@ -486,9 +507,6 @@ func TestHelpers(t *testing.T) {
 	}
 	if listenPort("127.0.0.1:9") != "9" || listenPort("bad") != "7420" {
 		t.Fatal("listenPort")
-	}
-	if !tcpBusy("127.0.0.1:1") && tcpBusy(freeAddr(t)) {
-		// 127.0.0.1:1 may or may not be busy; just exercise tcpBusy false path
 	}
 	addr := freeAddr(t)
 	if tcpBusy(addr) {

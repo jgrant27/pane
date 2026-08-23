@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSessionOwnsAndHubLookup(t *testing.T) {
@@ -31,7 +32,7 @@ func TestSessionOwnsAndHubLookup(t *testing.T) {
 		t.Fatal("dead rpc")
 	}
 
-	h := &agentHub{sessions: map[string]*session{}}
+	h := newAgentHub(nil)
 	if h.lookup("x") != nil || (*agentHub)(nil).lookup("x") != nil {
 		t.Fatal("empty lookup")
 	}
@@ -255,7 +256,7 @@ func TestAskHelpers(t *testing.T) {
 	if len(s.askQ) != 0 {
 		t.Fatalf("execute became ask %+v", s.askQ)
 	}
-	s.replyPermission([]byte("9"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"Execute git push","kind":"execute","rawInput":{"command":"git push"}}}}`))
+	s.replyPermission([]byte("9"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"Execute git push","kind":"execute","rawInput":{"command":"git push"}}}}`), true)
 	if !rpcIDSet(s.permID) || s.permAllow != "allow_once" {
 		t.Fatalf("execute should wait %+v", s.permID)
 	}
@@ -263,11 +264,11 @@ func TestAskHelpers(t *testing.T) {
 	if rpcIDSet(s.permID) {
 		t.Fatal("perm cleared")
 	}
-	s.replyPermission([]byte("10"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"}],"toolCall":{"title":"Read file","kind":"read"}}}`))
+	s.replyPermission([]byte("10"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"}],"toolCall":{"title":"Read file","kind":"read"}}}`), true)
 	if rpcIDSet(s.permID) {
 		t.Fatal("read should auto-allow")
 	}
-	s.replyPermission([]byte("11"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"run_terminal_command","kind":"Other","rawInput":{"command":"git push origin main && git status"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute","read_only":false}}}}}`))
+	s.replyPermission([]byte("11"), []byte(`{"params":{"options":[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"reject_once","kind":"reject_once"}],"toolCall":{"title":"run_terminal_command","kind":"Other","rawInput":{"command":"git push origin main && git status"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute","read_only":false}}}}}`), true)
 	if !rpcIDSet(s.permID) {
 		t.Fatal("real ACP execute frame should wait")
 	}
@@ -279,7 +280,6 @@ func TestAskHelpers(t *testing.T) {
 	s.clearAsk()
 	s.completeAsk("skip", nil)
 	s.offerAsk([]byte("6"), "", qs)
-	s.replyMethodNotFound(nil, "x")
 	s.writeAskResult(nil, skip)
 }
 
@@ -300,5 +300,179 @@ func TestBuildPrompt(t *testing.T) {
 	blocks = buildPrompt("x", []promptFile{{Path: outside, Name: "nope.txt"}}, dir, false)
 	if len(blocks) != 1 || blocks[0]["type"] != "text" {
 		t.Fatalf("outside leaked %+v", blocks)
+	}
+}
+
+// Embedding reads the file itself, which skips the agent's own permission
+// prompt — so a name that merely looks like it is in the project is not
+// enough. The check used to be lexical while the read followed links, so
+// <cwd>/diagram.png -> ~/.ssh/id_rsa shipped the private key to the model.
+func TestBuildPromptRefusesSymlinkEscape(t *testing.T) {
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "id_rsa")
+	if err := os.WriteFile(secret, []byte("BEGIN PRIVATE KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		path func(dir string) string
+	}{
+		{"symlinked file", func(dir string) string {
+			p := filepath.Join(dir, "diagram.png")
+			if err := os.Symlink(secret, p); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+		{"symlinked directory", func(dir string) string {
+			if err := os.Symlink(secretDir, filepath.Join(dir, "pics")); err != nil {
+				t.Fatal(err)
+			}
+			return filepath.Join(dir, "pics", "id_rsa")
+		}},
+	}
+	for _, c := range cases {
+		dir := t.TempDir()
+		path := c.path(dir)
+		blocks := buildPrompt("look", []promptFile{{Path: path, Name: "diagram.png", Mime: "image/png", Size: 17}}, dir, true)
+		for _, b := range blocks {
+			if b["type"] == "image" {
+				t.Fatalf("%s: the link target was embedded: %+v", c.name, b)
+			}
+		}
+		if underCwdResolved(dir, filepath.Join(dir, "missing.png")) {
+			t.Fatal("a path that does not exist is not inside anything")
+		}
+	}
+}
+
+// A turn is not an RPC that answers in a moment: session/prompt returns only
+// when the whole turn ends, so one flat deadline for every method declared
+// live turns dead — denying their pending permission on the way out.
+func TestRPCDeadlineIsPerMethod(t *testing.T) {
+	if d := rpcDeadline("session/prompt"); d <= 10*time.Minute {
+		t.Fatalf("a turn may not be capped at %v", d)
+	}
+	if d := rpcDeadline("initialize"); d > time.Minute {
+		t.Fatalf("a wedged agent must be reported in seconds, not %v", d)
+	}
+	if d := rpcDeadline("session/set_model"); d > time.Minute {
+		t.Fatalf("control calls answer at once; %v is not a deadline", d)
+	}
+	if d := rpcDeadline("session/load"); d <= time.Minute || d > 10*time.Minute {
+		t.Fatalf("loading a transcript is real work but still bounded: %v", d)
+	}
+}
+
+// The table is only worth having if rpc consults it. The deadline used to be
+// hard-coded in rpc, where changing the table changed nothing.
+func TestRPCAsksTheTableForItsDeadline(t *testing.T) {
+	h, _, _ := hubWithAgent(t)
+	asked := make(chan string, 4)
+	h.deadline = func(method string) time.Duration {
+		asked <- method
+		return 40 * time.Millisecond
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.rpc("session/prompt", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != errTimeout {
+			t.Fatalf("a call the agent never answered returned %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rpc waited past the deadline it asked for")
+	}
+	if m := <-asked; m != "session/prompt" {
+		t.Fatalf("the deadline was chosen for %q", m)
+	}
+}
+
+// Several tabs on one session id: updates reach all of them, while a card
+// that can only be answered once goes to the tab whose turn it is.
+func TestLookupFansOutButCardsPickTheBusyTab(t *testing.T) {
+	h := newAgentHub(nil)
+	a := &session{id: "shared"}
+	b := &session{id: "shared"}
+	h.attach("shared", a)
+	h.attach("shared", b)
+
+	if got := h.lookupAll("shared"); len(got) != 2 {
+		t.Fatalf("the update reached %d of 2 tabs", len(got))
+	}
+	if h.lookup("shared") != nil {
+		t.Fatal("with no turn in flight neither tab owns the card")
+	}
+	a.busy.Store(true)
+	if h.lookup("shared") != a {
+		t.Fatal("the card belongs to the tab whose turn it is")
+	}
+	b.busy.Store(true)
+	if h.lookup("shared") != nil {
+		t.Fatal("two turns on one id is ambiguous")
+	}
+	if len(h.lookupAll("nobody")) != 0 || len(h.lookupAll("")) != 0 {
+		t.Fatal("unknown and ambiguous ids route nowhere")
+	}
+	if h.detach(a) {
+		t.Fatal("one tab leaving does not leave the session unwatched")
+	}
+	if !h.detach(b) {
+		t.Fatal("the last tab leaving does")
+	}
+	if (*agentHub)(nil).lookupAll("shared") != nil {
+		t.Fatal("nil hub")
+	}
+}
+
+// A call with no live socket must fail rather than wait out its deadline.
+func TestRPCWithoutASocketFails(t *testing.T) {
+	if _, err := newAgentHub(nil).rpc("initialize", nil); err != errNoAgent {
+		t.Fatalf("rpc without a socket: %v", err)
+	}
+}
+
+// The turn is claimed per ACP session id, not per socket: a session runs one
+// prompt at a time however many tabs are watching, and a tab that never
+// prompted can still tell a live turn from the session/load transcript.
+func TestTurnIsClaimedPerSession(t *testing.T) {
+	h := newAgentHub(nil)
+	if h.turnActive("s") {
+		t.Fatal("no turn has started")
+	}
+	if !h.claimTurn("s") {
+		t.Fatal("the first turn on an idle session must be allowed")
+	}
+	if h.claimTurn("s") {
+		t.Fatal("a second turn started on a session already working")
+	}
+	if !h.turnActive("s") {
+		t.Fatal("the claimed turn is not visible to the other tabs")
+	}
+	if !h.claimTurn("other") {
+		t.Fatal("one busy session must not block another")
+	}
+	h.releaseTurn("s")
+	if h.turnActive("s") {
+		t.Fatal("the turn ended")
+	}
+	if !h.claimTurn("s") {
+		t.Fatal("the next turn must be allowed once the last one released")
+	}
+
+	// With no id there is nothing to key a claim on, so the per-socket guard
+	// is left to do the job on its own.
+	if !h.claimTurn("") || !(*agentHub)(nil).claimTurn("s") {
+		t.Fatal("an unkeyable claim must not block the prompt")
+	}
+	h.releaseTurn("")
+	(*agentHub)(nil).releaseTurn("s")
+	if (*agentHub)(nil).turnActive("s") || h.turnActive("") {
+		t.Fatal("nil hub and empty ids have no turns")
 	}
 }

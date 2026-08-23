@@ -17,15 +17,22 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.2</string>
+	<string>0.2.7</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2007</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
+		<!-- What this key buys is exactly the named-host case: an unqualified name
+		     (http://beelz) and a Bonjour name (http://beelz.local). It does nothing
+		     for an address literal, and it does not need to — since iOS 10 ATS is
+		     not applied to a URL whose host is an IP address at all, so the
+		     http://192.168.1.5:7420 the help text offers, 127.0.0.1, and a 100.64/10
+		     tailnet address are all reachable with no exemption. That is every
+		     cleartext pane there is; a tailnet MagicDNS name is https. ATS also
+		     ignores NSAllowsArbitraryLoads whenever this key is present, so the
+		     blanket exemption was buying nothing but an App Review justification. -->
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>

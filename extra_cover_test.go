@@ -213,7 +213,7 @@ func TestMoreUploadAndPrompt(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/upload?cwd="+dir+"&path="+src, nil)
 	rec := httptest.NewRecorder()
-	handleUpload(rec, req)
+	newTestProxy().handleUpload(rec, req)
 	if rec.Code != 200 {
 		t.Fatal(rec.Body.String())
 	}
@@ -233,7 +233,18 @@ func TestSessionsPruneAndGrokHome(t *testing.T) {
 	}
 	_ = os.WriteFile(filepath.Join(sessionGroupDir(cwd), stub, "summary.json"), []byte(`{"info":{"id":"`+stub+`"},"generated_title":"","num_messages":0}`), 0o644)
 	_ = os.WriteFile(filepath.Join(sessionGroupDir(cwd), real, "summary.json"), []byte(`{"info":{"id":"`+real+`"},"generated_title":"Real","num_messages":3}`), 0o644)
-	req := httptest.NewRequest(http.MethodGet, "/v1/sessions?cwd="+cwd+"&prune=1&keep="+real, nil)
+	// A GET must not delete anything, however it is decorated.
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/sessions?cwd="+cwd+"&prune=1&keep="+real, nil)
+	getRec := httptest.NewRecorder()
+	handleSessions(getRec, getReq)
+	if getRec.Code != 200 {
+		t.Fatal(getRec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(sessionGroupDir(cwd), stub)); err != nil {
+		t.Fatal("a GET pruned a session")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions?cwd="+cwd+"&prune=1&keep="+real, nil)
 	rec := httptest.NewRecorder()
 	handleSessions(rec, req)
 	if rec.Code != 200 {
@@ -372,8 +383,8 @@ func TestCopyFileExistsAndDeleteDir(t *testing.T) {
 	}
 	_ = os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0o644)
 	rec := httptest.NewRecorder()
-	handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+sub, nil))
-	if rec.Code != http.StatusInternalServerError {
+	newTestProxy().handleUpload(rec, httptest.NewRequest(http.MethodDelete, "/v1/upload?cwd="+dir+"&path="+sub, nil))
+	if rec.Code != http.StatusBadRequest {
 		t.Fatal(rec.Code)
 	}
 }

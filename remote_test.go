@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -108,9 +109,60 @@ func TestCachedRemoteSessionsCold(t *testing.T) {
 	oldPath, oldApp := lookPath, lookTailscaleApp
 	lookPath = func(string) (string, error) { return "", os.ErrNotExist }
 	lookTailscaleApp = func() string { return "" }
+	// The hook has to outlive the refresh goroutine that reads it, or the
+	// restore below races it — which is what go test -race reported.
 	t.Cleanup(func() { lookPath, lookTailscaleApp = oldPath, oldApp })
+	t.Cleanup(waitRemoteRefresh)
 	got := cachedRemoteSessions()
 	if got == nil {
 		t.Fatal("nil")
+	}
+}
+
+func TestWaitRemoteRefreshJoinsBackgroundRefresh(t *testing.T) {
+	waitRemoteRefresh()
+	remoteMu.Lock()
+	prevList, prevAt, prevRef := remoteList, remoteAt, remoteRefreshing
+	// A cached-but-stale list is what sends the refresh to the background.
+	remoteList = []remoteSession{}
+	remoteAt = time.Now().Add(-time.Minute)
+	remoteRefreshing = false
+	remoteMu.Unlock()
+
+	blocked := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(blocked) }) }
+	oldPath, oldJSON := lookPath, tailscaleJSON
+	lookPath = func(string) (string, error) { return "/usr/bin/tailscale", nil }
+	tailscaleJSON = func() ([]byte, error) {
+		<-blocked
+		return []byte(`{"Self":{"DNSName":"self.ts.net.","HostName":"self"}}`), nil
+	}
+	// Cleanups run last-registered-first: unblock the refresh, join it, then
+	// put the hooks and the cache back.
+	t.Cleanup(func() {
+		remoteMu.Lock()
+		remoteList, remoteAt, remoteRefreshing = prevList, prevAt, prevRef
+		remoteMu.Unlock()
+	})
+	t.Cleanup(func() { lookPath, tailscaleJSON = oldPath, oldJSON })
+	t.Cleanup(waitRemoteRefresh)
+	t.Cleanup(release)
+
+	cachedRemoteSessions()
+	remoteMu.Lock()
+	stillStale := remoteAt.Before(time.Now().Add(-30 * time.Second))
+	remoteMu.Unlock()
+	if !stillStale {
+		t.Fatal("refresh should still be in flight")
+	}
+	release()
+	waitRemoteRefresh()
+	remoteMu.Lock()
+	fresh := time.Since(remoteAt) < time.Minute
+	running := remoteRefreshing
+	remoteMu.Unlock()
+	if !fresh || running {
+		t.Fatalf("waitRemoteRefresh returned before the refresh finished (fresh=%v running=%v)", fresh, running)
 	}
 }

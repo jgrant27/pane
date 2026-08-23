@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"os"
 	goruntime "runtime"
 
 	"github.com/jgrant27/pane/web"
@@ -64,7 +63,12 @@ func main() {
 	if goruntime.GOOS != "darwin" {
 		file.AddSeparator()
 		file.AddText("Quit", keys.CmdOrCtrl("q"), func(_ *menu.CallbackData) {
-			os.Exit(0)
+			// os.Exit would skip OnShutdown, and that hook is the only thing
+			// that stops the pane server this app started — it would keep
+			// holding :7420 and its grok child after the window is gone.
+			if app.ctx != nil {
+				runtime.Quit(app.ctx)
+			}
 		})
 	}
 	appMenu.Append(menu.EditMenu())
@@ -82,7 +86,7 @@ func main() {
 			EnableFileDrop:     true,
 			DisableWebViewDrop: true,
 		},
-		OnStartup:  app.startup,
+		OnStartup: app.startup,
 		OnDomReady: func(ctx context.Context) {
 			// macOS restores the last frame; force the smaller default.
 			runtime.WindowSetSize(ctx, 1040, 680)

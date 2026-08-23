@@ -27,9 +27,8 @@ Light theme is the default.
 
 ## 1. What you need
 
-- **Go 1.25+** — https://go.dev/dl
-- **Grok CLI**, signed in
-- On a Mac, **Xcode command-line tools** (`xcode-select --install`) so the desktop app can link WebKit
+- **Grok CLI**, signed in — on every machine that will run the agent.
+- To **build from source** (optional): **Go 1.25+** (https://go.dev/dl), and on a Mac the **Xcode command-line tools** (`xcode-select --install`) so the desktop app can link WebKit. A [release download](#2-download-a-release) needs neither.
 
 Install Grok:
 
@@ -59,16 +58,70 @@ grok --version
 
 ---
 
-## 2. Get Grok Pane
+## 2. Download a release
+
+Every tagged version publishes prebuilt binaries on the [Releases page](https://github.com/jgrant27/pane/releases/latest). Pick the zip for the machine it will run on:
+
+| Machine | Zip |
+| --- | --- |
+| Mac, Apple silicon | `grok-pane-darwin-arm64.zip` |
+| Linux, x86-64 | `grok-pane-linux-amd64.zip` |
+| Linux, arm64 | `grok-pane-linux-arm64.zip` |
+| Windows, x86-64 | `grok-pane-windows-amd64.zip` |
+| Windows, arm64 | `grok-pane-windows-arm64.zip` |
+
+Intel Macs are not built in CI — [build from source](#3-build-from-source) there.
+
+Each zip holds the two programs, `pane` and `grok-pane` (`.exe` on Windows), plus a `build.txt` saying what built it. The Mac zip also holds **`Grok-Pane.app.zip`**, the two wrapped as an app.
+
+**Check the download.** `SHA256SUMS` sits next to the zips:
+
+```bash
+# macOS / Linux — in the folder with the zip and SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+```powershell
+# Windows
+(Get-FileHash .\grok-pane-windows-amd64.zip).Hash -eq ((Get-Content .\SHA256SUMS | Select-String windows-amd64) -split ' ')[0]
+```
+
+**Run it.**
+
+- **Mac:** unzip, then unzip `Grok-Pane.app.zip` inside it and open **Grok Pane.app**. The app is unsigned, so the first launch is refused: System Settings → Privacy & Security → **Open Anyway**. Or, in a terminal, `xattr -d com.apple.quarantine "Grok Pane.app"` once.
+- **Linux:** `./grok-pane`. It needs the GTK and WebKit runtime — `libgtk-3-0` and `libwebkit2gtk-4.1-0` on Debian/Ubuntu.
+- **Windows:** `grok-pane.exe`. Install [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) if it will not start; recent Windows already has it.
+
+The app looks for `pane` on `127.0.0.1:7420` and starts one if nothing is there. Inside **Grok Pane.app** it finds `pane` beside itself; the bare `grok-pane` binary needs `pane` in the same folder or on your `PATH`. Everything else — `pane.secret`, `pane.token`, starting `grok agent serve` — it does on first run. Then go to [Use it](#4-use-it).
+
+### Across machines
+
+The agent runs where the files are. Pane's job is to put a window on it from somewhere else, over your tailnet.
+
+1. **On the machine with the project** (the one with Grok signed in): unzip *that machine's* zip, then
+
+   ```bash
+   ./pane
+   ```
+
+   Or from source, `make remote`. It Tailscale-serves when Tailscale is running, prints `https://<host>.<tailnet>.ts.net/`, and still answers on loopback so the desktop app works. Leave it running. `-tailscale` is the strict identity gate.
+
+2. **On your laptop**, either:
+   - open that URL in a browser — nothing to install; or
+   - unzip *the laptop's* zip, open Grok Pane, then **File → Connect to pane…** and paste the URL (or launch with `PANE_URL=https://<host>.<tailnet>.ts.net`). **Change project…** now asks for a path on the remote machine.
+
+3. **On a phone**, the iOS and Android shells take the same URL. They are not in the release — see [Phone](#phone-ios-and-android).
+
+Default `./pane` still answers on loopback (desktop token). `-tailscale` makes Tailscale identity the credential on that path. What that gate does and does not check is under [Tailscale](#tailscale-another-machine). **Never use `tailscale funnel`** — that publishes the agent to the internet.
+
+---
+
+## 3. Build from source
 
 ```bash
 git clone https://github.com/jgrant27/pane
 cd pane
 ```
-
----
-
-## 3. Build and open the desktop app
 
 **macOS** (recommended):
 
@@ -162,11 +215,13 @@ Leave the app running. Quit with ⌘Q / Alt+F4, or close the window.
 | Symptom | What to do |
 | --- | --- |
 | Status stuck on `connecting…` / `disconnected` | Is anything else bound to **7420**? In a terminal: `./pane -no-open` then reopen Grok Pane. |
-| `pane server is not running and no pane binary was found` | Run `make` in this repo, then either `make install` (puts `pane` on `~/.local/bin`) or start `./pane` yourself before the app. |
+| `pane server is not running and no pane binary was found` | The app could not find `pane`. From a release: put the `pane` binary from the zip in the same folder as `grok-pane`, or on your `PATH`. From source: `make`, then `make install` (puts `pane` on `~/.local/bin`) or start `./pane` yourself before the app. |
 | Agent errors / auth | `grok login`, then retry. |
 | Mac: app won’t open | Unsigned build. System Settings → Privacy & Security → Open Anyway. Or run `./grok-pane` from the repo. |
 
 The server writes a secret to `~/.grok/pane.secret` on first run (or uses `-secret` / `$GROK_AGENT_SECRET` / `$PANE_SECRET`). You do not normally need to touch this.
+
+It also writes a UI token to `~/.grok/pane.token` (or uses `$PANE_TOKEN`). The secret authenticates **pane to Grok**; the token authenticates **the UI to pane**, so that a random web page you happen to have open cannot reach `127.0.0.1:7420` and drive your agent. Pane serves the token inside its own page, where only a same-origin document can read it, and the desktop app reads it off disk. You do not normally need to touch this either — but if you delete it, reload the page.
 
 ---
 
@@ -209,7 +264,14 @@ make remote
 ./pane
 ```
 
-`pane` with no flags Tailscale-serves when Tailscale is running, keeps listening on `127.0.0.1:7420` (so the desktop app still works), and opens `https://<host>.<tailnet>.ts.net/`. `-tailscale` is the strict mode: identity gate, loopback 403. `-local` is loopback only.
+`pane` with no flags Tailscale-serves when Tailscale is running, keeps listening on `127.0.0.1:7420` (so the desktop app still works), and opens `https://<host>.<tailnet>.ts.net/`. `-local` is loopback only.
+
+`-tailscale` is the strict mode: identity gate, loopback 403. That keeps `pane` on `127.0.0.1:7420`, puts `tailscale serve` in front, and requires a Tailscale identity on every request.
+
+Two things that gate does **not** do:
+
+- It does not check *which* tailnet member is calling. Everyone who can reach that URL can drive the agent.
+- It cannot tell the Serve proxy apart from another program on the same machine, since both connect over loopback — so a local program that sets the identity header itself gets in. A web page cannot do this (the browser will not send that header cross-origin without permission pane never grants), and a local program already runs as you and could just read `~/.grok/pane.token` or run `grok` directly. Treat it as one more reason not to run untrusted code on the box.
 
 On a **laptop on the same tailnet**:
 
@@ -222,7 +284,8 @@ On a **laptop on the same tailnet**:
 
 ## What it is (and is not)
 
-- Auto-approves tool permission prompts (`yoloMode`). Treat it like a local shell with a window attached.
+- Asks before commands that execute or write. Pane requests a gated session and shows an **Allow / Deny** card; denying, closing the tab, or leaving the card unanswered all reject the call.
+- **That gate is only as good as Grok's own setting.** With `permission_mode = "always-approve"` (or yolo) in `~/.grok/config.toml`, Grok approves tool calls itself and never asks Pane — the card never appears and commands run unreviewed. Pane detects this and prints a warning in the transcript. Until you change that setting, treat it like a local shell with a window attached.
 - Parallel sessions, each with its own cwd.
 - Not a clone of Claude’s diff viewer, in-app browser, or git-isolated worktrees. The agent already does the coding.
 

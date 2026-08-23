@@ -59,20 +59,65 @@ func detectMIME(name string, head []byte) string {
 	return http.DetectContentType(head)
 }
 
-func underCwd(cwd, path string) bool {
+// relUnder places path inside cwd: where it sits relative to cwd, and whether
+// it stayed in there at all. Purely lexical — nothing here follows a link.
+func relUnder(cwd, path string) (string, bool) {
 	absCwd, err := filepath.Abs(cwd)
 	if err != nil {
-		return false
+		return "", false
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return false
+		return "", false
 	}
 	rel, err := filepath.Rel(absCwd, absPath)
 	if err != nil {
-		return false
+		return "", false
 	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return rel, true
+}
+
+func underCwd(cwd, path string) bool {
+	_, ok := relUnder(cwd, path)
+	return ok
+}
+
+// projectPath decides whether src already lives inside the project and, if it
+// does, gives back the spelling of it to pass on from here.
+//
+// Two different questions get asked about the same file. Deciding whether to
+// copy has to survive the filesystem, or a link inside the project pointing
+// out of it would be handed to the agent in place. But the path that comes
+// back is checked again downstream, and lexically: buildPrompt drops any
+// attachment that is not literally under cwd. A file reached through a link
+// *into* the project passes the first test and fails the second, so it has to
+// come back re-spelled under cwd or it silently never reaches the agent.
+// Re-spelling relative to the resolved root is also what keeps the macOS case
+// working, where cwd itself is the link (/tmp -> /private/tmp) and the file
+// under it must not start being copied.
+func projectPath(cwd, src string) (string, bool) {
+	real, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return "", false
+	}
+	root, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		root = cwd
+	}
+	rel, ok := relUnder(root, real)
+	if !ok {
+		return "", false
+	}
+	// The caller's own spelling already passes the lexical test, so keep it:
+	// a link that stays inside the project should still be the file the user
+	// pointed at, not its target.
+	if underCwd(cwd, src) {
+		return src, true
+	}
+	return filepath.Join(cwd, rel), true
 }
 
 func copyFile(src, dest string) error {
@@ -116,9 +161,16 @@ func attachPath(cwd, src string) (uploadInfo, error) {
 	if st.Size() > maxUpload {
 		return uploadInfo{}, fmt.Errorf("file too large (20MB)")
 	}
-	dest := abs
+	// Whether the file is already in the project decides whether pane
+	// hands the agent a link to it where it lies. That has to be the real
+	// answer, not the lexical one: a link inside the project pointing out
+	// of it would otherwise be passed along in place. Resolved, it fails
+	// the test and gets copied in, which is the safe outcome. Either way
+	// what comes back is spelled under cwd, since that is what the prompt
+	// builder gates on.
+	dest, inProject := projectPath(cwd, abs)
 	copied := false
-	if !underCwd(cwd, abs) {
+	if !inProject {
 		dest = uniquePath(cwd, filepath.Base(abs))
 		if err := copyFile(abs, dest); err != nil {
 			return uploadInfo{}, err
@@ -149,27 +201,70 @@ func writeUploadJSON(w http.ResponseWriter, info uploadInfo) {
 	_ = json.NewEncoder(w).Encode(info)
 }
 
-func handleUpload(w http.ResponseWriter, r *http.Request) {
+// noteUpload remembers a file pane copied into a project, so it can be
+// taken back out again later.
+func (p *proxy) noteUpload(path string) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	p.upMu.Lock()
+	defer p.upMu.Unlock()
+	if p.uploads == nil {
+		p.uploads = map[string]bool{}
+	}
+	if len(p.uploads) < 4096 {
+		p.uploads[abs] = true
+	}
+}
+
+// knownUpload reports whether this names a copy pane made, and returns the
+// path pane recorded. The recorded path is what gets removed: resolving
+// the caller's string again could land somewhere else entirely if a
+// symlink along the way has changed.
+func (p *proxy) knownUpload(path string) (string, bool) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false
+	}
+	p.upMu.Lock()
+	defer p.upMu.Unlock()
+	if !p.uploads[abs] {
+		return "", false
+	}
+	return abs, true
+}
+
+func (p *proxy) forgetUpload(path string) {
+	p.upMu.Lock()
+	defer p.upMu.Unlock()
+	delete(p.uploads, path)
+}
+
+func (p *proxy) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// Delete only ever takes back a copy pane itself made. The caller used
+	// to supply both the file and the directory it had to be under, and
+	// cwd=/ satisfies that for every path on the system — an arbitrary
+	// delete. It also means a file the user attached in place, which pane
+	// merely pointed at, is never removed.
 	if r.Method == http.MethodDelete {
-		cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
 		path := strings.TrimSpace(r.URL.Query().Get("path"))
-		if cwd == "" || path == "" {
+		if strings.TrimSpace(r.URL.Query().Get("cwd")) == "" || path == "" {
 			http.Error(w, "cwd and path required", http.StatusBadRequest)
 			return
 		}
-		abs, err := filepath.Abs(cwd)
-		if err != nil {
-			http.Error(w, "cwd", http.StatusBadRequest)
+		dest, ok := p.knownUpload(path)
+		if !ok {
+			http.Error(w, "not an upload", http.StatusBadRequest)
 			return
 		}
-		if !underCwd(abs, path) {
-			http.Error(w, "not in project", http.StatusBadRequest)
-			return
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// Keep the record until the file is really gone, so a failed
+		// delete can be retried instead of orphaning the copy.
+		if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		p.forgetUpload(dest)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -211,6 +306,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Only a copy is ours to delete later; a file attached where it
+		// already lived belongs to the user.
+		if info.Copied {
+			p.noteUpload(info.Path)
+		}
 		writeUploadJSON(w, info)
 		return
 	}
@@ -248,6 +348,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		head = head[:n]
 		_ = rf.Close()
 	}
+	p.noteUpload(dest)
 	writeUploadJSON(w, uploadInfo{
 		Name:   filepath.Base(dest),
 		Path:   dest,

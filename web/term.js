@@ -13,6 +13,10 @@
     return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
   }
 
+  function escapeText(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
   function renderMd(src) {
     var raw = String(src || '');
     var html;
@@ -22,15 +26,27 @@
       if (parse) {
         html = parse.call(lib, raw, { gfm: true, breaks: true });
       } else {
-        html = '<p>' + raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') + '</p>';
+        html = '<p>' + escapeText(raw).replace(/\n/g, '<br>') + '</p>';
       }
     } catch (e) {
-      html = '<p>' + raw.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</p>';
+      html = '<p>' + escapeText(raw) + '</p>';
     }
-    if (window.DOMPurify) {
-      return DOMPurify.sanitize(html, { USE_PROFILES: { html: true }, ADD_ATTR: ['target', 'rel'] });
+    // marked hands raw HTML straight through, so everything below is
+    // agent-authored markup rendered in the same document as the
+    // permission card. `style`/`class`/`id` would let it restyle or hide
+    // that card, and an `img` fetches an attacker URL the moment it
+    // renders — neither is worth any markdown feature we lose.
+    if (window.DOMPurify && DOMPurify.isSupported) {
+      return DOMPurify.sanitize(html, {
+        USE_PROFILES: { html: true },
+        ADD_ATTR: ['target', 'rel'],
+        FORBID_TAGS: ['style', 'form', 'input', 'button', 'img', 'base'],
+        FORBID_ATTR: ['style', 'class', 'id', 'srcset', 'src']
+      });
     }
-    return html;
+    // No usable sanitizer (asset dropped, or a WebView DOMPurify does not
+    // support): show the markdown as text rather than trust it.
+    return '<p>' + escapeText(raw).replace(/\n/g, '<br>') + '</p>';
   }
 
   function openExternal(href) {
@@ -47,23 +63,70 @@
     window.open(href, '_blank', 'noopener,noreferrer');
   }
 
+  // Schemes a click may hand to the operating system. DOMPurify lets more
+  // through (ftp, xmpp, cid, callto), but nothing on this side knows what
+  // to do with those; tel: and sms: are here because the mobile shells
+  // forward them and a phone number in agent markdown should still dial.
+  var externalSchemes = ['http:', 'https:', 'mailto:', 'tel:', 'sms:'];
+
   function isDesktop() {
     return !!(window.runtime || window.wails || (window.go && window.go.main));
   }
 
-  function fetchJSON(url, tries) {
+  function fetchJSON(url, tries, opts) {
     tries = tries == null ? 16 : tries;
-    return fetch(url).then(function (r) {
+    return authFetch(url, opts).then(function (r) {
       if (!r.ok) throw new Error(String(r.status));
       return r.json();
     }).catch(function (err) {
       if (tries <= 1) throw err;
       return new Promise(function (resolve, reject) {
         setTimeout(function () {
-          fetchJSON(url, tries - 1).then(resolve, reject);
+          fetchJSON(url, tries - 1, opts).then(resolve, reject);
         }, 400);
       });
     });
+  }
+
+  // The token pane put in the page, or the one the desktop app read off
+  // disk. Empty is normal for a remote pane reached over the tailnet,
+  // where Tailscale identity is the credential instead.
+  var paneToken = (function () {
+    try {
+      var m = document.querySelector('meta[name="pane-token"]');
+      return (m && m.content) || '';
+    } catch (e) { return ''; }
+  })();
+
+  function setPaneToken(t) {
+    paneToken = String(t || '');
+  }
+
+  // The token belongs to one pane: the one that served this page, or the
+  // local one the desktop app read it from. `?pane=` and the stored
+  // pane-url can point everything at another host, and handing this to a
+  // host of someone else's choosing would give away the credential.
+  function ownsToken(target) {
+    var u;
+    try { u = new URL(target, location.href); } catch (e) { return false; }
+    // Compare hosts, not origins: ws:// and http:// to the same server
+    // are the same pane, but URL.origin says otherwise.
+    if (u.host === location.host) return true;
+    if (!isDesktop()) return false;
+    var h = u.hostname;
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+  }
+
+  // Same-origin calls carry the token in a header; a WebSocket cannot set
+  // headers, so /ws takes it as a query parameter instead.
+  function authFetch(url, opts) {
+    opts = opts || {};
+    if (paneToken && ownsToken(url)) {
+      var h = opts.headers || {};
+      h['X-Pane-Token'] = paneToken;
+      opts.headers = h;
+    }
+    return fetch(url, opts);
   }
 
   function paneHTTP() {
@@ -92,6 +155,7 @@
     var effort = stored('pane-effort');
     if (model) u.searchParams.set('model', model);
     if (effort) u.searchParams.set('effort', effort);
+    if (paneToken && ownsToken(u.toString())) u.searchParams.set('t', paneToken);
     return u.toString();
   }
 
@@ -100,6 +164,9 @@
   }
   function store(k, v) {
     try { if (v) localStorage.setItem(k, v); } catch (e) {}
+  }
+  function forget(k) {
+    try { localStorage.removeItem(k); } catch (e) {}
   }
 
   var themeBtn = document.getElementById('theme');
@@ -141,10 +208,17 @@
 
   function setPickingProject(on) {
     pickingProject = !!on;
-    if (changeBtn) {
-      changeBtn.disabled = pickingProject;
-      changeBtn.setAttribute('aria-busy', pickingProject ? 'true' : 'false');
-    }
+    syncRailChrome();
+  }
+
+  // The rail refuses while a turn is running, so it has to look refused —
+  // a button that silently does nothing reads as a broken app.
+  function syncRailChrome() {
+    if (!changeBtn) return;
+    var locked = railLocked();
+    changeBtn.disabled = pickingProject || locked;
+    changeBtn.setAttribute('aria-busy', pickingProject ? 'true' : 'false');
+    changeBtn.title = locked ? 'Finish the current turn first' : 'Choose a different folder';
   }
 
   function paintTheme() {
@@ -226,6 +300,7 @@
     document.documentElement.dataset.busy = on ? 'true' : 'false';
     document.documentElement.setAttribute('aria-busy', on ? 'true' : 'false');
     syncSend();
+    syncRailChrome();
     refreshSessionRow(active);
     paintQueue();
   }
@@ -235,8 +310,15 @@
     syncBusyChrome();
   }
 
+  // `busy` covers both "a turn is running" and "the socket is down", but
+  // only the first is a reason to refuse: a tab whose pane went away must
+  // still be closable and must not pin the whole rail.
+  function turnInFlight(s) {
+    return !!(s && s.busy && s.live);
+  }
+
   function railLocked() {
-    return !!(active && active.busy);
+    return turnInFlight(active);
   }
 
   function grow() {
@@ -298,7 +380,7 @@
       s.title = val;
       s.named = true;
       if (id && cwd) {
-        fetch(paneHTTP() + '/v1/rename?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), {
+        authFetch(paneHTTP() + '/v1/rename?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title: val })
@@ -372,6 +454,10 @@
         inp.className = 'sess-edit';
         inp.value = s.title;
         inp.setAttribute('aria-label', 'Session name');
+        // Escape has to clear the paint key too, or the repaint below
+        // short-circuits on an unchanged key and the box stays up — and
+        // the blur it eventually gets would apply the cancelled name.
+        var cancelled = false;
         inp.addEventListener('keydown', function (e) {
           if (e.key === 'Enter') {
             e.preventDefault();
@@ -379,12 +465,17 @@
           }
           if (e.key === 'Escape') {
             e.preventDefault();
+            cancelled = true;
             renaming = null;
+            sessPaintKey = '';
             paintSessions();
           }
           e.stopPropagation();
         });
-        inp.addEventListener('blur', function () { commitRename(s, inp.value); });
+        inp.addEventListener('blur', function () {
+          if (cancelled) return;
+          commitRename(s, inp.value);
+        });
         row.appendChild(inp);
         sessionsEl.appendChild(row);
         setTimeout(function () {
@@ -430,6 +521,10 @@
       var row = document.createElement('div');
       row.className = 'sess-row';
       if (renaming && renaming.disk && renaming.id === h.id) {
+        // Hold the row being renamed: reading the module-level `renaming`
+        // from these handlers throws once Escape has cleared it.
+        var target = renaming;
+        var cancelled2 = false;
         var inp2 = document.createElement('input');
         inp2.type = 'text';
         inp2.className = 'sess-edit';
@@ -438,16 +533,21 @@
         inp2.addEventListener('keydown', function (e) {
           if (e.key === 'Enter') {
             e.preventDefault();
-            commitRename(renaming, inp2.value);
+            commitRename(target, inp2.value);
           }
           if (e.key === 'Escape') {
             e.preventDefault();
+            cancelled2 = true;
             renaming = null;
+            sessPaintKey = '';
             paintSessions();
           }
           e.stopPropagation();
         });
-        inp2.addEventListener('blur', function () { commitRename(renaming, inp2.value); });
+        inp2.addEventListener('blur', function () {
+          if (cancelled2) return;
+          commitRename(target, inp2.value);
+        });
         row.appendChild(inp2);
         sessionsEl.appendChild(row);
         setTimeout(function () {
@@ -508,6 +608,7 @@
     document.documentElement.dataset.busy = s.busy ? 'true' : 'false';
     document.documentElement.setAttribute('aria-busy', s.busy ? 'true' : 'false');
     syncSend();
+    syncRailChrome();
     paintQueue();
     paintCatalog();
     paintUsage();
@@ -525,9 +626,15 @@
     this.seenReady = false;
     this.dead = false;
     this.busy = true;
+    // `live` is the socket half of `busy`: true only between a ready
+    // handshake and the close that follows it.
+    this.live = false;
     this.statusText = 'connecting…';
     this.statusCls = '';
     this.reconnects = 0;
+    this.retry = 0;
+    this.handshakeSince = 0;
+    this.giveUp = false;
     this.startedReply = false;
     this.tools = {};
     this.ws = null;
@@ -549,6 +656,8 @@
     this.toolCount = 0;
     this.askEl = null;
     this.asking = false;
+    this.askKey = '';
+    this.warned = false;
     this.stick = true;
     this.el = document.createElement('div');
     this.el.className = 'log-slot';
@@ -727,6 +836,14 @@
     var s = this;
     var questions = (msg && msg.questions) || [];
     if (!questions.length) return;
+    var key;
+    try { key = JSON.stringify(questions); } catch (e) { key = String(questions.length); }
+    // The same question can arrive more than once for one tool call.
+    // Rebuilding the card would throw away an answer already given and
+    // wipe anything typed into the free-text box. The key is cleared at
+    // the start of every turn, so a repeat next turn still shows.
+    if (key === s.askKey && s.askEl && s.askEl.parentNode) return;
+    s.askKey = key;
     if (s.askEl && s.askEl.parentNode) {
       s.askEl.parentNode.removeChild(s.askEl);
     }
@@ -846,17 +963,25 @@
 
     function finish(answers, action) {
       if (!s.asking) return;
+      // Nothing was sent, so do not claim it was. Leave the card live so
+      // the answer can be given again once the socket is back.
+      if (!s.ws || s.ws.readyState !== 1) {
+        s.setChrome('disconnected — answer not sent', 'err');
+        return;
+      }
       s.asking = false;
+      // Answered. The server will not restate this question, so release
+      // the key: if the agent genuinely asks the same thing again later
+      // in the turn, that card must render.
+      s.askKey = '';
       wrap.classList.add('done');
       var buttons = wrap.querySelectorAll('button');
       for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
-      if (s.ws && s.ws.readyState === 1) {
-        s.ws.send(JSON.stringify({
-          type: 'ask',
-          action: action || 'accept',
-          answers: answers || []
-        }));
-      }
+      s.ws.send(JSON.stringify({
+        type: 'ask',
+        action: action || 'accept',
+        answers: answers || []
+      }));
       var note = document.createElement('div');
       note.className = 'ask-picked';
       if (action === 'skip') {
@@ -878,6 +1003,9 @@
     if (s.askEl && s.askEl.parentNode) {
       s.askEl.parentNode.removeChild(s.askEl);
     }
+    // askEl now points at a permission card, so the ask dedupe can no
+    // longer use it as evidence that the question is still on screen.
+    s.askKey = '';
     s.asking = true;
     var wrap = document.createElement('div');
     wrap.className = 'msg ask perm';
@@ -916,13 +1044,16 @@
 
     function finish(action) {
       if (!s.asking) return;
+      // An Allow that never left the browser must not read as "allowed".
+      if (!s.ws || s.ws.readyState !== 1) {
+        s.setChrome('disconnected — not sent', 'err');
+        return;
+      }
       s.asking = false;
       wrap.classList.add('done');
       var buttons = wrap.querySelectorAll('button');
       for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
-      if (s.ws && s.ws.readyState === 1) {
-        s.ws.send(JSON.stringify({ type: 'perm', action: action }));
-      }
+      s.ws.send(JSON.stringify({ type: 'perm', action: action }));
       var note = document.createElement('div');
       note.className = 'ask-picked';
       note.textContent = action === 'deny' ? 'denied' : 'allowed';
@@ -939,15 +1070,66 @@
     this.scroll();
   };
 
+  // Close out a card that can no longer be answered. The server forgets a
+  // pending request when its socket goes, so a reconnected tab must not
+  // leave buttons that would report "allowed" while sending nothing.
+  Session.prototype.retireAsk = function (note) {
+    if (!this.asking || !this.askEl) return;
+    this.asking = false;
+    this.askKey = '';
+    this.askEl.classList.add('done');
+    var buttons = this.askEl.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+    var el = document.createElement('div');
+    el.className = 'ask-picked';
+    el.textContent = note || 'expired';
+    this.askEl.appendChild(el);
+  };
+
+  // Shown once per session when the agent approves its own tool calls.
+  Session.prototype.addWarn = function (text) {
+    if (!text || this.warned) return;
+    this.warned = true;
+    var wrap = document.createElement('div');
+    wrap.className = 'msg warn';
+    wrap.textContent = text;
+    this.el.appendChild(wrap);
+    this.scroll();
+  };
+
   Session.prototype.setChrome = function (text, cls) {
     this.statusText = text;
     this.statusCls = cls || '';
     if (this === active) setStatus(text, cls);
   };
 
+  // How long a session keeps redialling through pre-ready errors before it
+  // stops and waits to be used again. An agent restart is the thing being
+  // ridden out, and it takes longer than a handful of dials.
+  var handshakeGraceMs = 60000;
+
+  // Whether a pre-ready error means the id we asked to resume is gone
+  // rather than the agent being briefly away. The wording comes from grok,
+  // so this looks for the two ideas together — a session, and it not being
+  // there — and treats anything else as worth another dial. Guessing wrong
+  // this way costs a retry; guessing wrong the other way loses the session.
+  var gonePhrase = /not found|no such|unknown|invalid|missing|does not exist|expired|corrupt/i;
+  var sessionWord = /session|conversation|thread/i;
+
+  function unloadableSession(text, id) {
+    var t = String(text || '');
+    if (!gonePhrase.test(t)) return false;
+    if (sessionWord.test(t)) return true;
+    return !!id && t.toLowerCase().indexOf(String(id).toLowerCase()) >= 0;
+  }
+
   Session.prototype.connect = function () {
     var s = this;
+    // A retry timer armed before shutdown() must not resurrect the tab.
+    if (s.dead) return;
+    s.retry = 0;
     s.busy = true;
+    s.live = false;
     if (s === active) setBusy(true);
     s.setChrome(s.reconnects ? 'reconnecting…' : 'connecting…');
     var replay = !!(s.resumeID && !s.seenReady);
@@ -958,10 +1140,14 @@
     ws.onclose = function () {
       if (s.dead || s.ws !== this) return;
       s.busy = true;
+      s.live = false;
       if (s === active) setBusy(true);
+      // The server already said why it could not open this session;
+      // leave that on screen instead of redialling into the same error.
+      if (s.giveUp) return;
       s.setChrome('disconnected', 'err');
       s.reconnects++;
-      setTimeout(function () { s.connect(); }, Math.min(8000, 400 * s.reconnects));
+      s.retry = setTimeout(function () { s.connect(); }, Math.min(8000, 400 * s.reconnects));
     };
     ws.onmessage = function (ev) {
       var msg;
@@ -969,19 +1155,33 @@
       if (foreignSession(s, msg)) return;
       switch (msg.type) {
         case 'ready':
+          // A reconnect is a new server-side session: whatever it was
+          // waiting on is gone, so an unanswered card cannot be answered.
+          if (s.seenReady) s.retireAsk('expired — reconnected');
           s.reconnects = 0;
+          s.handshakeSince = 0;
           s.seenReady = true;
+          s.live = true;
           s.id = msg.session || s.id;
           if (s.id) s.resumeID = s.id;
           if (msg.cwd) s.cwd = msg.cwd;
           if (s === active) paintCwd(s.cwd);
-          s.busy = false;
-          s.setChrome('ready', 'ok');
-          if (s === active) setBusy(false);
+          // Reattaching to a session that is still answering has to show
+          // Queue, not a Send that would race the turn. `busy` is the
+          // server's word for that; a server too old to send it leaves
+          // this undefined, which reads as idle exactly as it used to.
+          var midTurn = msg.busy === true;
+          s.busy = midTurn;
+          s.setChrome(midTurn ? 'working…' : 'ready', midTurn ? 'busy' : 'ok');
+          if (s === active) setBusy(midTurn);
           else paintSessions();
           applyCatalog(s, msg);
           if (s === active) paintCatalog();
           if (s.id && s.cwd) store('pane-last-sid:' + normPath(s.cwd), s.id);
+          // The server picks its own cwd when the query had none (?sid=,
+          // or a boot with no saved project). Without adopting it the
+          // composer has a live session and still refuses to send.
+          if (s.cwd && !project) setProject(s.cwd);
           refreshUsage(s);
           scheduleHistory(s.cwd);
           flushQueue(s);
@@ -1012,10 +1212,38 @@
         case 'err':
           s.addErr(msg.text || 'error');
           s.setChrome(msg.text || 'error', 'err');
+          // An error before ready means the handshake itself failed and
+          // the socket is about to close. Only an error that says this
+          // session cannot be loaded is a reason to stop asking for it —
+          // "no grok agent at …", "agent closed" and a failed dial all
+          // mean the agent is between lives, and dropping the id there
+          // would lose the session the user was sitting in.
+          if (!s.seenReady) {
+            if (s.resumeID && unloadableSession(msg.text, s.resumeID)) {
+              forget('pane-last-sid:' + normPath(s.cwd));
+              s.resumeID = '';
+              s.handshakeSince = 0;
+            } else {
+              if (!s.handshakeSince) s.handshakeSince = Date.now();
+              if (Date.now() - s.handshakeSince >= handshakeGraceMs) {
+                // The redial backs off to eight seconds, so counting
+                // attempts is a poor clock: this is a whole minute of the
+                // pane being unreachable, which outlasts an agent
+                // restart. Past it a red line every few seconds tells the
+                // user nothing new, and sending dials again.
+                s.giveUp = true;
+                s.setChrome((msg.text || 'error') + ' — send to retry', 'err');
+              }
+            }
+          }
+          break;
+        case 'warn':
+          s.addWarn(msg.text || '');
           break;
         case 'busy':
           s.busy = true;
           s.asking = false;
+          s.askKey = '';
           s.startedReply = false;
           s.tools = {};
           s.toolsBox = null;
@@ -1165,20 +1393,21 @@
       url += '&prune=1';
       if (keep.length) url += '&keep=' + keep.map(encodeURIComponent).join(',');
     }
-    fetchJSON(url)
+    // Pruning deletes sessions, so it goes out as a POST.
+    fetchJSON(url, null, opts.prune ? { method: 'POST' } : null)
       .then(function (list) {
         diskSessions = Array.isArray(list) ? list : [];
         sessPaintKey = '';
         applyGrokTitles(diskSessions);
         paintSessions();
-        if (opts.resume) resumeLatest(cwd, diskSessions);
+        if (opts.resume) resumeLatest(cwd, diskSessions, diskSessions.length < sessionListCap);
         loadProjects();
       })
       .catch(function () {
         diskSessions = [];
         sessPaintKey = '';
         paintSessions();
-        if (opts.resume) resumeLatest(cwd, []);
+        if (opts.resume) resumeLatest(cwd, [], false);
         var opened = sessions.some(function (s) { return !s.dead && samePath(s.cwd, cwd); });
         if (!opened) setStatus('pane not reachable', 'err');
         loadProjects();
@@ -1211,7 +1440,7 @@
       loadProjects();
       return;
     }
-    fetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(cwd), {
+    authFetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(cwd), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: val })
@@ -1261,6 +1490,9 @@
         inp.className = 'sess-edit';
         inp.value = p.name || projectLabel(p.cwd);
         inp.setAttribute('aria-label', 'Project name');
+        // The repaint waits on loadProjects()'s fetch, so a click landing
+        // in that window would otherwise blur-commit the cancelled name.
+        var cancelledProj = false;
         inp.addEventListener('keydown', function (e) {
           if (e.key === 'Enter') {
             e.preventDefault();
@@ -1268,12 +1500,16 @@
           }
           if (e.key === 'Escape') {
             e.preventDefault();
+            cancelledProj = true;
             renamingProject = null;
             loadProjects();
           }
           e.stopPropagation();
         });
-        inp.addEventListener('blur', function () { commitProjectRename(p.cwd, inp.value); });
+        inp.addEventListener('blur', function () {
+          if (cancelledProj) return;
+          commitProjectRename(p.cwd, inp.value);
+        });
         row.appendChild(inp);
         projectsEl.appendChild(row);
         setTimeout(function () {
@@ -1339,7 +1575,14 @@
     }, 600);
   }
 
-  function resumeLatest(cwd, list) {
+  // What /v1/sessions will return at most (history.go: listGrokSessions
+  // with a limit of 40). A response that hits the cap is a page, not a
+  // census: it is sorted by Updated, and a session grok has not written a
+  // summary for yet sorts last on an empty Updated, so the very session
+  // being resumed is the one a full page drops.
+  var sessionListCap = 40;
+
+  function resumeLatest(cwd, list, listComplete) {
     list = list || [];
     var lastSid = stored('pane-last-sid:' + normPath(cwd));
     var pick = null;
@@ -1352,7 +1595,12 @@
         }
       }
     }
-    if (!pick && lastSid) pick = { id: lastSid, cwd: cwd, title: lastSid };
+    // Only a list that is known complete can prove the stored id is gone:
+    // then it was deleted or pruned, and resuming it yields an error and a
+    // redial. A list that never arrived, or one long enough to have been
+    // truncated, proves nothing — keep the id and let the handshake say.
+    if (!pick && lastSid && !listComplete) pick = { id: lastSid, cwd: cwd, title: lastSid };
+    if (!pick && lastSid && listComplete) forget('pane-last-sid:' + normPath(cwd));
     if (!pick && list[0] && list[0].id) pick = list[0];
     if (pick && pick.id) {
       var existing = sessions.filter(function (s) {
@@ -1372,7 +1620,7 @@
 
   function loadRemote() {
     if (!remoteEl) return;
-    fetch(paneHTTP() + '/v1/remote-sessions')
+    authFetch(paneHTTP() + '/v1/remote-sessions')
       .then(function (r) { return r.ok ? r.json() : []; })
       .then(function (list) {
         remoteEl.textContent = '';
@@ -1500,8 +1748,10 @@
     if (!s) return;
     var i = sessions.indexOf(s);
     if (i >= 0) sessions.splice(i, 1);
-    if (s === active) active = null;
+    // shutdown() hands back the composer draft of the tab that is on
+    // screen, so it has to still be the active one while it runs.
     s.shutdown();
+    if (s === active) active = null;
     syncNewSession();
   }
 
@@ -1516,7 +1766,7 @@
         if (s.cwd === p.cwd) doomed.push(s);
       });
       doomed.forEach(dropTab);
-      fetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(p.cwd), { method: 'DELETE' })
+      authFetch(paneHTTP() + '/v1/projects?cwd=' + encodeURIComponent(p.cwd), { method: 'DELETE' })
         .then(function (r) {
           if (!r.ok) throw new Error('delete failed');
           setStatus('deleted project', 'ok');
@@ -1532,7 +1782,7 @@
             paintCwd('');
             loadProjects();
             if (!sessions.length) {
-              fetch(paneHTTP() + '/v1/projects')
+              authFetch(paneHTTP() + '/v1/projects')
                 .then(function (r) { return r.ok ? r.json() : []; })
                 .then(function (list) {
                   if (list && list[0] && list[0].cwd) setProject(list[0].cwd);
@@ -1574,7 +1824,7 @@
         loadHistory(cwd);
         return;
       }
-      fetch(paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), { method: 'DELETE' })
+      authFetch(paneHTTP() + '/v1/sessions?cwd=' + encodeURIComponent(cwd) + '&id=' + encodeURIComponent(id), { method: 'DELETE' })
         .then(function (r) {
           if (!r.ok) throw new Error('delete failed');
           setStatus('deleted', 'ok');
@@ -1589,17 +1839,45 @@
 
   Session.prototype.shutdown = function () {
     this.dead = true;
+    this.live = false;
+    // A pending reconnect outlives the tab otherwise: it would dial a new
+    // socket for a session the user just deleted, re-store its id, and
+    // flush the queue into it.
+    if (this.retry) {
+      clearTimeout(this.retry);
+      this.retry = 0;
+    }
     var w = this.ws;
     this.ws = null;
     if (w) {
       try { w.close(); } catch (e) {}
+    }
+    // This tab held the only reference to whatever its queued messages
+    // uploaded, so the copies in the project go with it.
+    var cwd = this.cwd;
+    (this.queue || []).forEach(function (item) {
+      releaseFiles(item && item.files, cwd);
+    });
+    this.queue = [];
+    // The composer is shared, but the draft in it belongs to the tab on
+    // screen and its attachments were already copied into that tab's
+    // project. Nothing else remembers them once the tab is gone.
+    if (this === active && pending.length) {
+      releaseFiles(pending, cwd);
+      pending = [];
+      paintChips();
+      syncSend();
     }
     if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
   };
 
   function closeSession(s) {
     s = s || active;
-    if (!s || s.busy) return;
+    if (!s) return;
+    if (turnInFlight(s)) {
+      setStatus('finish the current turn first', 'err');
+      return;
+    }
     var i = sessions.indexOf(s);
     if (i < 0) return;
     sessions.splice(i, 1);
@@ -1851,7 +2129,7 @@
       if (s === active) paintUsage();
       return;
     }
-    fetch(paneHTTP() + '/v1/usage?cwd=' + encodeURIComponent(s.cwd) + '&id=' + encodeURIComponent(s.id))
+    authFetch(paneHTTP() + '/v1/usage?cwd=' + encodeURIComponent(s.cwd) + '&id=' + encodeURIComponent(s.id))
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (u) {
         if (!u) return;
@@ -1925,7 +2203,8 @@
       x.textContent = '×';
       x.addEventListener('click', function () {
         if (!active) return;
-        active.queue.splice(i, 1);
+        var gone = active.queue.splice(i, 1)[0];
+        releaseFiles(gone && gone.files, active.cwd);
         paintQueue();
         paintSessions();
       });
@@ -2083,16 +2362,28 @@
   function send() {
     var has = !!(input.value.replace(/\s+$/, '') || pending.length);
     if (!has) return;
-    if (!project) {
+    // The live session's own cwd is what the message goes to; the global
+    // project can be empty for a session the server gave a cwd to, and
+    // refusing then leaves a ready tab that cannot send. Matches addFiles.
+    var cwd = (active && !active.dead && active.cwd) || project;
+    if (!cwd) {
       setStatus('open a project first', 'err');
       return;
     }
     if (!active || active.dead) {
-      newSession(project);
+      newSession(cwd);
     }
     if (!active || active.dead) {
       setStatus('no session', 'err');
       return;
+    }
+    // Trying to use a session that stopped dialling is the retry: the
+    // message queues and flushes as soon as the handshake lands.
+    if (active.giveUp) {
+      active.giveUp = false;
+      active.reconnects = 0;
+      active.handshakeSince = 0;
+      active.connect();
     }
     var item = snapshotComposer();
     rememberComposer(item.text);
@@ -2157,7 +2448,9 @@
       }
     }
     if (e.key !== 'Escape' || !active) return;
-    if (active.asking && active.askEl) {
+    // Only let Escape answer a card that can actually be answered;
+    // otherwise fall through so it can still cancel the turn.
+    if (active.asking && active.askEl && active.ws && active.ws.readyState === 1) {
       var skip = active.askEl.querySelector('.ask-skip');
       if (skip && !skip.disabled) skip.click();
       return;
@@ -2168,25 +2461,34 @@
       return;
     }
     if (!input.value.replace(/\s+$/, '') && active.queue.length) {
-      active.queue.pop();
+      var popped = active.queue.pop();
+      releaseFiles(popped && popped.files, active.cwd);
       paintQueue();
       paintSessions();
     }
   });
 
+  // Dropping an attachment anywhere — composer chip, queued message, or a
+  // whole tab — has to undo the upload: /v1/upload copied the file into
+  // the project, where an orphan can end up committed.
+  function releaseFiles(files, cwd) {
+    (files || []).forEach(function (f) {
+      if (!f) return;
+      if (f.preview) {
+        try { URL.revokeObjectURL(f.preview); } catch (e) {}
+      }
+      if (!f.copied || !f.path) return;
+      var dir = cwd || project;
+      if (!dir) return;
+      authFetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(dir) + '&path=' + encodeURIComponent(f.path), { method: 'DELETE' }).catch(function () {});
+    });
+  }
+
   function dropPending(i) {
     var f = pending[i];
     if (!f) return;
     pending.splice(i, 1);
-    if (f.preview) {
-      try { URL.revokeObjectURL(f.preview); } catch (e) {}
-    }
-    if (f.copied && f.path) {
-      var cwd = (active && active.cwd) || project;
-      if (cwd) {
-        fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd) + '&path=' + encodeURIComponent(f.path), { method: 'DELETE' }).catch(function () {});
-      }
-    }
+    releaseFiles([f], (active && active.cwd) || project);
     paintChips();
     syncSend();
   }
@@ -2244,7 +2546,7 @@
       }
       var fd = new FormData();
       fd.append('file', file, file.name || 'upload');
-      fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), { method: 'POST', body: fd })
+      authFetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), { method: 'POST', body: fd })
         .then(function (r) {
           if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.statusText); });
           return r.json();
@@ -2277,7 +2579,7 @@
       if (!p) return;
       var dup = pending.some(function (f) { return f.path === p || f.name === basename(p); });
       if (dup) return;
-      fetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), {
+      authFetch(paneHTTP() + '/v1/upload?cwd=' + encodeURIComponent(cwd), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: p })
@@ -2446,6 +2748,7 @@
     document.documentElement.dataset.busy = 'false';
     document.documentElement.setAttribute('aria-busy', 'false');
     syncSend();
+    syncRailChrome();
     paintQueue();
     paintCatalog();
     paintUsage();
@@ -2481,7 +2784,11 @@
   }
 
   function openProject() {
-    if (railLocked() || pickingProject) return;
+    if (railLocked()) {
+      setStatus('finish the current turn first', 'err');
+      return;
+    }
+    if (pickingProject) return;
     if (window.runtime && typeof window.runtime.EventsEmit === 'function') {
       setPickingProject(true);
       window.runtime.EventsEmit('request-open-project');
@@ -2658,15 +2965,60 @@
     else syncJump();
   });
 
+  function stripHash(href) {
+    var i = String(href).indexOf('#');
+    return i < 0 ? String(href) : String(href).slice(0, i);
+  }
+
+  // True only for a link that moves inside this document — the #anchor a
+  // markdown table of contents emits. Everything else, relative included,
+  // resolves to some other document.
+  function sameDocument(u) {
+    return !!(u && u.hash) && stripHash(u.href) === stripHash(location.href);
+  }
+
+  // An in-page anchor has to scroll, not open a window. renderMd strips
+  // `id`, so a heading usually answers to `name` instead; when nothing
+  // matches, the click is simply spent, which is still not a navigation.
+  function scrollToAnchor(hash) {
+    var id = String(hash || '').replace(/^#/, '');
+    try { id = decodeURIComponent(id); } catch (e) {}
+    if (!id) return;
+    var el = document.getElementById(id);
+    if (!el) {
+      var named = document.getElementsByName(id);
+      el = (named && named[0]) || null;
+    }
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'start' });
+  }
+
   document.addEventListener('click', function (e) {
     var t = e.target;
     var a = t && t.closest ? t.closest('a[href]') : null;
     if (!a) return;
     var href = a.getAttribute('href') || '';
-    if (!/^(https?:|mailto:)/i.test(href)) return;
+    var u = null;
+    try { u = new URL(href, location.href); } catch (err) { u = null; }
+    // Every anchor on this page came out of agent markdown, so the click
+    // is taken first and answered afterwards: letting the browser follow
+    // one would unload the app, cancelling every running turn, and could
+    // hit a pane endpoint that acts.
     e.preventDefault();
     e.stopPropagation();
-    openExternal(href);
+    if (!u) return;
+    if (sameDocument(u)) {
+      scrollToAnchor(u.hash);
+      return;
+    }
+    if (externalSchemes.indexOf(u.protocol) < 0) return;
+    // A same-origin URL that is not an in-page anchor is the navigation
+    // this guard exists to stop; handing it to openExternal would only
+    // move the same load into a second window aimed at the pane. Only the
+    // web schemes get this test — mailto: and friends report origin
+    // "null", which a page on a custom scheme would match.
+    var web = u.protocol === 'http:' || u.protocol === 'https:';
+    if (web && u.origin === location.origin) return;
+    openExternal(u.href);
   }, true);
 
   function boot() {
@@ -2713,6 +3065,20 @@
       }
       if (path) setProject(path);
     }
+    // The desktop app serves its own page, so there is no token in it.
+    // Ask the app for the local server's token before anything connects.
+    function withToken(done) {
+      var api = desktopAPI();
+      if (paneToken || !api || typeof api.PaneToken !== 'function') {
+        done();
+        return;
+      }
+      Promise.resolve(api.PaneToken()).then(function (t) {
+        setPaneToken(t);
+        done();
+      }).catch(function () { done(); });
+    }
+
     var api = desktopAPI();
     if (api && typeof api.PaneOrigin === 'function') {
       Promise.resolve(api.PaneOrigin()).then(function (o) {
@@ -2720,11 +3086,11 @@
           window.__paneOrigin = o;
           try { localStorage.setItem('pane-url', o); } catch (e) {}
         }
-        start();
-      }).catch(function () { start(); });
+        withToken(start);
+      }).catch(function () { withToken(start); });
       return;
     }
-    start();
+    withToken(start);
   }
   boot();
 

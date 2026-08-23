@@ -142,19 +142,66 @@ func TestListenerInfoAndKill(t *testing.T) {
 	if pid == "" {
 		t.Fatalf("expected listener pid, cmd=%q", cmd)
 	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same port, an address nothing is bound to: matching on the port alone
+	// would hand back the pid above and get it killed.
+	if p, _ := listenerInfo("127.0.0.2:" + port); p != "" {
+		t.Fatalf("foreign host matched by port: pid %s", p)
+	}
+	// A hostless bind is not an address; it used to fall back to pane's own
+	// UI port and kill the pane server.
+	if p, _ := listenerInfo(port); p != "" {
+		t.Fatalf("hostless bind matched: pid %s", p)
+	}
+	if err := killListener(port); err == nil {
+		t.Fatal("hostless bind must be refused, not guessed at")
+	}
 	if err := killListener(freeAddr(t)); err != nil {
 		t.Fatal(err)
 	}
 
 	root := moduleRoot(t)
-	helper := filepath.Join(t.TempDir(), "listen")
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "listen")
 	build := exec.Command("go", "build", "-o", helper, "./cmd/listen")
 	build.Dir = root
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build listen: %v\n%s", err, out)
 	}
 	addr := freeAddr(t)
-	proc := exec.Command(helper, addr)
+	proc := startListener(t, helper, addr)
+	if err := killListener(addr); err == nil {
+		t.Fatal("a stranger's process on the bind must not be killed")
+	}
+	if !tcpBusy(addr) {
+		t.Fatal("killed a process that is not a grok agent")
+	}
+	_ = proc.Process.Kill()
+	_ = proc.Wait()
+
+	// The same helper under a command line that reads as the grok agent — the
+	// one process pane may replace. cmd/listen takes the address first and
+	// ignores the rest.
+	agent := filepath.Join(dir, "grok")
+	if err := os.Rename(helper, agent); err != nil {
+		t.Fatal(err)
+	}
+	addr = freeAddr(t)
+	startListener(t, agent, addr, "agent", "serve")
+	if err := killListener(addr); err != nil {
+		t.Fatal(err)
+	}
+	if tcpBusy(addr) {
+		t.Fatal("still listening after kill")
+	}
+}
+
+func startListener(t *testing.T, bin, addr string, args ...string) *exec.Cmd {
+	t.Helper()
+	proc := exec.Command(bin, append([]string{addr}, args...)...)
 	if err := proc.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -167,11 +214,51 @@ func TestListenerInfoAndKill(t *testing.T) {
 	if err := waitTCP(addr, 3*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if err := killListener(addr); err != nil {
-		t.Fatal(err)
+	return proc
+}
+
+func TestIsGrokAgent(t *testing.T) {
+	ok := []string{
+		"/opt/homebrew/bin/grok agent serve --bind 127.0.0.1:2419 --secret s",
+		"grok --debug agent serve --bind 127.0.0.1:2419",
 	}
-	if tcpBusy(addr) {
-		t.Fatal("still listening after kill")
+	for _, cmd := range ok {
+		if !isGrokAgent(cmd) {
+			t.Fatalf("want grok agent: %s", cmd)
+		}
+	}
+	no := []string{
+		"",
+		"/usr/sbin/httpd -D FOREGROUND -f /etc/apache2/httpd.conf",
+		"/usr/local/bin/grok",
+		"grok sessions list --json",
+		"/usr/bin/notgrok agent serve --bind 127.0.0.1:2419",
+	}
+	for _, cmd := range no {
+		if isGrokAgent(cmd) {
+			t.Fatalf("must not pass as grok agent: %s", cmd)
+		}
+	}
+}
+
+func TestSameBindHost(t *testing.T) {
+	cases := []struct {
+		host, sock string
+		want       bool
+	}{
+		{"127.0.0.1", "127.0.0.1:2419", true},
+		{"127.0.0.1", "127.0.0.2:2419", false},
+		{"127.0.0.1", "*:2419", true},
+		{"0.0.0.0", "127.0.0.1:2419", true},
+		{"::1", "[::1]:2419", true},
+		{"::1", "[fe80::1]:2419", false},
+		{"box.local", "box.local:2419", true},
+		{"127.0.0.1", "nonsense", false},
+	}
+	for _, c := range cases {
+		if got := sameBindHost(c.host, c.sock); got != c.want {
+			t.Fatalf("sameBindHost(%q, %q) = %v", c.host, c.sock, got)
+		}
 	}
 }
 
@@ -192,7 +279,7 @@ func startAgentListener(t *testing.T, secret string) net.Listener {
 		}
 		_ = c.Close()
 	})}
-	go srv.Serve(ln)
+	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	return ln
 }

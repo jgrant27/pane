@@ -107,7 +107,23 @@ var (
 	rePlistShort = regexp.MustCompile(`(<key>CFBundleShortVersionString</key>\s*<string>)(\d+\.\d+\.\d+)(</string>)`)
 	rePlistBuild = regexp.MustCompile(`(<key>CFBundleVersion</key>\s*<string>)(\d+\.\d+\.\d+)(</string>)`)
 	reProxy      = regexp.MustCompile(`("name":\s*"grok-pane",\s*"title":\s*"Grok Pane",\s*"version":\s*")(\d+\.\d+\.\d+)(")`)
+	// the phone shells carry a plain integer build counter next to the marketing
+	// version: CFBundleVersion on iOS, versionCode on Android.
+	rePlistBuildCode = regexp.MustCompile(`(<key>CFBundleVersion</key>\s*<string>)(\d+)(</string>)`)
+	reGradleName     = regexp.MustCompile(`(versionName\s*=\s*")(\d+\.\d+\.\d+)(")`)
+	reGradleCode     = regexp.MustCompile(`(versionCode\s*=\s*)(\d+)`)
+	// Xcode build settings override the Info.plist they are built with, so
+	// stamping only the plist leaves the app reporting the older number.
+	reXcodeMarketing = regexp.MustCompile(`(MARKETING_VERSION = )(\d+\.\d+\.\d+)(;)`)
+	reXcodeBuild     = regexp.MustCompile(`(CURRENT_PROJECT_VERSION = )(\d+)(;)`)
 )
+
+// buildCode packs the version into one increasing integer. The stores reject an
+// upload whose counter did not climb, and deriving it from the version keeps it
+// monotone without a second piece of state to bump.
+func buildCode(v ver) string {
+	return strconv.Itoa(v.major*1_000_000 + v.minor*1_000 + v.patch)
+}
 
 func current(root string) ver {
 	var vs []ver
@@ -118,16 +134,24 @@ func current(root string) ver {
 	return maxVer(vs)
 }
 
+// replaceAll rewrites capture group sub of every match with next. A file that
+// the pattern does not match at all is the dangerous case: the stamp quietly
+// does not happen and the release ships carrying the previous version, which
+// looks exactly like a stamp that worked. So count the matches and refuse to
+// call zero of them a success. Matching but writing nothing is fine — that is
+// just a file already sitting at the version being stamped.
 func replaceAll(path string, re *regexp.Regexp, next string, sub int) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
+	hits := 0
 	out := re.ReplaceAllFunc(b, func(m []byte) []byte {
 		parts := re.FindSubmatch(m)
 		if len(parts) <= sub {
 			return m
 		}
+		hits++
 		var buf []byte
 		for i := 1; i < len(parts); i++ {
 			if i == sub {
@@ -138,6 +162,9 @@ func replaceAll(path string, re *regexp.Regexp, next string, sub int) error {
 		}
 		return buf
 	})
+	if hits == 0 {
+		return fmt.Errorf("%s: no version stamp matching %s", path, re)
+	}
 	if bytes.Equal(b, out) {
 		return nil
 	}
@@ -145,6 +172,10 @@ func replaceAll(path string, re *regexp.Regexp, next string, sub int) error {
 }
 
 func writeVersion(root, next string) error {
+	v, ok := parseVer(next)
+	if !ok {
+		return fmt.Errorf("bad version %q", next)
+	}
 	if err := os.WriteFile(filepath.Join(root, "VERSION"), []byte(next+"\n"), 0o644); err != nil {
 		return err
 	}
@@ -156,6 +187,28 @@ func writeVersion(root, next string) error {
 		return err
 	}
 	if err := replaceAll(plist, rePlistBuild, next, 2); err != nil {
+		return err
+	}
+	code := buildCode(v)
+	ios := filepath.Join(root, "mobile", "ios", "GrokPane", "Info.plist")
+	if err := replaceAll(ios, rePlistShort, next, 2); err != nil {
+		return err
+	}
+	if err := replaceAll(ios, rePlistBuildCode, code, 2); err != nil {
+		return err
+	}
+	pbx := filepath.Join(root, "mobile", "ios", "GrokPane.xcodeproj", "project.pbxproj")
+	if err := replaceAll(pbx, reXcodeMarketing, next, 2); err != nil {
+		return err
+	}
+	if err := replaceAll(pbx, reXcodeBuild, code, 2); err != nil {
+		return err
+	}
+	gradle := filepath.Join(root, "mobile", "android", "app", "build.gradle.kts")
+	if err := replaceAll(gradle, reGradleName, next, 2); err != nil {
+		return err
+	}
+	if err := replaceAll(gradle, reGradleCode, code, 2); err != nil {
 		return err
 	}
 	return replaceAll(filepath.Join(root, "proxy.go"), reProxy, next, 2)
