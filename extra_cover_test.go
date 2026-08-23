@@ -270,9 +270,10 @@ func TestDialAgentRefusedAndHTTPError(t *testing.T) {
 }
 
 func TestTailscaleMissingAndServeAgentStart(t *testing.T) {
-	old := lookPath
+	old, oldApp := lookPath, lookTailscaleApp
 	lookPath = func(string) (string, error) { return "", errors.New("no") }
-	t.Cleanup(func() { lookPath = old })
+	lookTailscaleApp = func() string { return "" }
+	t.Cleanup(func() { lookPath, lookTailscaleApp = old, oldApp })
 	err := servePane(paneCfg{
 		listen:    freeAddr(t),
 		cwd:       t.TempDir(),

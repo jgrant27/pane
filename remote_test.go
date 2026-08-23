@@ -105,9 +105,10 @@ func TestCachedRemoteSessionsCold(t *testing.T) {
 		remoteList, remoteAt, remoteRefreshing = prevList, prevAt, prevRef
 		remoteMu.Unlock()
 	})
-	oldPath := lookPath
+	oldPath, oldApp := lookPath, lookTailscaleApp
 	lookPath = func(string) (string, error) { return "", os.ErrNotExist }
-	t.Cleanup(func() { lookPath = oldPath })
+	lookTailscaleApp = func() string { return "" }
+	t.Cleanup(func() { lookPath, lookTailscaleApp = oldPath, oldApp })
 	got := cachedRemoteSessions()
 	if got == nil {
 		t.Fatal("nil")

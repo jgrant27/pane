@@ -26,7 +26,7 @@ import (
 
 type paneCfg struct {
 	listen, agent, agentBind, secret, cwd string
-	tailscale, noAgent, noOpen            bool
+	tailscale, local, noAgent, noOpen     bool
 	serveAgent, replaceAgent              bool
 }
 
@@ -36,6 +36,7 @@ func paneUsage(fs *flag.FlagSet) {
   pane
   pane -cwd ~/src/my-project
   pane -tailscale -cwd ~/src/my-project
+  pane -local
   pane -serve-agent
   pane -serve-agent -replace-agent
 
@@ -63,7 +64,8 @@ func parsePaneArgs(args []string) (paneCfg, error) {
 	fs.StringVar(&cfg.agentBind, "agent-bind", "127.0.0.1:2419", "bind for a spawned grok agent serve")
 	fs.StringVar(&cfg.secret, "secret", env("GROK_AGENT_SECRET", env("PANE_SECRET", "")), "agent server-key")
 	fs.StringVar(&cfg.cwd, "cwd", env("PANE_CWD", ""), "ACP working directory (default: $HOME)")
-	fs.BoolVar(&cfg.tailscale, "tailscale", false, "run `tailscale serve` in front and require Tailscale identity")
+	fs.BoolVar(&cfg.tailscale, "tailscale", false, "require Tailscale identity (403 loopback) and fail if serve cannot start")
+	fs.BoolVar(&cfg.local, "local", false, "loopback only — do not Tailscale-serve")
 	fs.BoolVar(&cfg.noAgent, "no-agent", false, "do not start grok agent serve; only connect")
 	fs.BoolVar(&cfg.noOpen, "no-open", false, "do not open a browser")
 	fs.BoolVar(&cfg.serveAgent, "serve-agent", false, "start or check grok agent serve, then exit (no HTTP UI)")
@@ -90,6 +92,9 @@ func run(args []string) error {
 	if cfg.replaceAgent && !cfg.serveAgent {
 		return fmt.Errorf("-replace-agent requires -serve-agent")
 	}
+	if cfg.local && cfg.tailscale {
+		return fmt.Errorf("-local and -tailscale conflict")
+	}
 	if cfg.serveAgent {
 		sec, err := resolveSecret(cfg.secret)
 		if err != nil {
@@ -108,12 +113,26 @@ func run(args []string) error {
 }
 
 var (
-	lookPath       = exec.LookPath
-	openBrowser    = openURL
-	tailscaleRun   = func(args ...string) error { return exec.Command("tailscale", args...).Run() }
-	tailscaleJSON  = func() ([]byte, error) { return exec.Command("tailscale", "status", "--json").Output() }
+	lookPath         = exec.LookPath
+	lookTailscaleApp = findTailscaleApp
+	openBrowser      = openURL
+	tailscaleRun     = func(args ...string) error {
+		bin, err := tailscaleExe()
+		if err != nil {
+			return err
+		}
+		return exec.Command(bin, args...).Run()
+	}
+	tailscaleJSON = func() ([]byte, error) {
+		bin, err := tailscaleExe()
+		if err != nil {
+			return nil, err
+		}
+		return exec.Command(bin, "status", "--json").Output()
+	}
 	grokReadyFor   = 8 * time.Second
 	listenReadyFor = 3 * time.Second
+	autoTailnet    = true
 	startGrok      = func(bind, secret string) (*exec.Cmd, error) {
 		cmd := exec.Command("grok", "agent", "serve", "--bind", bind, "--secret", secret)
 		cmd.Stdout = os.Stdout
@@ -201,7 +220,7 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 
 	h := http.Handler(withCORS(mux))
 	if cfg.tailscale {
-		if _, err := lookPath("tailscale"); err != nil {
+		if _, err := tailscaleExe(); err != nil {
 			return fmt.Errorf("tailscale not on PATH")
 		}
 		h = requireTailscale(h)
@@ -228,18 +247,37 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 	log.Printf("agent  %s/ws  cwd=%s", p.agentBase, cfg.cwd)
 
 	tsReset := false
-	if cfg.tailscale {
+	tsURL := ""
+	wantServe := cfg.tailscale || (autoTailnet && !cfg.local)
+	if wantServe && !cfg.tailscale {
+		if _, err := tailscaleExe(); err != nil || !tailscaleRunning() {
+			wantServe = false
+		}
+	}
+	if wantServe {
 		if err := tailscaleRun("serve", "--bg", listenPort(cfg.listen)); err != nil {
-			_ = srv.Close()
-			return fmt.Errorf("tailscale serve: %w", err)
+			if cfg.tailscale {
+				_ = srv.Close()
+				return fmt.Errorf("tailscale serve: %w", err)
+			}
+			log.Printf("tailscale serve skipped: %v", err)
+		} else {
+			tsReset = true
+			if dns := tailscaleDNS(); dns != "" {
+				tsURL = "https://" + dns + "/"
+				log.Printf("tailnet %s", tsURL)
+			}
+			if cfg.tailscale {
+				log.Printf("loopback is 403 unless the request comes through tailscale serve")
+			}
 		}
-		tsReset = true
-		if dns := tailscaleDNS(); dns != "" {
-			log.Printf("tailnet https://%s/", dns)
+	}
+	if !cfg.noOpen {
+		if tsURL != "" {
+			openBrowser(tsURL)
+		} else if !cfg.tailscale {
+			openBrowser(url)
 		}
-		log.Printf("loopback is 403 unless the request comes through tailscale serve")
-	} else if !cfg.noOpen {
-		openBrowser(url)
 	}
 
 	log.Printf("Ctrl-C to stop")
@@ -350,6 +388,45 @@ func listenPort(addr string) string {
 		return "7420"
 	}
 	return port
+}
+
+func findTailscaleApp() string {
+	cands := []string{"/Applications/Tailscale.app/Contents/MacOS/Tailscale"}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cands = append(cands, filepath.Join(home, "Applications/Tailscale.app/Contents/MacOS/Tailscale"))
+	}
+	for _, c := range cands {
+		st, err := os.Stat(c)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		return c
+	}
+	return ""
+}
+
+func tailscaleExe() (string, error) {
+	if p, err := lookPath("tailscale"); err == nil {
+		return p, nil
+	}
+	if p := lookTailscaleApp(); p != "" {
+		return p, nil
+	}
+	return "", fmt.Errorf("tailscale not on PATH")
+}
+
+func tailscaleRunning() bool {
+	out, err := tailscaleJSON()
+	if err != nil {
+		return false
+	}
+	var st struct {
+		BackendState string `json:"BackendState"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		return false
+	}
+	return st.BackendState == "Running"
 }
 
 func tailscaleDNS() string {

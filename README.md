@@ -92,8 +92,8 @@ On Linux you also need GTK + WebKit (`libgtk-3-dev` and `libwebkit2gtk-4.1-dev` 
 
 Native shells. They load your pane URL. The agent stays on the computer.
 
-1. On the machine with the project: `./pane -tailscale` (or use the LAN URL).
-2. In the phone app, paste that URL (`https://<host>.<tailnet>.ts.net`).
+1. On the machine with the project: `make remote` — installs Tailscale if needed, starts it, serves pane on the tailnet, and opens `https://<host>.<tailnet>.ts.net/` (the URL a phone browser uses). The shipped `pane` binary does this serve by default when Tailscale is up (`-local` to skip).
+2. On the phone: Tailscale app, same tailnet, then that URL in the browser or the Grok Pane app.
 
 ```bash
 make ios          # Xcode simulator
@@ -179,6 +179,7 @@ make run                  # pane on :7420
 make agent                # grok agent serve on :2419 (other terminal)
 make agent-restart        # :2419 already taken with a different secret
 make open                 # optional: open http://127.0.0.1:7420
+make remote               # Tailscale + remote URL (https://<host>.<tailnet>.ts.net/)
 make app                  # optional: desktop window
 ```
 
@@ -186,8 +187,8 @@ Or by hand:
 
 ```bash
 make
-./pane -no-open -no-agent
-./pane -no-open -no-agent -cwd ~/src/my-project
+./pane -no-open -no-agent -local
+./pane -no-open -no-agent -local -cwd ~/src/my-project
 ```
 
 Then open http://127.0.0.1:7420 yourself. Ctrl-C on `make run` stops pane. Ctrl-C on `make agent` stops the agent. An agent that was already running is left alone.
@@ -204,10 +205,11 @@ make run ARGS='-cwd .'
 On the **machine that has the project and Grok**:
 
 ```bash
-./pane -tailscale
+make remote
+./pane
 ```
 
-That keeps `pane` on `127.0.0.1:7420`, puts `tailscale serve` in front, and requires `Tailscale-User-Login`. Loopback hits get 403. The log prints `https://<host>.<tailnet>.ts.net/`.
+`pane` with no flags Tailscale-serves when Tailscale is running, keeps listening on `127.0.0.1:7420` (so the desktop app still works), and opens `https://<host>.<tailnet>.ts.net/`. `-tailscale` is the strict mode: identity gate, loopback 403. `-local` is loopback only.
 
 On a **laptop on the same tailnet**:
 
@@ -235,7 +237,8 @@ On a **laptop on the same tailnet**:
 | `-agent-bind` | `127.0.0.1:2419` | where to start the agent |
 | `-secret` | env / `~/.grok/pane.secret` | `server-key` |
 | `-cwd` | `$HOME` | default ACP working directory |
-| `-tailscale` | false | `tailscale serve` + identity gate |
+| `-tailscale` | false | strict: identity gate, fail if serve cannot start |
+| `-local` | false | loopback only — do not Tailscale-serve |
 | `-no-agent` | false | do not start the agent |
 | `-no-open` | false | do not open a browser |
 | `-serve-agent` | false | start/check the agent, then exit |

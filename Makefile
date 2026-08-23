@@ -12,13 +12,14 @@ ifeq ($(UNAME),Linux)
   endif
 endif
 
-.PHONY: all build install run agent agent-restart app open desktop desktop-app icon test clean deploy desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt ios android
+.PHONY: all build install run agent agent-restart app open remote desktop desktop-app icon test clean deploy desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt ios android
 
 # make run            pane on :7420 — no agent spawn, no browser tab
 # make agent          grok agent serve on :2419 (same secret as pane)
 # make agent-restart  replace whatever is already on :2419
 # make app            desktop window
 # make open           browser tab → http://127.0.0.1:7420
+# make remote         install/start Tailscale, serve pane, open the remote URL
 # make deploy         bump patch, commit, tag, push (BUMP=minor|major)
 # make ios            Grok Pane iOS app (simulator)
 # make android        print how to build the Android app
@@ -35,7 +36,7 @@ install: build
 	install -m 755 $(BIN) $(PREFIX)/bin/$(BIN)
 
 run: build
-	./$(BIN) -no-open -no-agent $(ARGS)
+	./$(BIN) -no-open -no-agent -local $(ARGS)
 
 agent: build
 	./$(BIN) -serve-agent
@@ -52,6 +53,61 @@ ifeq ($(UNAME),Darwin)
 else
 	xdg-open http://127.0.0.1:7420
 endif
+
+# Remote URL is https://<host>.<tailnet>.ts.net/ — never the public internet.
+TS_APP ?= /Applications/Tailscale.app/Contents/MacOS/Tailscale
+
+remote: build
+	@set -e; \
+	ts=$$(command -v tailscale 2>/dev/null || true); \
+	if [ -z "$$ts" ] && [ -x "$(TS_APP)" ]; then ts="$(TS_APP)"; fi; \
+	if [ -z "$$ts" ]; then \
+		echo "pane: installing Tailscale"; \
+		if [ "$(UNAME)" = Darwin ]; then \
+			command -v brew >/dev/null || { echo "pane: install Homebrew from https://brew.sh, then retry"; exit 1; }; \
+			brew install --cask tailscale; \
+			ts="$(TS_APP)"; \
+			[ -x "$$ts" ] || ts=$$(command -v tailscale); \
+		else \
+			curl -fsSL https://tailscale.com/install.sh | sh; \
+			ts=$$(command -v tailscale); \
+		fi; \
+	fi; \
+	if [ -z "$$ts" ] || [ ! -x "$$ts" ]; then echo "pane: tailscale not found"; exit 1; fi; \
+	export PATH="$$(dirname "$$ts"):$$PATH"; \
+	if [ "$(UNAME)" = Darwin ]; then open -a Tailscale 2>/dev/null || true; fi; \
+	json=$$("$$ts" status --json 2>/dev/null || true); \
+	state=$$(printf '%s' "$$json" | perl -ne 'print $$1 if /"BackendState":\s*"([^"]+)"/'); \
+	if [ "$$state" != "Running" ]; then \
+		echo "pane: starting Tailscale"; \
+		auth=$$(printf '%s' "$$json" | perl -ne 'print $$1 if /"AuthURL":\s*"([^"]+)"/'); \
+		if [ -n "$$auth" ]; then \
+			echo "pane: log in: $$auth"; \
+			if [ "$(UNAME)" = Darwin ]; then open "$$auth"; else xdg-open "$$auth" >/dev/null 2>&1 || true; fi; \
+		fi; \
+		"$$ts" up; \
+		i=0; \
+		while [ $$i -lt 40 ]; do \
+			json=$$("$$ts" status --json 2>/dev/null || true); \
+			state=$$(printf '%s' "$$json" | perl -ne 'print $$1 if /"BackendState":\s*"([^"]+)"/'); \
+			[ "$$state" = "Running" ] && break; \
+			i=$$((i+1)); \
+			sleep 0.25; \
+		done; \
+	fi; \
+	if [ "$$state" != "Running" ]; then echo "pane: Tailscale is $$state — finish login and retry"; exit 1; fi; \
+	dns=$$(printf '%s' "$$json" | perl -ne 'if (/"Self"/) { $$s=1 } if ($$s && /"DNSName":\s*"([^"]+)"/) { print $$1; last }'); \
+	dns=$${dns%.}; \
+	if [ -z "$$dns" ]; then echo "pane: no MagicDNS name yet"; exit 1; fi; \
+	url="https://$$dns/"; \
+	echo "pane: remote URL $$url"; \
+	if lsof -nP -iTCP:7420 -sTCP:LISTEN >/dev/null 2>&1; then \
+		"$$ts" serve --bg 7420; \
+		if [ "$(UNAME)" = Darwin ]; then open "$$url"; else xdg-open "$$url" >/dev/null 2>&1 || true; fi; \
+		echo "pane: already on :7420 — serving it on the tailnet"; \
+	else \
+		exec ./$(BIN) $(ARGS); \
+	fi
 
 icon:
 	go run ./cmd/mkicon desktop/build/appicon.png

@@ -125,7 +125,7 @@ func discoverRemoteSessions(budget time.Duration) []remoteSession {
 }
 
 func tailscalePeerList() []tsPeer {
-	if _, err := lookPath("tailscale"); err != nil {
+	if _, err := tailscaleExe(); err != nil {
 		return nil
 	}
 	out, err := tailscaleJSON()

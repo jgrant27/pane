@@ -30,7 +30,14 @@ func TestParsePaneArgs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.noOpen || !cfg.noAgent || cfg.listen != "127.0.0.1:9" {
+	if !cfg.noOpen || !cfg.noAgent || cfg.listen != "127.0.0.1:9" || cfg.tailscale || cfg.local {
+		t.Fatalf("%+v", cfg)
+	}
+	cfg, err = parsePaneArgs([]string{"-local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.local || cfg.tailscale {
 		t.Fatalf("%+v", cfg)
 	}
 	if _, err := parsePaneArgs([]string{"-not-a-flag"}); err == nil {
@@ -38,6 +45,12 @@ func TestParsePaneArgs(t *testing.T) {
 	}
 	if _, err := parsePaneArgs([]string{"-h"}); err == nil {
 		t.Fatal("expected help error")
+	}
+}
+
+func TestRunLocalAndTailscaleConflict(t *testing.T) {
+	if err := run([]string{"-local", "-tailscale", "-no-agent", "-no-open"}); err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("%v", err)
 	}
 }
 
@@ -168,6 +181,241 @@ func TestServePaneOpensBrowser(t *testing.T) {
 	<-errc
 	if got != "http://"+addr {
 		t.Fatalf("opened %q", got)
+	}
+}
+
+func TestServePaneAutoTailnetServesLoopback(t *testing.T) {
+	oldAuto := autoTailnet
+	autoTailnet = true
+	var ran [][]string
+	var got string
+	oldOpen, oldPath, oldRun, oldJSON := openBrowser, lookPath, tailscaleRun, tailscaleJSON
+	openBrowser = func(u string) { got = u }
+	lookPath = func(string) (string, error) { return "/bin/true", nil }
+	tailscaleRun = func(args ...string) error {
+		ran = append(ran, append([]string{}, args...))
+		return nil
+	}
+	tailscaleJSON = func() ([]byte, error) {
+		return []byte(`{"BackendState":"Running","Self":{"DNSName":"beelz.beluga-hydra.ts.net."}}`), nil
+	}
+	t.Cleanup(func() {
+		autoTailnet = oldAuto
+		openBrowser, lookPath, tailscaleRun, tailscaleJSON = oldOpen, oldPath, oldRun, oldJSON
+	})
+	addr := freeAddr(t)
+	stop := make(chan struct{})
+	errc := make(chan error, 1)
+	go func() {
+		errc <- servePane(paneCfg{
+			listen:  addr,
+			cwd:     t.TempDir(),
+			secret:  "x",
+			noAgent: true,
+		}, stop)
+	}()
+	if err := waitTCP(addr, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("loopback %d", res.StatusCode)
+	}
+	close(stop)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://beelz.beluga-hydra.ts.net/" {
+		t.Fatalf("remote URL %q", got)
+	}
+	if len(ran) < 2 || ran[0][0] != "serve" || ran[len(ran)-1][0] != "serve" {
+		t.Fatalf("tailscale cmds %+v", ran)
+	}
+}
+
+func TestServePaneAutoTailnetSkippedWhenDown(t *testing.T) {
+	oldAuto := autoTailnet
+	autoTailnet = true
+	var ran int
+	oldPath, oldRun, oldJSON := lookPath, tailscaleRun, tailscaleJSON
+	lookPath = func(string) (string, error) { return "/bin/true", nil }
+	tailscaleRun = func(args ...string) error {
+		ran++
+		return nil
+	}
+	tailscaleJSON = func() ([]byte, error) {
+		return []byte(`{"BackendState":"Stopped"}`), nil
+	}
+	t.Cleanup(func() {
+		autoTailnet = oldAuto
+		lookPath, tailscaleRun, tailscaleJSON = oldPath, oldRun, oldJSON
+	})
+	addr := freeAddr(t)
+	stop := make(chan struct{})
+	errc := make(chan error, 1)
+	go func() {
+		errc <- servePane(paneCfg{
+			listen:  addr,
+			cwd:     t.TempDir(),
+			secret:  "x",
+			noAgent: true,
+			noOpen:  true,
+		}, stop)
+	}()
+	if err := waitTCP(addr, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if ran != 0 {
+		t.Fatalf("served while Stopped: %d", ran)
+	}
+}
+
+func TestServePaneLocalSkipsAutoTailnet(t *testing.T) {
+	oldAuto := autoTailnet
+	autoTailnet = true
+	var ran int
+	oldPath, oldRun, oldJSON := lookPath, tailscaleRun, tailscaleJSON
+	lookPath = func(string) (string, error) { return "/bin/true", nil }
+	tailscaleRun = func(args ...string) error {
+		ran++
+		return nil
+	}
+	tailscaleJSON = func() ([]byte, error) {
+		return []byte(`{"BackendState":"Running","Self":{"DNSName":"h.ts.net."}}`), nil
+	}
+	t.Cleanup(func() {
+		autoTailnet = oldAuto
+		lookPath, tailscaleRun, tailscaleJSON = oldPath, oldRun, oldJSON
+	})
+	addr := freeAddr(t)
+	stop := make(chan struct{})
+	errc := make(chan error, 1)
+	go func() {
+		errc <- servePane(paneCfg{
+			listen:  addr,
+			cwd:     t.TempDir(),
+			secret:  "x",
+			noAgent: true,
+			noOpen:  true,
+			local:   true,
+		}, stop)
+	}()
+	if err := waitTCP(addr, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if ran != 0 {
+		t.Fatalf("local served: %d", ran)
+	}
+}
+
+func TestServePaneAutoTailnetServeErrorKeepsLocal(t *testing.T) {
+	oldAuto := autoTailnet
+	autoTailnet = true
+	oldPath, oldRun, oldJSON := lookPath, tailscaleRun, tailscaleJSON
+	lookPath = func(string) (string, error) { return "/bin/true", nil }
+	tailscaleRun = func(args ...string) error { return errors.New("serve down") }
+	tailscaleJSON = func() ([]byte, error) {
+		return []byte(`{"BackendState":"Running"}`), nil
+	}
+	t.Cleanup(func() {
+		autoTailnet = oldAuto
+		lookPath, tailscaleRun, tailscaleJSON = oldPath, oldRun, oldJSON
+	})
+	addr := freeAddr(t)
+	stop := make(chan struct{})
+	errc := make(chan error, 1)
+	go func() {
+		errc <- servePane(paneCfg{
+			listen:  addr,
+			cwd:     t.TempDir(),
+			secret:  "x",
+			noAgent: true,
+			noOpen:  true,
+		}, stop)
+	}()
+	if err := waitTCP(addr, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("loopback %d", res.StatusCode)
+	}
+	close(stop)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTailscaleRunning(t *testing.T) {
+	old := tailscaleJSON
+	t.Cleanup(func() { tailscaleJSON = old })
+	tailscaleJSON = func() ([]byte, error) { return nil, errors.New("no") }
+	if tailscaleRunning() {
+		t.Fatal("err")
+	}
+	tailscaleJSON = func() ([]byte, error) { return []byte(`not-json`), nil }
+	if tailscaleRunning() {
+		t.Fatal("junk")
+	}
+	tailscaleJSON = func() ([]byte, error) { return []byte(`{"BackendState":"Running"}`), nil }
+	if !tailscaleRunning() {
+		t.Fatal("running")
+	}
+	tailscaleJSON = func() ([]byte, error) { return []byte(`{"BackendState":"Stopped"}`), nil }
+	if tailscaleRunning() {
+		t.Fatal("stopped")
+	}
+}
+
+func TestServePaneTailscaleOpensPhoneURL(t *testing.T) {
+	var got string
+	oldOpen, oldPath, oldRun, oldJSON := openBrowser, lookPath, tailscaleRun, tailscaleJSON
+	openBrowser = func(u string) { got = u }
+	lookPath = func(string) (string, error) { return "/bin/true", nil }
+	tailscaleRun = func(args ...string) error { return nil }
+	tailscaleJSON = func() ([]byte, error) {
+		return []byte(`{"Self":{"DNSName":"beelz.beluga-hydra.ts.net."}}`), nil
+	}
+	t.Cleanup(func() {
+		openBrowser, lookPath, tailscaleRun, tailscaleJSON = oldOpen, oldPath, oldRun, oldJSON
+	})
+	addr := freeAddr(t)
+	stop := make(chan struct{})
+	errc := make(chan error, 1)
+	go func() {
+		errc <- servePane(paneCfg{
+			listen:    addr,
+			cwd:       t.TempDir(),
+			secret:    "x",
+			noAgent:   true,
+			tailscale: true,
+		}, stop)
+	}()
+	if err := waitTCP(addr, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://beelz.beluga-hydra.ts.net/" {
+		t.Fatalf("phone URL %q", got)
 	}
 }
 
