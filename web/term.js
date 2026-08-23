@@ -2727,4 +2727,86 @@
     start();
   }
   boot();
+
+  (function bindRailResize() {
+    var split = document.getElementById('rail-split');
+    var shell = document.getElementById('shell');
+    if (!split || !shell) return;
+    var minW = 220;
+    var maxW = 480;
+    var defW = 280;
+    var dragging = false;
+
+    function clamp(n) {
+      var cap = Math.min(maxW, Math.floor(window.innerWidth * 0.5));
+      if (!(cap >= minW)) cap = minW;
+      if (!(n >= minW)) return minW;
+      if (n > cap) return cap;
+      return n;
+    }
+    function current() {
+      return parseInt(getComputedStyle(document.documentElement).getPropertyValue('--rail-w'), 10) || defW;
+    }
+    function apply(n) {
+      n = clamp(Math.round(n));
+      document.documentElement.style.setProperty('--rail-w', n + 'px');
+      split.setAttribute('aria-valuenow', String(n));
+      return n;
+    }
+    function persist(n) {
+      store('pane-rail-w', String(n));
+    }
+    apply(parseInt(stored('pane-rail-w'), 10) || current());
+
+    function onMove(e) {
+      if (!dragging) return;
+      apply(e.clientX - shell.getBoundingClientRect().left);
+    }
+    function onUp() {
+      if (!dragging) return;
+      dragging = false;
+      document.body.classList.remove('rail-drag');
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      persist(current());
+    }
+    split.addEventListener('pointermove', onMove);
+    split.addEventListener('pointerup', onUp);
+    split.addEventListener('pointercancel', onUp);
+    split.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      dragging = true;
+      document.body.classList.add('rail-drag');
+      if (split.focus) split.focus();
+      if (split.setPointerCapture) {
+        try { split.setPointerCapture(e.pointerId); } catch (err) {}
+      }
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    });
+    split.addEventListener('dblclick', function () {
+      persist(apply(defW));
+    });
+    split.addEventListener('keydown', function (e) {
+      var cur = current();
+      var step = e.shiftKey ? 32 : 16;
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        persist(apply(cur - step));
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        persist(apply(cur + step));
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        persist(apply(minW));
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        persist(apply(maxW));
+      }
+    });
+    window.addEventListener('resize', function () {
+      apply(parseInt(stored('pane-rail-w'), 10) || current());
+    });
+  })();
 })();

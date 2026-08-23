@@ -34,6 +34,67 @@ func TestWorkspaceIsSiblingOfRail(t *testing.T) {
 	}
 }
 
+func TestRailIsResizable(t *testing.T) {
+	htmlBytes, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+	rail := strings.Index(html, `id="rail"`)
+	split := strings.Index(html, `id="rail-split"`)
+	asideEnd := strings.Index(html, `</aside>`)
+	if rail < 0 || split < 0 || asideEnd < 0 {
+		t.Fatal("missing #rail or #rail-split")
+	}
+	if !(rail < split && split < asideEnd) {
+		t.Fatal("rail-split must live inside #rail")
+	}
+	if !strings.Contains(html, "pane-rail-w") {
+		t.Fatal("index.html must restore rail width before paint")
+	}
+
+	cssBytes, err := FS.ReadFile("style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssBytes)
+	if strings.Contains(css, "248px") {
+		t.Fatal("default rail must be wider than 248px so the overlay scrollbar misses ×")
+	}
+	if !strings.Contains(css, "--rail-w: 280px") {
+		t.Fatal("default rail width is 280px")
+	}
+	if !strings.Contains(css, `grid-template-columns: var(--rail-w)`) {
+		t.Fatal("shell grid must size the rail from --rail-w")
+	}
+	if !strings.Contains(css, "#rail-split") {
+		t.Fatal("style.css must style the rail splitter")
+	}
+	lists := strings.Index(css, "#sessions, #remote, #projects")
+	if lists < 0 {
+		t.Fatal("expected shared overflow rule for rail lists")
+	}
+	block := css[lists:]
+	if j := strings.Index(block, "}"); j >= 0 {
+		block = block[:j]
+	}
+	if !strings.Contains(block, "padding-right") {
+		t.Fatal("project/session lists must pad the overlay scrollbar off the delete control")
+	}
+
+	jsBytes, err := FS.ReadFile("term.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(jsBytes)
+	if !strings.Contains(js, "function bindRailResize") {
+		t.Fatal("term.js must drag-resize the rail")
+	}
+	if !strings.Contains(js, "pane-rail-w") {
+		t.Fatal("rail width must persist")
+	}
+}
+
 func TestDesktopForcesWindowSize(t *testing.T) {
 	b, err := os.ReadFile("../desktop/main.go")
 	if err != nil {

@@ -11,11 +11,17 @@
       try { if (localStorage.getItem('pane-theme') === 'dark') t = 'dark'; } catch (e) {}
       document.documentElement.dataset.theme = t;
       document.querySelector('meta[name="color-scheme"]').content = t;
+      try {
+        var n = parseInt(localStorage.getItem('pane-rail-w') || '', 10);
+        if (n >= 220 && n <= 480) {
+          document.documentElement.style.setProperty('--rail-w', n + 'px');
+        }
+      } catch (e) {}
     })();
   </script>
   <link rel="icon" href="favicon.png">
   <link rel="preload" href="fonts/iosevka-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css?v=53">
+  <link rel="stylesheet" href="style.css?v=54">
 </head>
 <body>
   <div id="shell">
@@ -30,6 +36,7 @@
     <div id="sessions"></div>
     <div class="rail-label">Remote</div>
     <div id="remote"></div>
+    <div id="rail-split" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" aria-valuemin="220" aria-valuemax="480" aria-valuenow="280" tabindex="0"></div>
   </aside>
   <div id="workspace">
     <header>
@@ -92,6 +99,6 @@
   </div>
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="term.js?v=57"></script>
+  <script src="term.js?v=58"></script>
 </body>
 </html>
