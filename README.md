@@ -13,15 +13,7 @@ Two programs:
 | **`pane`** | Local server. Starts Grok’s agent if needed, proxies the session, serves the UI. |
 | **Grok Pane** | Native desktop app. Talks to `pane`. Sessions, history, transcript. |
 
-Light theme is the default.
-
-**Light**
-
-![Grok Pane — light theme](docs/screenshot.jpg)
-
-**Dark**
-
-![Grok Pane — dark theme](docs/screenshot-dark.jpg)
+![Grok Pane](docs/screenshot.jpg)
 
 ---
 
