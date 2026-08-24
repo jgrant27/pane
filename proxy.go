@@ -553,7 +553,8 @@ func (s *session) startFollow() {
 	}
 	stop := make(chan struct{})
 	s.followStop = stop
-	go s.followDisk(path, off, stop)
+	every, window := diskFollowEvery, diskTurnWindow
+	go s.followDisk(path, off, stop, every, window)
 }
 
 func (s *session) stopFollow() {
@@ -567,8 +568,7 @@ func (s *session) stopFollow() {
 	})
 }
 
-func (s *session) followDisk(path string, off int64, stop <-chan struct{}) {
-	every, window := diskFollowEvery, diskTurnWindow
+func (s *session) followDisk(path string, off int64, stop <-chan struct{}, every, window time.Duration) {
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	var rest []byte
