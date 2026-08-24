@@ -99,6 +99,61 @@ func TestRailIsResizable(t *testing.T) {
 	}
 }
 
+func TestYouMessagesSitOnTheRight(t *testing.T) {
+	cssBytes, err := FS.ReadFile("style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssBytes)
+	i := strings.Index(css, ".msg.you {")
+	if i < 0 {
+		t.Fatal("style.css must place your messages on the right")
+	}
+	block := css[i:]
+	if j := strings.Index(block, "}"); j >= 0 {
+		block = block[:j]
+	}
+	if !strings.Contains(block, "margin-left: auto") || !strings.Contains(block, "text-align: right") {
+		t.Fatal("your messages must sit on the right; grok stays on the left")
+	}
+}
+
+func TestPhoneBrowserOpensRailDrawer(t *testing.T) {
+	htmlBytes, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+	if !strings.Contains(html, `id="menu"`) || !strings.Contains(html, `id="rail-backdrop"`) {
+		t.Fatal("phone layout must have a Menu control and a rail backdrop")
+	}
+	cssBytes, err := FS.ReadFile("style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssBytes)
+	phone := css
+	if i := strings.Index(css, "@media (max-width: 900px)"); i >= 0 {
+		phone = css[i:]
+	} else {
+		t.Fatal("phone media query must overlay the rail, not hide it")
+	}
+	if strings.Contains(phone, `#rail { display: none`) {
+		t.Fatal("phone browser must keep the rail reachable")
+	}
+	if !strings.Contains(css, "html.rail-open #rail") {
+		t.Fatal("style.css must slide the rail in as a drawer")
+	}
+	jsBytes, err := FS.ReadFile("term.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(jsBytes)
+	if !strings.Contains(js, "function bindRailMenu") || !strings.Contains(js, "rail-open") {
+		t.Fatal("term.js must toggle the rail drawer")
+	}
+}
+
 func TestDesktopForcesWindowSize(t *testing.T) {
 	b, err := os.ReadFile("../desktop/main.go")
 	if err != nil {
