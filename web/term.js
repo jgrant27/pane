@@ -1024,25 +1024,44 @@
       wrap.appendChild(pre);
     }
     var actions = document.createElement('div');
-    actions.className = 'ask-actions';
-    var allow = document.createElement('button');
-    allow.type = 'button';
-    allow.className = 'ask-submit';
-    allow.textContent = 'Allow';
-    allow.addEventListener('click', function () { finish('allow'); });
-    var deny = document.createElement('button');
-    deny.type = 'button';
-    deny.className = 'ask-skip';
-    deny.textContent = 'Deny';
-    deny.addEventListener('click', function () { finish('deny'); });
-    actions.appendChild(allow);
-    actions.appendChild(deny);
+    var opts = (msg && msg.options) || [];
+    if (opts.length) {
+      actions.className = 'ask-opts';
+      opts.forEach(function (o, i) {
+        var id = o && (o.id || o.optionId);
+        var name = (o && o.name) || id;
+        if (!id || !name) return;
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ask-opt';
+        var lab = document.createElement('div');
+        lab.className = 'ask-label';
+        lab.textContent = (i + 1) + '. ' + name;
+        b.appendChild(lab);
+        b.addEventListener('click', function () { finish(id, name); });
+        actions.appendChild(b);
+      });
+    } else {
+      actions.className = 'ask-actions';
+      var allow = document.createElement('button');
+      allow.type = 'button';
+      allow.className = 'ask-submit';
+      allow.textContent = 'Allow';
+      allow.addEventListener('click', function () { finish('allow', 'allowed'); });
+      var deny = document.createElement('button');
+      deny.type = 'button';
+      deny.className = 'ask-skip';
+      deny.textContent = 'Deny';
+      deny.addEventListener('click', function () { finish('deny', 'denied'); });
+      actions.appendChild(allow);
+      actions.appendChild(deny);
+    }
     wrap.appendChild(actions);
     s.el.appendChild(wrap);
     s.askEl = wrap;
     s.scroll();
 
-    function finish(action) {
+    function finish(action, label) {
       if (!s.asking) return;
       // An Allow that never left the browser must not read as "allowed".
       if (!s.ws || s.ws.readyState !== 1) {
@@ -1056,7 +1075,11 @@
       s.ws.send(JSON.stringify({ type: 'perm', action: action }));
       var note = document.createElement('div');
       note.className = 'ask-picked';
-      note.textContent = action === 'deny' ? 'denied' : 'allowed';
+      var act = String(action || '');
+      if (label && label !== action) note.textContent = label;
+      else if (act === 'deny' || /reject/.test(act)) note.textContent = 'denied';
+      else if (/always/.test(act)) note.textContent = 'always-approve';
+      else note.textContent = 'allowed';
       wrap.appendChild(note);
       s.setChrome('working…', 'busy');
     }

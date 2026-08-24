@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +131,48 @@ func TestPermUnansweredNeverAllows(t *testing.T) {
 	kind, opt := outcome(t, sink.next(t))
 	if kind != "cancelled" || opt != "" {
 		t.Fatalf("abandoned card became %q/%q", kind, opt)
+	}
+}
+
+func TestPermAlwaysApproveIsARealChoice(t *testing.T) {
+	s, sink := permSession(t)
+	opts := []permChoice{
+		{ID: "allow_always", Kind: "allow_always", Name: "Yes, and don't ask again for anything (always-approve mode)"},
+		{ID: "allow_once", Kind: "allow_once", Name: "Yes, proceed"},
+		{ID: "reject_once", Kind: "reject_once", Name: "No, reject"},
+	}
+	s.offerPermOpts(json.RawMessage(`41`), "Execute `git commit`", "git commit", "allow_once", "reject_once", opts)
+	s.completePerm("allow_always")
+	if kind, opt := outcome(t, sink.next(t)); kind != "selected" || opt != "allow_always" {
+		t.Fatalf("always-approve picked %q/%q", kind, opt)
+	}
+
+	s.offerPermOpts(json.RawMessage(`42`), "Execute `git commit`", "git commit", "allow_once", "reject_once", opts)
+	s.completePerm("allow_once")
+	if kind, opt := outcome(t, sink.next(t)); kind != "selected" || opt != "allow_once" {
+		t.Fatalf("proceed picked %q/%q", kind, opt)
+	}
+}
+
+func TestHandshakeAsksEvenWhenConfigIsYolo(t *testing.T) {
+	b, err := os.ReadFile("proxy.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	i := strings.Index(src, `"yoloMode":`)
+	if i < 0 {
+		t.Fatal("pane must set yoloMode")
+	}
+	chunk := src[i:]
+	if len(chunk) > 48 {
+		chunk = chunk[:48]
+	}
+	if !strings.Contains(chunk, "false") {
+		t.Fatalf("pane must not enable yoloMode: %q", chunk)
+	}
+	if !strings.Contains(src, `"permissionMode": "default"`) {
+		t.Fatal("pane sessions must ask, even if ~/.grok/config.toml is always-approve")
 	}
 }
 

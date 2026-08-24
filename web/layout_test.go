@@ -231,6 +231,9 @@ func TestToolCallsUseDetails(t *testing.T) {
 	if !strings.Contains(src, "Session.prototype.addPerm") || !strings.Contains(src, "allow this?") {
 		t.Fatal("term.js must wait on execute permissions")
 	}
+	if !strings.Contains(src, "msg.options") {
+		t.Fatal("permission card must list the agent's options, including always-approve")
+	}
 	css, err := FS.ReadFile("style.css")
 	if err != nil {
 		t.Fatal(err)

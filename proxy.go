@@ -264,6 +264,13 @@ type session struct {
 	permID    json.RawMessage
 	permAllow string
 	permDeny  string
+	permOpts  []permChoice
+}
+
+type permChoice struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+	Name string `json:"name"`
 }
 
 const (
@@ -402,8 +409,9 @@ func (s *session) handshake() error {
 	}
 
 	meta := map[string]any{
-		"yoloMode": false,
-		"rules":    "You are reached through Grok Pane, a desktop face onto grok agent serve. Answer the user in the transcript. Do not narrate tool calls, status lines, or a tour of the working tree unless asked. No session chrome.",
+		"yoloMode":       false,
+		"permissionMode": "default",
+		"rules":          "You are reached through Grok Pane, a desktop face onto grok agent serve. Answer the user in the transcript. Do not narrate tool calls, status lines, or a tour of the working tree unless asked. No session chrome.",
 	}
 	params := map[string]any{
 		"cwd":        s.cwd,
@@ -1202,6 +1210,7 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte, mayAnswer bool
 	}
 	allow := pickPermOption(req.Params.Options, "allow_once", "allow_always", "allow")
 	deny := pickPermOption(req.Params.Options, "reject_once", "reject_always", "reject", "deny")
+	opts := permChoices(req.Params.Options)
 	if permissionAutoAllow(hint) || !rpcIDSet(id) {
 		if allow == "" && len(req.Params.Options) > 0 {
 			allow = req.Params.Options[0].OptionID
@@ -1215,7 +1224,7 @@ func (s *session) replyPermission(id json.RawMessage, raw []byte, mayAnswer bool
 	if hint.Command != "" && (title == "" || strings.EqualFold(title, "run_terminal_command")) {
 		title = "Execute `" + hint.Command + "`"
 	}
-	s.offerPerm(id, title, hint.Command, allow, deny)
+	s.offerPermOpts(id, title, hint.Command, allow, deny, opts)
 }
 
 // grok reports permission interactions here rather than as ACP updates.
@@ -1643,6 +1652,62 @@ func permissionAutoAllow(h permHint) bool {
 		return true
 	}
 	return false
+}
+
+func permChoices(opts []struct {
+	OptionID string `json:"optionId"`
+	Kind     string `json:"kind"`
+	Name     string `json:"name"`
+}) []permChoice {
+	out := make([]permChoice, 0, len(opts))
+	for _, o := range opts {
+		id := strings.TrimSpace(o.OptionID)
+		if id == "" {
+			continue
+		}
+		name := strings.TrimSpace(o.Name)
+		if name == "" {
+			name = permFallbackName(o.Kind, id)
+		}
+		out = append(out, permChoice{ID: id, Kind: o.Kind, Name: name})
+	}
+	return out
+}
+
+func permFallbackName(kind, id string) string {
+	k := strings.ToLower(strings.TrimSpace(kind) + " " + strings.TrimSpace(id))
+	switch {
+	case strings.Contains(k, "allow_always"):
+		return "Yes, and don't ask again for anything (always-approve mode)"
+	case strings.Contains(k, "allow_once"), strings.Contains(k, "allow"):
+		return "Yes, proceed"
+	case strings.Contains(k, "reject"), strings.Contains(k, "deny"):
+		return "No, reject"
+	}
+	if id != "" {
+		return id
+	}
+	return kind
+}
+
+func pickChosenPerm(action, allow, deny string, opts []permChoice) string {
+	a := strings.TrimSpace(action)
+	for _, o := range opts {
+		if o.ID == a || strings.EqualFold(o.Kind, a) {
+			return o.ID
+		}
+	}
+	if strings.EqualFold(a, "allow_always") {
+		for _, o := range opts {
+			if strings.EqualFold(o.Kind, "allow_always") || o.ID == "allow_always" {
+				return o.ID
+			}
+		}
+	}
+	if isDenyAction(a) {
+		return deny
+	}
+	return allow
 }
 
 func pickPermOption(opts []struct {
@@ -2094,6 +2159,10 @@ func (s *session) clearAsk() {
 }
 
 func (s *session) offerPerm(id json.RawMessage, title, command, allow, deny string) {
+	s.offerPermOpts(id, title, command, allow, deny, nil)
+}
+
+func (s *session) offerPermOpts(id json.RawMessage, title, command, allow, deny string, opts []permChoice) {
 	if !rpcIDSet(id) {
 		return
 	}
@@ -2110,6 +2179,7 @@ func (s *session) offerPerm(id json.RawMessage, title, command, allow, deny stri
 	s.permID = append(json.RawMessage(nil), id...)
 	s.permAllow = allow
 	s.permDeny = deny
+	s.permOpts = opts
 	s.mu.Unlock()
 	if rpcIDSet(supersede) {
 		s.writePermResult(supersede, supersedeDeny)
@@ -2117,11 +2187,15 @@ func (s *session) offerPerm(id json.RawMessage, title, command, allow, deny stri
 	if title == "" {
 		title = "run a command"
 	}
-	_ = s.toBrowser(map[string]any{
+	frame := map[string]any{
 		"type":    "perm",
 		"title":   title,
 		"command": command,
-	})
+	}
+	if len(opts) > 0 {
+		frame["options"] = opts
+	}
+	_ = s.toBrowser(frame)
 }
 
 func (s *session) completePerm(action string) {
@@ -2129,9 +2203,11 @@ func (s *session) completePerm(action string) {
 	id := s.permID
 	allow := s.permAllow
 	deny := s.permDeny
+	opts := s.permOpts
 	s.permID = nil
 	s.permAllow = ""
 	s.permDeny = ""
+	s.permOpts = nil
 	s.mu.Unlock()
 	if !rpcIDSet(id) {
 		return
@@ -2141,12 +2217,7 @@ func (s *session) completePerm(action string) {
 	// other tab's turn ending would otherwise reject the same request a
 	// second time, after it was allowed.
 	s.hub.forgetPerm(s, id)
-	if isDenyAction(action) {
-		// deny with no reject option cancels. It must never mean allow.
-		s.writePermResult(id, deny)
-		return
-	}
-	s.writePermResult(id, allow)
+	s.writePermResult(id, pickChosenPerm(action, allow, deny, opts))
 }
 
 // forgetPerm takes a card that has just been answered away from every other
@@ -2186,6 +2257,7 @@ func (s *session) dropPerm(id json.RawMessage) {
 		s.permID = nil
 		s.permAllow = ""
 		s.permDeny = ""
+		s.permOpts = nil
 	}
 	s.mu.Unlock()
 }
@@ -2218,6 +2290,7 @@ func (s *session) clearPerm() {
 	s.permID = nil
 	s.permAllow = ""
 	s.permDeny = ""
+	s.permOpts = nil
 	s.mu.Unlock()
 	s.writePermResult(id, deny)
 }
