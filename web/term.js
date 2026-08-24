@@ -725,6 +725,15 @@
       this.talked = true;
       syncNewSession();
     }
+    // Composer already painted this ask. Disk-tail and replay of the same
+    // user_message_chunk must not open a second bubble.
+    if (text && !(files && files.length)) {
+      var last = this.el.lastElementChild;
+      var prev = last && last.querySelector && last.querySelector('.body');
+      if (last && last.classList.contains('you') && prev && prev.textContent === String(text)) {
+        return;
+      }
+    }
     var wrap = document.createElement('div');
     wrap.className = 'msg you';
     var who = document.createElement('div');

@@ -852,6 +852,13 @@ func TestComposerAttachmentsDieWithTheirTab(t *testing.T) {
 	}
 }
 
+func TestAddYouDoesNotDoubleTheAsk(t *testing.T) {
+	fn := chunk(t, termJS(t), "Session.prototype.addYou", "Session.prototype.addOut")
+	if !strings.Contains(fn, "last.classList.contains('you')") || !strings.Contains(fn, "prev.textContent === String(text)") {
+		t.Fatal("addYou must skip a consecutive duplicate ask (composer echo + disk/replay)")
+	}
+}
+
 func TestReconnectMidTurnOffersQueue(t *testing.T) {
 	ready := chunk(t, termJS(t), "case 'ready':", "case 'you':")
 	if !strings.Contains(ready, "msg.busy === true") {

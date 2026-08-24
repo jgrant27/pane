@@ -656,7 +656,7 @@ func mergeableReplay(typ string) bool {
 	return typ == "you" || typ == "out" || typ == "thought"
 }
 
-func appendReplay(evs []replayEvent, typ, text string) []replayEvent {
+func appendReplay(evs []replayEvent, typ, text string, at int64) []replayEvent {
 	n := len(evs)
 	merge := n > 0 && evs[n-1].Type == typ && mergeableReplay(typ)
 	// Inside a message a whitespace-only chunk is real formatting — grok
@@ -669,9 +669,30 @@ func appendReplay(evs []replayEvent, typ, text string) []replayEvent {
 	}
 	if merge {
 		evs[n-1].Text += text
+		if evs[n-1].At == 0 {
+			evs[n-1].At = at
+		}
 		return evs
 	}
-	return append(evs, replayEvent{Type: typ, Text: text})
+	return append(evs, replayEvent{Type: typ, Text: text, At: at})
+}
+
+// unixMs turns grok's timestamp (seconds) or agentTimestampMs into
+// milliseconds. Prefer the millisecond field when it is present.
+func unixMs(sec, ms int64) int64 {
+	if ms > 0 {
+		if ms < 1e12 {
+			return ms * 1000
+		}
+		return ms
+	}
+	if sec <= 0 {
+		return 0
+	}
+	if sec < 1e12 {
+		return sec * 1000
+	}
+	return sec
 }
 
 func firstNonEmpty(ss ...string) string {
@@ -687,6 +708,7 @@ func firstNonEmpty(ss ...string) string {
 type replayEvent struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	At   int64  `json:"at,omitempty"`
 }
 
 func replayUpdates(cwd, id string, max int) []replayEvent {
@@ -770,6 +792,9 @@ func joinReplay(earlier, later []replayEvent) []replayEvent {
 	last := len(earlier) - 1
 	if earlier[last].Type == later[0].Type && mergeableReplay(earlier[last].Type) {
 		earlier[last].Text += later[0].Text
+		if earlier[last].At == 0 {
+			earlier[last].At = later[0].At
+		}
 		later = later[1:]
 	}
 	return append(earlier, later...)
@@ -798,11 +823,15 @@ func parseChatReplay(data []byte) []replayEvent {
 			continue
 		}
 		var row struct {
-			Params struct {
+			Timestamp int64 `json:"timestamp"`
+			Params    struct {
 				Update struct {
 					SessionUpdate string          `json:"sessionUpdate"`
 					Content       json.RawMessage `json:"content"`
 				} `json:"update"`
+				Meta struct {
+					AgentTimestampMs int64 `json:"agentTimestampMs"`
+				} `json:"_meta"`
 			} `json:"params"`
 		}
 		if json.Unmarshal(line, &row) != nil {
@@ -813,11 +842,12 @@ func parseChatReplay(data []byte) []replayEvent {
 		if text == "" {
 			continue
 		}
+		at := unixMs(row.Timestamp, row.Params.Meta.AgentTimestampMs)
 		switch kind {
 		case "user_message_chunk":
-			evs = appendReplay(evs, "you", text)
+			evs = appendReplay(evs, "you", text, at)
 		case "agent_message_chunk":
-			evs = appendReplay(evs, "out", text)
+			evs = appendReplay(evs, "out", text, at)
 		}
 	}
 	return evs

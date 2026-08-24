@@ -520,7 +520,11 @@ func (s *session) readyPayload() map[string]any {
 
 func (s *session) replayHistory() {
 	for _, ev := range replayUpdates(s.cwd, s.id, 20) {
-		_ = s.toBrowser(map[string]string{"type": ev.Type, "text": ev.Text})
+		frame := map[string]any{"type": ev.Type, "text": ev.Text}
+		if ev.At > 0 {
+			frame["at"] = ev.At
+		}
+		_ = s.toBrowser(frame)
 	}
 }
 

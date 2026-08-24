@@ -377,11 +377,34 @@ func TestReplayUpdatesTailPastHugeLine(t *testing.T) {
 	}
 }
 
+func TestUnixMs(t *testing.T) {
+	if unixMs(0, 0) != 0 {
+		t.Fatal("empty")
+	}
+	if got := unixMs(1787589039, 0); got != 1787589039000 {
+		t.Fatalf("seconds: %d", got)
+	}
+	if got := unixMs(0, 1787589039689); got != 1787589039689 {
+		t.Fatalf("already ms: %d", got)
+	}
+	if got := unixMs(1787589039, 1787589039689); got != 1787589039689 {
+		t.Fatalf("ms wins: %d", got)
+	}
+}
+
+func TestParseChatReplayKeepsTimestamp(t *testing.T) {
+	line := `{"timestamp":1787589039,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"continue"}},"_meta":{"agentTimestampMs":1787589039689}}}` + "\n"
+	evs := parseChatReplay([]byte(line))
+	if len(evs) != 1 || evs[0].Type != "you" || evs[0].Text != "continue" || evs[0].At != 1787589039689 {
+		t.Fatalf("%+v", evs)
+	}
+}
+
 func TestAppendReplay(t *testing.T) {
 	var evs []replayEvent
-	evs = appendReplay(evs, "you", "hel")
-	evs = appendReplay(evs, "you", "lo")
-	evs = appendReplay(evs, "out", "hi")
+	evs = appendReplay(evs, "you", "hel", 0)
+	evs = appendReplay(evs, "you", "lo", 0)
+	evs = appendReplay(evs, "out", "hi", 0)
 	if len(evs) != 2 || evs[0].Text != "hello" || evs[1].Text != "hi" {
 		t.Fatalf("%+v", evs)
 	}
@@ -390,22 +413,22 @@ func TestAppendReplay(t *testing.T) {
 func TestAppendReplayWhitespace(t *testing.T) {
 	// A bubble may not open on whitespace: that is the empty first bubble a
 	// resumed session used to show.
-	if evs := appendReplay(nil, "out", "\n"); len(evs) != 0 {
+	if evs := appendReplay(nil, "out", "\n", 0); len(evs) != 0 {
 		t.Fatalf("whitespace-only chunk started a bubble: %+v", evs)
 	}
-	if evs := appendReplay(nil, "out", " \t\n"); len(evs) != 0 {
+	if evs := appendReplay(nil, "out", " \t\n", 0); len(evs) != 0 {
 		t.Fatalf("whitespace-only chunk started a bubble: %+v", evs)
 	}
 	// Inside a message the same chunk is a paragraph break and must survive.
-	evs := appendReplay(nil, "out", "one")
-	evs = appendReplay(evs, "out", "\n\n")
-	evs = appendReplay(evs, "out", "two")
+	evs := appendReplay(nil, "out", "one", 0)
+	evs = appendReplay(evs, "out", "\n\n", 0)
+	evs = appendReplay(evs, "out", "two", 0)
 	if len(evs) != 1 || evs[0].Text != "one\n\ntwo" {
 		t.Fatalf("lost the blank line between paragraphs: %+v", evs)
 	}
 	// Types that never merge always open a bubble, so whitespace-only is
 	// dropped there too.
-	if evs := appendReplay([]replayEvent{{Type: "tool", Text: "x"}}, "tool", "  "); len(evs) != 1 {
+	if evs := appendReplay([]replayEvent{{Type: "tool", Text: "x"}}, "tool", "  ", 0); len(evs) != 1 {
 		t.Fatalf("%+v", evs)
 	}
 }
