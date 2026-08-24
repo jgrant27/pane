@@ -32,7 +32,7 @@ endif
 # make open           browser tab → http://127.0.0.1:7420
 # make remote         install/start Tailscale, serve pane, open the remote URL
 # make deploy         bump patch, commit, tag, push (BUMP=minor|major)
-# make ios            Grok Pane iOS app (simulator)
+# make ios            boot Simulator, install Grok Pane, load http://127.0.0.1:7420
 # make android        print how to build the Android app
 
 BUMP ?= patch
@@ -239,10 +239,59 @@ desktop-linux-arm64: qemu-binfmt
 	docker buildx build --builder pane --platform linux/arm64 -f ci/Dockerfile.linux \
 		--output type=local,dest=dist/linux-arm64 .
 
+# Simulator shares the Mac loopback. IOS_SIM / IOS_URL override the device and URL.
+IOS_SIM    ?= iPhone 17
+IOS_BUNDLE := com.jgrant27.grokpane
+IOS_DD     ?= .build/ios
+IOS_URL    ?= http://127.0.0.1:7420
+
 ios:
+	@set -e; \
+	if [ "$(UNAME)" != Darwin ]; then echo "pane: make ios is macOS-only"; exit 1; fi; \
+	if ! command -v xcrun >/dev/null || ! command -v xcodebuild >/dev/null; then \
+		echo "pane: Xcode command line tools required (xcodebuild)"; \
+		exit 1; \
+	fi; \
+	if ! lsof -nP -iTCP:7420 -sTCP:LISTEN >/dev/null 2>&1; then \
+		go build -o $(BIN) .; \
+		mkdir -p "$(IOS_DD)"; \
+		echo "pane: starting pane on :7420"; \
+		./$(BIN) -no-open >>"$(IOS_DD)/pane.log" 2>&1 & \
+		i=0; \
+		while [ $$i -lt 40 ]; do \
+			lsof -nP -iTCP:7420 -sTCP:LISTEN >/dev/null 2>&1 && break; \
+			i=$$((i+1)); \
+			sleep 0.25; \
+		done; \
+		if ! lsof -nP -iTCP:7420 -sTCP:LISTEN >/dev/null 2>&1; then \
+			echo "pane: did not bind :7420"; \
+			exit 1; \
+		fi; \
+	fi; \
+	list=$$(xcrun simctl list devices available); \
+	udid=$$(printf '%s\n' "$$list" | perl -ne 'if (/^\s+\Q$(IOS_SIM)\E \(([0-9A-Fa-f-]{36})\)/) { print $$1; exit }'); \
+	if [ -z "$$udid" ]; then \
+		udid=$$(printf '%s\n' "$$list" | perl -ne 'if (/^\s+iPhone .* \(([0-9A-Fa-f-]{36})\)/) { print $$1; exit }'); \
+	fi; \
+	if [ -z "$$udid" ]; then \
+		echo "pane: no iOS Simulator device (wanted $(IOS_SIM))"; \
+		printf '%s\n' "$$list"; \
+		exit 1; \
+	fi; \
+	echo "pane: simulator $(IOS_SIM) $$udid"; \
+	open -a Simulator; \
+	xcrun simctl bootstatus "$$udid" -b >/dev/null; \
+	mkdir -p "$(IOS_DD)"; \
 	xcodebuild -project mobile/ios/GrokPane.xcodeproj -scheme GrokPane \
-		-destination 'platform=iOS Simulator,name=iPhone 17' \
-		-configuration Debug CODE_SIGNING_ALLOWED=NO build
+		-destination "platform=iOS Simulator,id=$$udid" \
+		-derivedDataPath "$(IOS_DD)" \
+		-configuration Debug CODE_SIGNING_ALLOWED=NO build; \
+	app="$(IOS_DD)/Build/Products/Debug-iphonesimulator/GrokPane.app"; \
+	if [ ! -d "$$app" ]; then echo "pane: missing $$app"; exit 1; fi; \
+	xcrun simctl install "$$udid" "$$app"; \
+	xcrun simctl spawn "$$udid" defaults write $(IOS_BUNDLE) pane-url -string "$(IOS_URL)" || true; \
+	SIMCTL_CHILD_PANE_URL="$(IOS_URL)" xcrun simctl launch --terminate-running-process "$$udid" $(IOS_BUNDLE); \
+	echo "pane: launched Grok Pane → $(IOS_URL)"
 
 android:
 	@echo "Open mobile/android in Android Studio and Run."
@@ -250,4 +299,4 @@ android:
 
 clean:
 	rm -f $(BIN) $(APP)
-	rm -rf "Grok Pane.app" desktop/build/appicon.iconset dist
+	rm -rf "Grok Pane.app" desktop/build/appicon.iconset dist .build

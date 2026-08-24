@@ -390,10 +390,14 @@ func TestCopyFileExistsAndDeleteDir(t *testing.T) {
 }
 
 func TestHandleMetaDirect(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
 	p := &proxy{cwd: t.TempDir()}
 	rec := httptest.NewRecorder()
 	p.handleMeta(rec, httptest.NewRequest(http.MethodGet, "/meta", nil))
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Grok Pane") {
 		t.Fatal(rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"lastCwd"`) || !strings.Contains(rec.Body.String(), `"lastSid"`) {
+		t.Fatal("meta must name lastCwd and lastSid so a new client can resume")
 	}
 }

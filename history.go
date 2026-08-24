@@ -371,6 +371,23 @@ func scanGrokProjects(root string) []projectInfo {
 	return out
 }
 
+// lastGrok is the project and session grok last wrote to. A new client
+// (empty localStorage — iOS Simulator, a fresh browser) has no pane-project
+// of its own, and without this it boots pane's default cwd, which is HOME
+// and usually has no sessions.
+func lastGrok() (cwd, sid, title string) {
+	projs := listGrokProjects()
+	if len(projs) == 0 {
+		return "", "", ""
+	}
+	cwd = projs[0].Cwd
+	list := listGrokSessions(cwd, 1)
+	if len(list) == 0 {
+		return cwd, "", ""
+	}
+	return cwd, list[0].ID, list[0].Title
+}
+
 func deleteGrokProject(cwd string) error {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {

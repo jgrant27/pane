@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -787,6 +789,155 @@ func TestReadyTellsANewTabTheSessionIsBusy(t *testing.T) {
 
 	if _, ready = dialReadyFrame(t, u); ready["busy"] != true {
 		t.Fatalf("a tab joining mid-turn was told busy=%v", ready["busy"])
+	}
+}
+
+func plantSessionUpdates(t *testing.T, cwd, sid, body string, age time.Duration) string {
+	t.Helper()
+	dir := filepath.Join(sessionGroupDir(cwd), sid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "updates.jsonl")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().Add(-age)
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The TUI writes this session's updates.jsonl without going through pane's
+// hub. Connecting mid-TUI-turn used to come back idle.
+func TestReadyBusyWhenTUIIsWritingTheSession(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	secret, sid := "tui-busy", "01tuibusyxxxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	plantSessionUpdates(t, cwd, sid, "{}\n", 0)
+
+	var prompts atomic.Int32
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	_, ready := dialReadyFrame(t, u)
+	if ready["busy"] != true {
+		t.Fatalf("a TUI turn in progress reported busy=%v", ready["busy"])
+	}
+}
+
+func TestReadyIdleWhenSessionFileIsStale(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	secret, sid := "tui-idle", "01tuiidlexxxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+
+	var prompts atomic.Int32
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	_, ready := dialReadyFrame(t, u)
+	if ready["busy"] != false {
+		t.Fatalf("a stale session reported busy=%v", ready["busy"])
+	}
+}
+
+func TestFollowDiskAnnouncesAForeignTurn(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	secret, sid := "tui-follow", "01tuifollowxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	path := plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+
+	var prompts atomic.Int32
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	c, ready := dialReadyFrame(t, u)
+	if ready["busy"] != false {
+		t.Fatalf("stale file reported busy=%v", ready["busy"])
+	}
+	line := `{"method":"session/update","params":{"sessionId":"` + sid + `","update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"thinking"}}}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if got := waitFrame(t, c, "busy"); got == nil {
+		t.Fatal("a TUI write on disk must show working…")
+	}
+}
+
+func TestFollowDiskShowsTUIUserMessage(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	oldW, oldE := diskTurnWindow, diskFollowEvery
+	t.Cleanup(func() { diskTurnWindow, diskFollowEvery = oldW, oldE })
+	diskTurnWindow = time.Second
+	diskFollowEvery = 15 * time.Millisecond
+
+	secret, sid := "tui-you", "01tuiyouxxxxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	path := plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+
+	var prompts atomic.Int32
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	c, _ := dialReadyFrame(t, u)
+	line := `{"method":"session/update","params":{"sessionId":"` + sid + `","update":{"sessionUpdate":"user_message_chunk","content":{"text":"continue"}}}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	got := waitFrame(t, c, "you")
+	if got == nil || got["text"] != "continue" {
+		t.Fatalf("TUI ask must appear once, got %v", got)
+	}
+}
+
+func TestFollowDiskDoesNotEchoOurOwnAsk(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	oldW, oldE := diskTurnWindow, diskFollowEvery
+	t.Cleanup(func() { diskTurnWindow, diskFollowEvery = oldW, oldE })
+	diskTurnWindow = time.Second
+	diskFollowEvery = 15 * time.Millisecond
+
+	secret, sid := "own-you", "01ownyouxxxxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	path := plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+
+	var prompts atomic.Int32
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	c, _ := dialReadyFrame(t, u)
+	if err := c.WriteJSON(map[string]any{"type": "in", "text": "continue"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "our turn to start", func() bool { return prompts.Load() == 1 })
+	line := `{"method":"session/update","params":{"sessionId":"` + sid + `","update":{"sessionUpdate":"user_message_chunk","content":{"text":"continue"}}}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if got := waitFrame(t, c, "you"); got != nil {
+		t.Fatalf("pane already echoed the ask; disk tail sent another: %v", got)
 	}
 }
 

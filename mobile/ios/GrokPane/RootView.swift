@@ -1,13 +1,17 @@
 import SwiftUI
 
 struct RootView: View {
+    #if targetEnvironment(simulator)
+    @AppStorage("pane-url") private var urlString = "http://127.0.0.1:7420"
+    #else
     @AppStorage("pane-url") private var urlString = ""
+    #endif
     @State private var draft = ""
     @State private var askURL = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            if let url = PaneURL.parse(urlString) {
+            if let url = paneURL {
                 PaneWebView(url: url)
                     .ignoresSafeArea()
             } else {
@@ -39,6 +43,36 @@ struct RootView: View {
         } message: {
             Text("Tailscale or LAN address of pane. Examples: beelz.tailnet.ts.net or 192.168.1.5:7420")
         }
+        .onAppear { seedURL() }
+    }
+
+    /// Simulator shares the Mac loopback, so an empty URL still loads pane.
+    /// A device has no pane on itself — empty stays the connect prompt.
+    /// make ios sets PANE_URL via SIMCTL_CHILD_PANE_URL; that wins when present.
+    private var paneURL: URL? {
+        if let env = ProcessInfo.processInfo.environment["PANE_URL"], let u = PaneURL.parse(env) {
+            return u
+        }
+        if let u = PaneURL.parse(urlString) { return u }
+        #if targetEnvironment(simulator)
+        return URL(string: "http://127.0.0.1:7420")
+        #else
+        return nil
+        #endif
+    }
+
+    private func seedURL() {
+        if let env = ProcessInfo.processInfo.environment["PANE_URL"] {
+            let t = env.trimmingCharacters(in: .whitespacesAndNewlines)
+            if PaneURL.parse(t) != nil {
+                urlString = t
+                return
+            }
+        }
+        if PaneURL.parse(urlString) != nil { return }
+        #if targetEnvironment(simulator)
+        urlString = "http://127.0.0.1:7420"
+        #endif
     }
 
     private func beginEdit() {

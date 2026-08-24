@@ -592,9 +592,31 @@
     }
   }
 
+  function socketLive(s) {
+    var st = s && s.ws && s.ws.readyState;
+    return st === 0 || st === 1;
+  }
+
+  function ensureConnected(s) {
+    if (!s || s.dead) return;
+    if (socketLive(s)) return;
+    s.giveUp = false;
+    s.connect();
+  }
+
+  function kickReconnects() {
+    sessions.forEach(function (s) {
+      if (s.dead) return;
+      s.giveUp = false;
+      if (s.reconnects > 3) s.reconnects = 3;
+      ensureConnected(s);
+    });
+  }
+
   function activate(s) {
     if (!s) return;
     if (s === active) {
+      ensureConnected(s);
       input.focus();
       return;
     }
@@ -613,6 +635,7 @@
     paintCatalog();
     paintUsage();
     syncJump();
+    ensureConnected(s);
     input.focus();
   }
 
@@ -1150,7 +1173,15 @@
     var s = this;
     // A retry timer armed before shutdown() must not resurrect the tab.
     if (s.dead) return;
-    s.retry = 0;
+    if (s.retry) {
+      clearTimeout(s.retry);
+      s.retry = 0;
+    }
+    var prev = s.ws;
+    s.ws = null;
+    if (prev) {
+      try { prev.close(); } catch (e) {}
+    }
     s.busy = true;
     s.live = false;
     if (s === active) setBusy(true);
@@ -1241,10 +1272,19 @@
           // "no grok agent at …", "agent closed" and a failed dial all
           // mean the agent is between lives, and dropping the id there
           // would lose the session the user was sitting in.
+          var transient = /agent closed|no grok agent|not reachable|connection refused|socket error/i.test(msg.text || '');
+          if (s.seenReady && transient) {
+            s.giveUp = false;
+            if (s.ws && s.ws.readyState === 1) {
+              try { s.ws.close(); } catch (e) {}
+            }
+          }
           if (!s.seenReady) {
             if (s.resumeID && unloadableSession(msg.text, s.resumeID)) {
               forget('pane-last-sid:' + normPath(s.cwd));
               s.resumeID = '';
+              s.handshakeSince = 0;
+            } else if (transient) {
               s.handshakeSince = 0;
             } else {
               if (!s.handshakeSince) s.handshakeSince = Date.now();
@@ -1419,20 +1459,28 @@
     // Pruning deletes sessions, so it goes out as a POST.
     fetchJSON(url, null, opts.prune ? { method: 'POST' } : null)
       .then(function (list) {
+        if (project && !samePath(cwd, project)) return;
         diskSessions = Array.isArray(list) ? list : [];
         sessPaintKey = '';
         applyGrokTitles(diskSessions);
         paintSessions();
-        if (opts.resume) resumeLatest(cwd, diskSessions, diskSessions.length < sessionListCap);
+        if (opts.resume) {
+          resumeLatest(cwd, diskSessions, diskSessions.length < sessionListCap);
+          if (!liveSessionFor(cwd)) newSession(cwd);
+        }
         loadProjects();
       })
       .catch(function () {
+        if (project && !samePath(cwd, project)) return;
         diskSessions = [];
         sessPaintKey = '';
         paintSessions();
         if (opts.resume) resumeLatest(cwd, [], false);
         var opened = sessions.some(function (s) { return !s.dead && samePath(s.cwd, cwd); });
-        if (!opened) setStatus('pane not reachable', 'err');
+        if (!opened) {
+          if (opts.resume) newSession(cwd);
+          else setStatus('pane not reachable', 'err');
+        }
         loadProjects();
       });
   }
@@ -3065,6 +3113,15 @@
     function start() {
       fetchJSON(paneHTTP() + '/meta')
         .then(function (meta) {
+          // The phone is a window onto this pane, not its own last-project.
+          // URL/pending sid still wins; otherwise grok's last session does,
+          // including over this WebView's localStorage (a prior sim boot
+          // that landed on HOME or another project would otherwise stick).
+          if (!qCwd && !qSid && meta && meta.lastCwd) {
+            saved = meta.lastCwd;
+            if (meta.lastSid) qSid = meta.lastSid;
+            if (!qTitle && meta.lastTitle) qTitle = meta.lastTitle;
+          }
           if (!saved) saved = (meta && meta.cwd) || '';
           resumeBoot(saved);
         })
@@ -3238,4 +3295,10 @@
       syncViewport();
     }
   })();
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) kickReconnects();
+  });
+  window.addEventListener('online', kickReconnects);
+  window.addEventListener('pageshow', kickReconnects);
 })();

@@ -6,6 +6,7 @@
 /desktop/build/appicon.iconset
 /desktop/build/bin
 /dist
+/.build
 /cover.out
 xcuserdata/
 DerivedData/

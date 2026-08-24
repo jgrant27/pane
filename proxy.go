@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -74,12 +76,16 @@ func newAgentHub(conn *websocket.Conn) *agentHub {
 func (p *proxy) handleMeta(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	host, _ := os.Hostname()
+	lastCwd, lastSid, lastTitle := lastGrok()
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"name":   "Grok Pane",
-		"cwd":    p.cwd,
-		"listen": r.Host,
-		"host":   host,
-		"ts":     tailscaleDNS(),
+		"name":      "Grok Pane",
+		"cwd":       p.cwd,
+		"listen":    r.Host,
+		"host":      host,
+		"ts":        tailscaleDNS(),
+		"lastCwd":   lastCwd,
+		"lastSid":   lastSid,
+		"lastTitle": lastTitle,
 	})
 }
 
@@ -135,6 +141,7 @@ func (p *proxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	log.Printf("session %s cwd=%s model=%s effort=%s", s.id, s.cwd, s.model, s.effort)
 	s.live.Store(true)
 	_ = s.toBrowser(s.readyPayload())
+	s.startFollow()
 	s.loop()
 }
 
@@ -247,6 +254,11 @@ type session struct {
 	live     atomic.Bool
 	prompted atomic.Bool
 	autoWarn atomic.Bool
+	// Tailing grok's updates.jsonl so a TUI turn on this session shows as
+	// working… instead of an idle composer. followStop is closed from drop.
+	following  atomic.Bool
+	followStop chan struct{}
+	fOnce      sync.Once
 
 	// Permission interactions the agent announced, and the subset it
 	// actually asked us to decide. A resolve with no matching ask means
@@ -485,6 +497,10 @@ func (s *session) applyWantedModel() {
 }
 
 func (s *session) readyPayload() map[string]any {
+	busy := s.hub.turnActive(s.id) || diskTurnFresh(s.cwd, s.id)
+	if busy {
+		s.busy.Store(true)
+	}
 	return map[string]any{
 		"type":    "ready",
 		"cwd":     s.cwd,
@@ -495,8 +511,10 @@ func (s *session) readyPayload() map[string]any {
 		"models":  s.models,
 		// Whether the session is working, not whether this socket has ever
 		// prompted. A tab that reconnects mid-turn has never prompted
-		// anything itself and used to be handed an idle composer.
-		"busy": s.hub.turnActive(s.id),
+		// anything itself and used to be handed an idle composer. The TUI
+		// writes the same session's updates.jsonl without going through
+		// this hub, so disk freshness is the other half of the answer.
+		"busy": busy,
 	}
 }
 
@@ -504,6 +522,140 @@ func (s *session) replayHistory() {
 	for _, ev := range replayUpdates(s.cwd, s.id, 20) {
 		_ = s.toBrowser(map[string]string{"type": ev.Type, "text": ev.Text})
 	}
+}
+
+// How recently grok must have written updates.jsonl for the session to
+// count as working when this hub did not start the turn. The TUI streams
+// thoughts and tools at least this often; a longer gap is a finished turn.
+var diskTurnWindow = 3 * time.Second
+
+var diskFollowEvery = 250 * time.Millisecond
+
+func diskTurnFresh(cwd, id string) bool {
+	if cwd == "" || id == "" {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(sessionGroupDir(cwd), id, "updates.jsonl"))
+	if err != nil {
+		return false
+	}
+	return time.Since(st.ModTime()) < diskTurnWindow
+}
+
+func (s *session) startFollow() {
+	if s == nil || s.id == "" || s.cwd == "" {
+		return
+	}
+	path := filepath.Join(sessionGroupDir(s.cwd), s.id, "updates.jsonl")
+	var off int64
+	if st, err := os.Stat(path); err == nil {
+		off = st.Size()
+	}
+	stop := make(chan struct{})
+	s.followStop = stop
+	go s.followDisk(path, off, stop)
+}
+
+func (s *session) stopFollow() {
+	if s == nil {
+		return
+	}
+	s.fOnce.Do(func() {
+		if s.followStop != nil {
+			close(s.followStop)
+		}
+	})
+}
+
+func (s *session) followDisk(path string, off int64, stop <-chan struct{}) {
+	every, window := diskFollowEvery, diskTurnWindow
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	var rest []byte
+	announced := false
+	lastGrow := time.Time{}
+	if st, err := os.Stat(path); err == nil {
+		lastGrow = st.ModTime()
+		announced = time.Since(lastGrow) < window
+	}
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+			st, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			if st.Size() < off {
+				off = 0
+				rest = nil
+			}
+			if st.Size() > off {
+				f, err := os.Open(path)
+				if err != nil {
+					continue
+				}
+				_, err = f.Seek(off, io.SeekStart)
+				if err != nil {
+					f.Close()
+					continue
+				}
+				chunk, err := io.ReadAll(f)
+				f.Close()
+				if err != nil && len(chunk) == 0 {
+					continue
+				}
+				off += int64(len(chunk))
+				lastGrow = time.Now()
+				own := s.hub.turnActive(s.id)
+				if !own && !announced {
+					announced = true
+					s.busy.Store(true)
+					_ = s.toBrowser(map[string]string{"type": "busy", "session": s.id})
+				}
+				// This hub already streams our own turn over ACP. Replaying
+				// the same lines from disk double-echoes the ask (and the
+				// reply). Consume the bytes so they are not applied later.
+				if own {
+					rest = nil
+					continue
+				}
+				rest = append(rest, chunk...)
+				parts := bytes.Split(rest, []byte("\n"))
+				rest = parts[len(parts)-1]
+				s.following.Store(true)
+				for _, line := range parts[:len(parts)-1] {
+					s.applyDiskLine(line)
+				}
+				s.following.Store(false)
+			}
+			if announced && !s.hub.turnActive(s.id) && time.Since(lastGrow) >= window {
+				announced = false
+				if s.busy.CompareAndSwap(true, false) {
+					_ = s.toBrowser(map[string]string{"type": "idle", "session": s.id})
+				}
+			}
+		}
+	}
+}
+
+func (s *session) applyDiskLine(line []byte) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 {
+		return
+	}
+	var ev struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(line, &ev) != nil {
+		return
+	}
+	if ev.Method != "session/update" && ev.Method != "_x.ai/session/update" {
+		return
+	}
+	s.forwardUpdate(ev.Params)
 }
 
 func (s *session) loop() {
@@ -790,13 +942,17 @@ func (h *agentHub) drop(s *session) {
 	if h == nil || s == nil {
 		return
 	}
+	s.stopFollow()
 	// Answer anything this browser was still holding before letting it go.
 	// A closed tab is not an approval, and an unanswered id would leave
 	// the agent blocked on a reply that is never coming.
 	s.clearPerm()
 	s.clearAsk()
 	last := h.detach(s)
-	if last && s.busy.Load() && s.id != "" {
+	// Cancel only a turn this pane claimed. s.busy is also set when the
+	// TUI is writing the session on disk; cancelling that would kill the
+	// turn the user is watching in grok.
+	if last && h.turnActive(s.id) {
 		h.notify("session/cancel", map[string]any{"sessionId": s.id})
 	}
 }
@@ -1356,7 +1512,7 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	// "The user" is the ACP session, not this socket: a reconnected tab, or
 	// a second one, has never prompted anything itself, and used to discard
 	// the answer to a turn that was already running.
-	if s.resumeID != "" && !s.prompted.Load() && !s.busy.Load() && !s.hub.turnActive(s.id) && !askTool {
+	if s.resumeID != "" && !s.prompted.Load() && !s.busy.Load() && !s.hub.turnActive(s.id) && !askTool && !s.following.Load() {
 		return
 	}
 	text := contentText(u.Content)
@@ -1366,7 +1522,12 @@ func (s *session) forwardUpdate(params json.RawMessage) {
 	case "agent_thought_chunk":
 		_ = s.toBrowser(map[string]string{"type": "thought", "text": text, "session": s.id})
 	case "user_message_chunk":
-		// already echoed
+		// Pane already echoed what this socket typed. A TUI prompt on the
+		// same session arrives only via the file tail, and only when this
+		// hub did not start the turn — otherwise "continue" shows twice.
+		if s.following.Load() && text != "" && !s.hub.turnActive(s.id) {
+			_ = s.toBrowser(map[string]string{"type": "you", "text": text, "session": s.id})
+		}
 	case "tool_call", "tool_call_update":
 		// A finished ask tool is not a new question. Re-offering on the
 		// completion update deletes the answered card and puts an

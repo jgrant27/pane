@@ -651,10 +651,24 @@ func TestDropDoesNotCancelWhileAnotherTabWatches(t *testing.T) {
 	sink.quiet(t)
 
 	other.busy.Store(true)
+	if !h.claimTurn("s1") {
+		t.Fatal("the last tab must own the ACP turn it is about to cancel")
+	}
 	h.drop(other)
 	if m := sink.next(t); m["method"] != "session/cancel" {
 		t.Fatalf("the last tab leaving must cancel the turn, got %v", m)
 	}
+}
+
+// s.busy is also set when the TUI is writing this session. Dropping the
+// last pane tab must not session/cancel a turn pane never claimed.
+func TestDropDoesNotCancelAForeignTurn(t *testing.T) {
+	s, sink := permSession(t)
+	h := s.hub
+	h.attach("s1", s)
+	s.busy.Store(true)
+	h.drop(s)
+	sink.quiet(t)
 }
 
 // A model change the agent never completes must say so rather than leave

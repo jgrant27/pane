@@ -141,7 +141,7 @@ Native shells. They load your pane URL. The agent stays on the computer.
 2. On the phone: Tailscale app, same tailnet, then that URL in the browser or the Grok Pane app.
 
 ```bash
-make ios          # Xcode simulator
+make ios          # boot Simulator, load http://127.0.0.1:7420
 open mobile/ios/GrokPane.xcodeproj
 ```
 

@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSessionGroupDir(t *testing.T) {
@@ -521,6 +522,81 @@ func TestReplayUpdatesMergesAcrossChunkBoundary(t *testing.T) {
 	}
 	if want := 20_000 * 100; len(evs[1].Text) != want {
 		t.Fatalf("answer is %d bytes, want %d", len(evs[1].Text), want)
+	}
+}
+
+func TestDiskTurnFresh(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	cwd := t.TempDir()
+	sid := "01diskfreshxxxxxxxxxxxxxxxxx"
+	if diskTurnFresh(cwd, sid) || diskTurnFresh("", "") {
+		t.Fatal("missing updates.jsonl is not a live turn")
+	}
+	dir := filepath.Join(sessionGroupDir(cwd), sid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "updates.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !diskTurnFresh(cwd, sid) {
+		t.Fatal("a just-written updates.jsonl is a live turn")
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if diskTurnFresh(cwd, sid) {
+		t.Fatal("a stale updates.jsonl is not a live turn")
+	}
+}
+
+func TestLastGrokPicksNewestProjectAndSession(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	older := t.TempDir()
+	newer := t.TempDir()
+	plant := func(cwd, id, updated string) {
+		t.Helper()
+		dir := filepath.Join(sessionGroupDir(cwd), id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sum := []byte(`{"info":{"id":"` + id + `","cwd":"` + cwd + `"},"generated_title":"` + id + `","updated_at":"` + updated + `","num_messages":2}`)
+		if err := os.WriteFile(filepath.Join(dir, "summary.json"), sum, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plant(older, "01oldxxxxxxxxxxxxxxxxxxxxxx", "2026-08-01T00:00:00Z")
+	plant(newer, "01stalexxxxxxxxxxxxxxxxxxxx", "2026-08-10T00:00:00Z")
+	plant(newer, "01newxxxxxxxxxxxxxxxxxxxxxx", "2026-08-20T00:00:00Z")
+
+	cwd, sid, title := lastGrok()
+	if cwd != newer || sid != "01newxxxxxxxxxxxxxxxxxxxxxx" || title != "01newxxxxxxxxxxxxxxxxxxxxxx" {
+		t.Fatalf("lastGrok=%s %s %s, want newest session in %s", cwd, sid, title, newer)
+	}
+
+	home := t.TempDir()
+	p := &proxy{cwd: home}
+	rec := httptest.NewRecorder()
+	p.handleMeta(rec, httptest.NewRequest(http.MethodGet, "/meta", nil))
+	var meta map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta["cwd"] != home {
+		t.Fatalf("meta.cwd is pane's listen cwd, got %s", meta["cwd"])
+	}
+	if meta["lastCwd"] != newer || meta["lastSid"] != "01newxxxxxxxxxxxxxxxxxxxxxx" {
+		t.Fatalf("meta last=%s %s, want grok's newest not HOME", meta["lastCwd"], meta["lastSid"])
+	}
+}
+
+func TestLastGrokEmpty(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	cwd, sid, title := lastGrok()
+	if cwd != "" || sid != "" || title != "" {
+		t.Fatalf("empty grok home: %s %s %s", cwd, sid, title)
 	}
 }
 

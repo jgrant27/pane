@@ -230,6 +230,27 @@ func TestIOSDropsArbitraryLoads(t *testing.T) {
 
 // The Xcode build settings override the Info.plist in a real build, so a stale
 // MARKETING_VERSION ships an app that reports a version pane no longer is.
+// make ios and Xcode Run on the simulator must load pane, not the connect
+// prompt. A physical device still asks — there is no pane on the phone.
+func TestIOSSimulatorLoadsLoopbackPane(t *testing.T) {
+	sw := read(t, rootView)
+	want(t, sw, "if let url = paneURL {",
+		"the WebView must use paneURL so empty storage on the simulator still loads pane")
+	want(t, sw, `#if targetEnvironment(simulator)`,
+		"the loopback default is simulator-only; a device still asks")
+	want(t, sw, `@AppStorage("pane-url") private var urlString = "http://127.0.0.1:7420"`,
+		"first simulator launch must default to the host pane")
+	want(t, sw, `@AppStorage("pane-url") private var urlString = ""`,
+		"a device with no saved URL must still show the connect prompt")
+	want(t, sw, `return URL(string: "http://127.0.0.1:7420")`,
+		"paneURL must still resolve loopback when AppStorage is empty")
+	want(t, sw, `ProcessInfo.processInfo.environment["PANE_URL"]`,
+		"make ios passes PANE_URL through SIMCTL_CHILD_PANE_URL")
+	if !strings.Contains(sw, ".onAppear { seedURL() }") {
+		t.Error("seedURL must run on appear so an empty stored URL is filled")
+	}
+}
+
 func TestXcodeProjectMatchesTheStampedVersion(t *testing.T) {
 	version := strings.TrimSpace(read(t, versionFile))
 	plist := read(t, iosPlist)

@@ -287,6 +287,16 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "pane-last-sid:") {
 		t.Fatal("term.js must reopen the last session for the last project")
 	}
+	boot := chunk(t, src, "function boot()", "(function bindRailResize")
+	if !strings.Contains(boot, "if (!qCwd && !qSid && meta && meta.lastCwd)") {
+		t.Fatal("boot must resume grok's last session unless the URL named one")
+	}
+	if !strings.Contains(boot, "saved = meta.lastCwd") {
+		t.Fatal("boot must take lastCwd even when this WebView already stored a project")
+	}
+	if !strings.Contains(boot, "qSid = meta.lastSid") {
+		t.Fatal("boot must reopen grok's last session id, not mint a blank one")
+	}
 	if !strings.Contains(src, "function cycleSession") || !strings.Contains(src, "function cycleProject") {
 		t.Fatal("term.js must cycle sessions and projects from the keyboard")
 	}
@@ -325,6 +335,21 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	}
 	if !strings.Contains(src, "function liveSessionFor") || !strings.Contains(src, "function deactivateView") {
 		t.Fatal("switching projects must hide the other project's streaming transcript")
+	}
+	if !strings.Contains(src, "function ensureConnected") {
+		t.Fatal("switching projects must dial if that project's socket is down")
+	}
+	if !strings.Contains(src, "if (!liveSessionFor(cwd)) newSession(cwd)") {
+		t.Fatal("opening a project with no live tab must create a connection")
+	}
+	if !strings.Contains(src, "if (project && !samePath(cwd, project)) return") {
+		t.Fatal("a late history fetch must not clobber the project you just switched to")
+	}
+	if !strings.Contains(src, "function kickReconnects") || !strings.Contains(src, "visibilitychange") {
+		t.Fatal("the page must redial when it becomes visible after pane/agent restart")
+	}
+	if !strings.Contains(src, "clearTimeout(s.retry)") {
+		t.Fatal("connect must cancel a pending reconnect before dialing again")
 	}
 	if !strings.Contains(src, "function foreignSession") {
 		t.Fatal("a session socket must ignore agent chunks tagged for another session")

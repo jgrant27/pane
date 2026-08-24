@@ -63,6 +63,58 @@ func TestMakefileRemoteTarget(t *testing.T) {
 	}
 }
 
+func TestMakefileIOSLaunchesSimulator(t *testing.T) {
+	b, err := os.ReadFile("Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	i := strings.Index(src, "\nIOS_SIM")
+	if i < 0 {
+		i = strings.Index(src, "\nios:")
+	}
+	if i < 0 {
+		t.Fatal("Makefile must have an ios target")
+	}
+	recipe := src[i:]
+	if j := strings.Index(recipe[1:], "\nandroid:"); j >= 0 {
+		recipe = recipe[:j+1]
+	}
+	if !strings.Contains(recipe, "open -a Simulator") {
+		t.Fatal("ios must open Simulator.app")
+	}
+	if !strings.Contains(recipe, "simctl bootstatus") {
+		t.Fatal("ios must boot the simulator and wait until it is ready")
+	}
+	if !strings.Contains(recipe, "simctl install") {
+		t.Fatal("ios must install GrokPane on the simulator")
+	}
+	if !strings.Contains(recipe, "simctl launch --terminate-running-process") {
+		t.Fatal("ios must launch GrokPane, not stop at xcodebuild build")
+	}
+	if !strings.Contains(recipe, "Debug-iphonesimulator/GrokPane.app") {
+		t.Fatal("ios must install the built GrokPane.app")
+	}
+	if !strings.Contains(recipe, "SIMCTL_CHILD_PANE_URL=") {
+		t.Fatal("ios must pass PANE_URL into the sim via SIMCTL_CHILD_")
+	}
+	if !strings.Contains(recipe, "http://127.0.0.1:7420") {
+		t.Fatal("ios must load the host pane on loopback, not a connect prompt")
+	}
+	if !strings.Contains(recipe, "com.jgrant27.grokpane") {
+		t.Fatal("ios must launch the GrokPane bundle id")
+	}
+	if !strings.Contains(recipe, "lsof -nP -iTCP:7420") {
+		t.Fatal("ios must start pane when :7420 is free")
+	}
+	if !strings.Contains(recipe, "./$(BIN) -no-open") {
+		t.Fatal("ios must start pane with -no-open when :7420 is free")
+	}
+	if !strings.Contains(recipe, "derivedDataPath") {
+		t.Fatal("ios must pin derivedDataPath so install can find GrokPane.app")
+	}
+}
+
 func TestTailscaleExe(t *testing.T) {
 	oldPath, oldApp := lookPath, lookTailscaleApp
 	t.Cleanup(func() { lookPath, lookTailscaleApp = oldPath, oldApp })
