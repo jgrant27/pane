@@ -944,18 +944,16 @@ func TestFollowDiskDoesNotEchoOurOwnAsk(t *testing.T) {
 // waitFrame reads until a frame of the given type arrives.
 func waitFrame(t *testing.T, c *websocket.Conn, want string) map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
 		var msg map[string]any
 		if err := c.ReadJSON(&msg); err != nil {
-			continue
+			return nil
 		}
 		if msg["type"] == want {
 			return msg
 		}
 	}
-	return nil
 }
 
 // Two browsers on one session id must both see the turn. Routing used to be
