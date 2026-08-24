@@ -390,6 +390,12 @@ func TestUnixMs(t *testing.T) {
 	if got := unixMs(1787589039, 1787589039689); got != 1787589039689 {
 		t.Fatalf("ms wins: %d", got)
 	}
+	if got := unixMs(0, 1787589039); got != 1787589039000 {
+		t.Fatalf("small ms field is seconds: %d", got)
+	}
+	if got := unixMs(1787589039689, 0); got != 1787589039689 {
+		t.Fatalf("large sec field is already ms: %d", got)
+	}
 }
 
 func TestParseChatReplayKeepsTimestamp(t *testing.T) {

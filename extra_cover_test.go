@@ -143,12 +143,12 @@ func TestHandleWSReplay(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("GROK_HOME", root)
 	dir := t.TempDir()
-	sid := "01replayxxxxxxxxxxxxxxxxxxxxx"
+	sid := "01mocksessionxxxxxxxxxxxxxxxx"
 	sdir := filepath.Join(sessionGroupDir(dir), sid)
 	if err := os.MkdirAll(sdir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	line := `{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"old"}}}}` + "\n"
+	line := `{"timestamp":1787589039,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"old"}},"_meta":{"agentTimestampMs":1787589039689}}}` + "\n"
 	line += `{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"reply"}}}}` + "\n"
 	if err := os.WriteFile(filepath.Join(sdir, "updates.jsonl"), []byte(line), 0o644); err != nil {
 		t.Fatal(err)
@@ -165,11 +165,21 @@ func TestHandleWSReplay(t *testing.T) {
 	}
 	defer c.Close()
 	_ = c.SetReadDeadline(time.Now().Add(4 * time.Second))
-	var sawReady bool
+	var sawReady, sawYouAt bool
 	for i := 0; i < 8; i++ {
 		var msg map[string]any
 		if err := c.ReadJSON(&msg); err != nil {
 			break
+		}
+		if msg["type"] == "you" {
+			if msg["text"] != "old" {
+				t.Fatalf("replay you %v", msg)
+			}
+			at, ok := msg["at"].(float64)
+			if !ok || int64(at) != 1787589039689 {
+				t.Fatalf("replay you must carry at, got %v", msg)
+			}
+			sawYouAt = true
 		}
 		if msg["type"] == "ready" {
 			sawReady = true
@@ -178,6 +188,9 @@ func TestHandleWSReplay(t *testing.T) {
 	}
 	if !sawReady {
 		t.Fatal("no ready after replay")
+	}
+	if !sawYouAt {
+		t.Fatal("replay must send at so the bubble can show a clock time")
 	}
 }
 

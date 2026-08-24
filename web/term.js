@@ -345,6 +345,31 @@
     return /^01[0-9a-fA-F-]{20,}$/.test(String(s || ''));
   }
 
+  function fmtWhen(at) {
+    var ms = +at;
+    if (!ms) ms = Date.now();
+    var d = new Date(ms);
+    if (isNaN(d.getTime())) return '';
+    var t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    var today = new Date();
+    if (d.toDateString() === today.toDateString()) return t;
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' · ' + t;
+  }
+
+  function stampWho(who, label, at) {
+    var name = document.createElement('span');
+    name.textContent = label;
+    who.appendChild(name);
+    var text = fmtWhen(at);
+    if (!text) return;
+    var when = document.createElement('time');
+    when.className = 'when';
+    var ms = +at || Date.now();
+    try { when.dateTime = new Date(ms).toISOString(); } catch (e) {}
+    when.textContent = text;
+    who.appendChild(when);
+  }
+
   function paintCwd(path) {
     if (!path) {
       cwdEl.hidden = true;
@@ -716,7 +741,7 @@
     if (this === active) syncJump();
   };
 
-  Session.prototype.addYou = function (text, files) {
+  Session.prototype.addYou = function (text, files, at) {
     this.toolsBox = null;
     this.toolsList = null;
     this.toolsSum = null;
@@ -738,7 +763,7 @@
     wrap.className = 'msg you';
     var who = document.createElement('div');
     who.className = 'who';
-    who.textContent = 'you';
+    stampWho(who, 'you', at);
     wrap.appendChild(who);
     if (text) {
       var body = document.createElement('div');
@@ -773,14 +798,14 @@
     else syncJump();
   };
 
-  Session.prototype.addOut = function (text) {
+  Session.prototype.addOut = function (text, at) {
     if (!text) return;
     if (!this.agentEl) {
       var wrap = document.createElement('div');
       wrap.className = 'msg agent';
       var who = document.createElement('div');
       who.className = 'who';
-      who.textContent = 'grok';
+      stampWho(who, 'grok', at);
       var body = document.createElement('div');
       body.className = 'body md';
       wrap.appendChild(who);
@@ -1250,11 +1275,11 @@
           flushQueue(s);
           break;
         case 'you':
-          s.addYou(msg.text || '', msg.files || []);
+          s.addYou(msg.text || '', msg.files || [], msg.at);
           break;
         case 'out':
           if (!s.startedReply) s.startedReply = true;
-          s.addOut(msg.text || '');
+          s.addOut(msg.text || '', msg.at);
           break;
         case 'thought':
           s.addThought(msg.text || '');

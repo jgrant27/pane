@@ -416,11 +416,22 @@ header > button[aria-pressed="false"] {
 #jump-bottom[hidden] { display: none; }
 .msg { margin: 0 0 0.7rem; max-width: 46rem; }
 .msg .who {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
   color: var(--dim);
   font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: lowercase;
   margin-bottom: 0.12rem;
+}
+.msg.you .who { justify-content: flex-end; }
+.msg .when {
+  text-transform: none;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--dim);
 }
 .msg .body { font-size: 15px; line-height: 1.35; }
 .msg.you {

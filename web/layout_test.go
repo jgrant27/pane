@@ -852,6 +852,38 @@ func TestComposerAttachmentsDieWithTheirTab(t *testing.T) {
 	}
 }
 
+func TestMessagesShowLocalTime(t *testing.T) {
+	src := termJS(t)
+	if !strings.Contains(src, "function fmtWhen") || !strings.Contains(src, "function stampWho") {
+		t.Fatal("messages must format a local clock time")
+	}
+	if !strings.Contains(src, "toLocaleTimeString") {
+		t.Fatal("the stamp is wall-clock time, not a raw epoch")
+	}
+	if !strings.Contains(src, "stampWho(who, 'you', at)") || !strings.Contains(src, "stampWho(who, 'grok', at)") {
+		t.Fatal("both your bubbles and grok's must carry the time")
+	}
+	if !strings.Contains(src, "s.addYou(msg.text || '', msg.files || [], msg.at)") {
+		t.Fatal("replay/live you frames must pass at into the bubble")
+	}
+	if !strings.Contains(src, "s.addOut(msg.text || '', msg.at)") {
+		t.Fatal("replay/live grok frames must pass at into the bubble")
+	}
+	if !strings.Contains(src, "when.className = 'when'") || !strings.Contains(src, `createElement('time')`) {
+		t.Fatal("the stamp must be a visible <time class=\"when\">, not a title tooltip")
+	}
+	if !strings.Contains(src, "if (!ms) ms = Date.now()") {
+		t.Fatal("a live send with no at still gets a clock time")
+	}
+	css, err := FS.ReadFile("style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(css), ".msg .when") || !strings.Contains(string(css), "text-transform: none") {
+		t.Fatal("the time must not inherit who { text-transform: lowercase }")
+	}
+}
+
 func TestAddYouDoesNotDoubleTheAsk(t *testing.T) {
 	fn := chunk(t, termJS(t), "Session.prototype.addYou", "Session.prototype.addOut")
 	if !strings.Contains(fn, "last.classList.contains('you')") || !strings.Contains(fn, "prev.textContent === String(text)") {
