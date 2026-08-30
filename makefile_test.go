@@ -2,6 +2,9 @@ package main
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -13,19 +16,51 @@ func TestMain(m *testing.M) {
 
 // TestPaneStopDoesNotKillAgent is the gate for #57: pane stop used to
 // SIGTERM grok agent serve (and SIGHUP it as a child), so the next pane
-// minted another agent on :2419.
+// minted another agent on :2419. #61: Setpgid cannot live in main.go —
+// Windows does not have that field.
 func TestPaneStopDoesNotKillAgent(t *testing.T) {
-	b, err := os.ReadFile("main.go")
+	mainSrc := readFile(t, "main.go")
+	unixSrc := readFile(t, "agent_detach_unix.go")
+	winSrc := readFile(t, "agent_detach_windows.go")
+	if !strings.Contains(mainSrc, "detachAgent(cmd)") {
+		t.Fatal("startGrok must call detachAgent so pane exit does not take the agent")
+	}
+	if strings.Contains(mainSrc, "Setpgid:") {
+		t.Fatal("#61: Setpgid in main.go does not compile on Windows")
+	}
+	if !strings.Contains(unixSrc, "Setpgid: true") {
+		t.Fatal("unix detachAgent must Setpgid so stopping pane does not SIGHUP the agent")
+	}
+	if strings.Contains(winSrc, "Setpgid") {
+		t.Fatal("windows detachAgent must not reference Setpgid")
+	}
+	if strings.Count(mainSrc, "agentCmd.Process.Signal") != 1 {
+		t.Fatal("only a spawn that failed to bind may be killed; pane stop must leave grok agent serve")
+	}
+}
+
+// TestWindowsPaneCompiles is the #61 gate: PR #60 put Setpgid in main.go
+// and the Windows native job was the first compile that saw it.
+func TestWindowsPaneCompiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	out := filepath.Join(t.TempDir(), "pane.exe")
+	cmd := exec.Command("go", "build", "-o", out, ".")
+	cmd.Env = append(os.Environ(), "GOOS=windows", "CGO_ENABLED=0")
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("GOOS=windows go build: %v\n%s", err, b)
+	}
+}
+
+func readFile(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := string(b)
-	if !strings.Contains(src, "Setpgid: true") {
-		t.Fatal("startGrok must detach the agent so stopping pane does not SIGHUP it")
-	}
-	if strings.Count(src, "agentCmd.Process.Signal") != 1 {
-		t.Fatal("only a spawn that failed to bind may be killed; pane stop must leave grok agent serve")
-	}
+	return string(b)
 }
 
 func TestMakefileRemoteTarget(t *testing.T) {

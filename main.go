@@ -142,9 +142,8 @@ var (
 		cmd := exec.Command("grok", "agent", "serve", "--bind", bind, "--secret", secret)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		// #57: own process group so stopping pane does not SIGHUP the agent.
-		// The next pane reuses :2419 instead of minting another grok.
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		// #57 #61: Unix Setpgid lives in detachAgent; Windows is a no-op.
+		detachAgent(cmd)
 		if err := cmd.Start(); err != nil {
 			return nil, err
 		}
