@@ -4,6 +4,7 @@ import WebKit
 
 struct PaneWebView: UIViewRepresentable {
     let url: URL
+    var resumeToken: Int = 0
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -26,10 +27,18 @@ struct PaneWebView: UIViewRepresentable {
     func updateUIView(_ view: WKWebView, context: Context) {
         if view.url?.host != url.host || view.url?.scheme != url.scheme || view.url?.port != url.port {
             view.load(URLRequest(url: url))
+            return
+        }
+        // #58: WKWebView often keeps a WebSocket in OPEN after freeze.
+        // pageshow is what term.js uses to redial and replay the live tail.
+        if context.coordinator.lastResume != resumeToken {
+            context.coordinator.lastResume = resumeToken
+            view.evaluateJavaScript("window.dispatchEvent(new Event('pageshow'))", completionHandler: nil)
         }
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        var lastResume = 0
         /// WebKit blocks the page until a JS panel answers and traps if it answers
         /// twice, so every way out of a panel goes through one of these.
         private final class Once {

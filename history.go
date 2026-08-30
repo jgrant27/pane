@@ -371,11 +371,94 @@ func scanGrokProjects(root string) []projectInfo {
 	return out
 }
 
-// lastGrok is the project and session grok last wrote to. A new client
-// (empty localStorage — iOS Simulator, a fresh browser) has no pane-project
-// of its own, and without this it boots pane's default cwd, which is HOME
-// and usually has no sessions.
+type paneFocus struct {
+	Cwd   string `json:"cwd"`
+	Sid   string `json:"sid"`
+	Title string `json:"title"`
+}
+
+var focusMu sync.Mutex
+
+func paneLastPath() string {
+	return filepath.Join(grokHome(), "pane-last.json")
+}
+
+func rememberFocus(cwd, sid, title string) {
+	cwd = strings.TrimSpace(cwd)
+	sid = strings.TrimSpace(sid)
+	if cwd == "" || !validSessionID(sid) {
+		return
+	}
+	if abs, err := filepath.Abs(cwd); err == nil {
+		cwd = abs
+	}
+	focusMu.Lock()
+	defer focusMu.Unlock()
+	b, err := json.Marshal(paneFocus{Cwd: cwd, Sid: sid, Title: strings.TrimSpace(title)})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(paneLastPath(), b, 0o600)
+}
+
+func readFocus() (cwd, sid, title string) {
+	focusMu.Lock()
+	b, err := os.ReadFile(paneLastPath())
+	focusMu.Unlock()
+	if err != nil {
+		return "", "", ""
+	}
+	var f paneFocus
+	if json.Unmarshal(b, &f) != nil || f.Cwd == "" || !validSessionID(f.Sid) {
+		return "", "", ""
+	}
+	if st, err := os.Stat(f.Cwd); err != nil || !st.IsDir() {
+		return "", "", ""
+	}
+	dir, ok := sessionDir(f.Cwd, f.Sid)
+	if !ok {
+		return "", "", ""
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return "", "", ""
+	}
+	return f.Cwd, f.Sid, f.Title
+}
+
+func handleFocus(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		cwd, sid, title := lastGrok()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(paneFocus{Cwd: cwd, Sid: sid, Title: title})
+	case http.MethodPost:
+		var in paneFocus
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		rememberFocus(in.Cwd, in.Sid, in.Title)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// lastGrok is the project and session pane is looking at. #59: pane-last.json
+// is the shared focus (switch on desktop, phone follows). If that file is
+// missing or stale, fall back to grok's most recently written session.
 func lastGrok() (cwd, sid, title string) {
+	if cwd, sid, title = readFocus(); cwd != "" {
+		if title == "" {
+			for _, s := range listGrokSessions(cwd, 40) {
+				if s.ID == sid {
+					title = s.Title
+					break
+				}
+			}
+		}
+		return cwd, sid, title
+	}
 	projs := listGrokProjects()
 	if len(projs) == 0 {
 		return "", "", ""

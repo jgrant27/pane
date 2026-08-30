@@ -251,6 +251,22 @@ func TestIOSSimulatorLoadsLoopbackPane(t *testing.T) {
 	}
 }
 
+// TestIOSForegroundReplaysTheLiveTail is the iOS half of #58: WKWebView
+// keeps the socket OPEN after freeze, so foreground must fire pageshow
+// or term.js never redials.
+func TestIOSForegroundReplaysTheLiveTail(t *testing.T) {
+	sw := read(t, rootView)
+	want(t, sw, `@Environment(\.scenePhase) private var scenePhase`,
+		"the shell must see the app coming back to the foreground")
+	want(t, sw, "if phase == .active { resumeToken += 1 }",
+		"foreground must bump resumeToken so the WebView can redial")
+	want(t, sw, "PaneWebView(url: url, resumeToken: resumeToken)",
+		"the WebView must receive the foreground token")
+	pw := read(t, paneWebView)
+	want(t, pw, `evaluateJavaScript("window.dispatchEvent(new Event('pageshow'))"`,
+		"foreground must fire pageshow so term.js catch-up runs")
+}
+
 func TestXcodeProjectMatchesTheStampedVersion(t *testing.T) {
 	version := strings.TrimSpace(read(t, versionFile))
 	plist := read(t, iosPlist)

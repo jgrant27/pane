@@ -348,6 +348,34 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "function kickReconnects") || !strings.Contains(src, "visibilitychange") {
 		t.Fatal("the page must redial when it becomes visible after pane/agent restart")
 	}
+	// #59 shared focus: POST /v1/focus on switch; resume applies /meta lastCwd/lastSid.
+	kick := chunk(t, src, "function kickReconnects", "function activate")
+	if !strings.Contains(src, "function applyServerFocus") || !strings.Contains(src, "function reportFocus") {
+		t.Fatal("#59: clients must publish and follow the shared pane focus")
+	}
+	if !strings.Contains(src, "'/v1/focus'") {
+		t.Fatal("#59: switching sessions must POST /v1/focus so other clients can follow")
+	}
+	if !strings.Contains(kick, "applyServerFocus") {
+		t.Fatal("#59: resume must apply /meta lastCwd/lastSid, not stay on this WebView's tab")
+	}
+	// #58: iPhone resume left the socket OPEN and skipped replay after the first handshake.
+	redial := chunk(t, src, "function redialAll", "function kickReconnects")
+	if !strings.Contains(redial, "s.connect();") {
+		t.Fatal("#58: kickReconnects must redial, not trust a frozen OPEN socket")
+	}
+	if strings.Contains(redial, "ensureConnected(s)") {
+		t.Fatal("#58: ensureConnected skips OPEN sockets; iPhone resume reports OPEN after freeze")
+	}
+	if strings.Contains(src, "s.resumeID && !s.seenReady") {
+		t.Fatal("#58: reconnect must replay; gating on !seenReady leaves the phone on a stale paint")
+	}
+	if !strings.Contains(src, "var replay = !!s.resumeID") {
+		t.Fatal("#58: a session id on reconnect must request replay so the tail catches up")
+	}
+	if !strings.Contains(src, "Session.prototype.resetPaint") {
+		t.Fatal("#58: catch-up replay must replace the frozen transcript, not append a second copy")
+	}
 	if !strings.Contains(src, "clearTimeout(s.retry)") {
 		t.Fatal("connect must cancel a pending reconnect before dialing again")
 	}

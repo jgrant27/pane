@@ -138,7 +138,7 @@ On Linux you also need GTK + WebKit (`libgtk-3-dev` and `libwebkit2gtk-4.1-dev` 
 Native shells. They load your pane URL. The agent stays on the computer.
 
 1. On the machine with the project: `make remote` — installs Tailscale if needed, starts it, serves pane on the tailnet, and opens `https://<host>.<tailnet>.ts.net/` (the URL a phone browser uses). The shipped `pane` binary does this serve by default when Tailscale is up (`-local` to skip).
-2. On the phone: Tailscale app, same tailnet, then that URL in the browser or the Grok Pane app.
+2. On the phone: Tailscale app, same tailnet, then that URL in the browser or the Grok Pane app. It follows the session the desk is looking at. Unlocking the phone redials and replays the live tail — WKWebView otherwise keeps a dead OPEN socket and paints a frozen transcript.
 
 ```bash
 make ios          # boot Simulator, load http://127.0.0.1:7420
@@ -188,11 +188,11 @@ Linux desktop builds use Wails’ `webkit2_41` tag (Ubuntu 24.04 has WebKit 4.1,
 
 ## 4. Use it
 
-The app looks for `pane` on `http://127.0.0.1:7420`. If nothing is listening, it starts `pane` for you. `pane` starts `grok agent serve` on `:2419` if that port is free.
+The app looks for `pane` on `http://127.0.0.1:7420`. If nothing is listening, it starts `pane` for you. `pane` starts `grok agent serve` on `:2419` if that port is free. Stopping pane leaves that agent running; the next pane reuses it. `make agent-restart` is what replaces the agent.
 
 1. **Open a project** — File → Open Project (⌘O / Ctrl+O), or the **Open project** button. After a folder is chosen, the left rail shows its name. Click the name (or the path in the header) to copy it. **File → Show Project** (⇧⌘O) opens the folder in Finder / Explorer / your file manager. **Change project…** switches trees.
 2. **Talk** — type in the box at the bottom. **Enter** sends, **Shift+Enter** is a newline, **Esc** cancels the turn. While Grok is working, Enter **queues** a follow-up.
-3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder. **History** lists Grok’s saved sessions for this folder; click one to resume it (transcript + context).
+3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder. **History** lists Grok’s saved sessions for this folder; click one to resume it (transcript + context). Switching a session writes `~/.grok/pane-last.json`; a phone or another browser follows that focus instead of grok’s newest write.
 4. **Delete a session** — the **×** on a session or history row, then confirm. That wipes it from Grok’s on-disk history. **⌘W** / File → Close Session only closes the tab.
 5. **Thoughts** — off by default. Click **Thoughts** so it reads **Thoughts on**; the current turn’s reasoning appears above the reply. Click again to hide it.
 6. Replies render as markdown (headings, lists, tables, code).
@@ -238,7 +238,7 @@ make
 ./pane -no-open -no-agent -local -cwd ~/src/my-project
 ```
 
-Then open http://127.0.0.1:7420 yourself. Ctrl-C on `make run` stops pane. Ctrl-C on `make agent` stops the agent. An agent that was already running is left alone.
+Then open http://127.0.0.1:7420 yourself. Ctrl-C on `make run` stops pane and leaves the agent. Ctrl-C on `make agent` stops the agent. An agent pane started is left alone the same way.
 
 ```bash
 make install              # ~/.local/bin/pane
@@ -307,7 +307,7 @@ On a **laptop on the same tailnet**:
 pane/
   main.go          server CLI, HTTP, agent, Tailscale
   proxy.go         browser WS ↔ ACP (cwd per connection)
-  history.go       GET/DELETE /v1/sessions, transcript replay
+  history.go       GET/DELETE /v1/sessions, transcript replay, GET/POST /v1/focus
   web/             UI (browser and desktop)
   desktop/         Grok Pane (Wails)
 ```

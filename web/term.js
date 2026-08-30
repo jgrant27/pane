@@ -629,13 +629,73 @@
     s.connect();
   }
 
-  function kickReconnects() {
+  // #59: publish the tab this client is looking at so other clients follow.
+  function reportFocus(s) {
+    if (!s || !s.id || !s.cwd) return;
+    authFetch(paneHTTP() + '/v1/focus', JSON.stringify({ cwd: s.cwd, sid: s.id, title: s.title || '' }), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    }).catch(function () {});
+  }
+
+  function applyServerFocus(meta, done) {
+    done = done || function () {};
+    if (!meta || !meta.lastCwd) {
+      done();
+      return;
+    }
+    var cwd = normPath(meta.lastCwd);
+    var sid = meta.lastSid || '';
+    var existing = sid && sessions.filter(function (s) {
+      return !s.dead && (s.id === sid || s.resumeID === sid);
+    })[0];
+    if (existing) {
+      if (cwd && (!project || !samePath(project, cwd))) {
+        project = cwd;
+        if (projectBtn) {
+          projectBtn.textContent = projectLabel(cwd);
+          projectBtn.title = cwd + ' — click to copy';
+        }
+        try { localStorage.setItem('pane-project', cwd); } catch (e) {}
+      }
+      activate(existing);
+      done();
+      return;
+    }
+    if (sid) {
+      if (cwd) {
+        project = cwd;
+        if (projectBtn) {
+          projectBtn.textContent = projectLabel(cwd);
+          projectBtn.title = cwd + ' — click to copy';
+        }
+        try { localStorage.setItem('pane-project', cwd); } catch (e) {}
+        paintCwd(cwd);
+        loadHistory(cwd);
+      }
+      newSession(cwd || project, { sid: sid, title: meta.lastTitle });
+      done();
+      return;
+    }
+    if (cwd) setProject(cwd);
+    done();
+  }
+
+  function redialAll() {
     sessions.forEach(function (s) {
       if (s.dead) return;
       s.giveUp = false;
       if (s.reconnects > 3) s.reconnects = 3;
-      ensureConnected(s);
+      // #58: iPhone Safari/WKWebView keep readyState OPEN after freeze.
+      // Trusting socketLive here leaves a stale transcript on resume.
+      s.connect();
     });
+  }
+
+  function kickReconnects() {
+    fetchJSON(paneHTTP() + '/meta')
+      .then(function (meta) { applyServerFocus(meta, redialAll); })
+      .catch(function () { redialAll(); });
   }
 
   function activate(s) {
@@ -661,6 +721,7 @@
     paintUsage();
     syncJump();
     ensureConnected(s);
+    reportFocus(s);
     input.focus();
   }
 
@@ -1203,6 +1264,25 @@
     return !!id && t.toLowerCase().indexOf(String(id).toLowerCase()) >= 0;
   }
 
+  Session.prototype.resetPaint = function () {
+    if (!this.el) return;
+    this.el.textContent = '';
+    this.agentEl = null;
+    this.agentBuf = '';
+    this.thoughtEl = null;
+    this.thoughtBuf = '';
+    this.toolsBox = null;
+    this.toolsList = null;
+    this.toolsSum = null;
+    this.toolCount = 0;
+    this.tools = {};
+    this.askEl = null;
+    this.askKey = '';
+    this.asking = false;
+    this.startedReply = false;
+    this.warned = false;
+  };
+
   Session.prototype.connect = function () {
     var s = this;
     // A retry timer armed before shutdown() must not resurrect the tab.
@@ -1220,7 +1300,10 @@
     s.live = false;
     if (s === active) setBusy(true);
     s.setChrome(s.reconnects ? 'reconnecting…' : 'connecting…');
-    var replay = !!(s.resumeID && !s.seenReady);
+    // #58: a phone that already handshook once used to skip replay, so
+    // resume showed the frozen paint. Always catch up when we have a session id.
+    if (s.resumeID && s.seenReady) s.resetPaint();
+    var replay = !!s.resumeID;
     var ws = new WebSocket(paneWS(s.cwd, s.resumeID, replay));
     s.ws = ws;
     ws.onopen = function () { s.setChrome('handshaking…', 'busy'); };
@@ -1266,6 +1349,7 @@
           applyCatalog(s, msg);
           if (s === active) paintCatalog();
           if (s.id && s.cwd) store('pane-last-sid:' + normPath(s.cwd), s.id);
+          reportFocus(s);
           // The server picks its own cwd when the query had none (?sid=,
           // or a boot with no saved project). Without adopting it the
           // composer has a live session and still refuses to send.
