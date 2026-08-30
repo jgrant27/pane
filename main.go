@@ -142,6 +142,9 @@ var (
 		cmd := exec.Command("grok", "agent", "serve", "--bind", bind, "--secret", secret)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+		// #57: own process group so stopping pane does not SIGHUP the agent.
+		// The next pane reuses :2419 instead of minting another grok.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		if err := cmd.Start(); err != nil {
 			return nil, err
 		}
@@ -236,6 +239,7 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 	})
 	mux.HandleFunc("/meta", p.handleMeta)
 	mux.HandleFunc("/v1/sessions", handleSessions)
+	mux.HandleFunc("/v1/focus", handleFocus)
 	mux.HandleFunc("/v1/projects", handleProjects)
 	mux.HandleFunc("/v1/rename", handleRename)
 	mux.HandleFunc("/v1/transcript", handleTranscript)
@@ -315,10 +319,8 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 		log.Printf("cleared tailscale serve")
 	}
 	_ = srv.Close()
-	if agentCmd != nil && agentCmd.Process != nil {
-		_ = agentCmd.Process.Signal(syscall.SIGTERM)
-		_, _ = agentCmd.Process.Wait()
-	}
+	// #57: do not SIGTERM grok agent serve. Restarting pane used to kill
+	// it and the next start minted another agent on :2419.
 	return nil
 }
 

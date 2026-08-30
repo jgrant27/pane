@@ -629,6 +629,68 @@ func TestLastGrokEmpty(t *testing.T) {
 	}
 }
 
+// TestLastGrokPrefersPaneFocusOverNewest is the gate for #59: recency used
+// to win, so a phone booted grok's newest write instead of the session the
+// desk was looking at.
+func TestLastGrokPrefersPaneFocusOverNewest(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	older := t.TempDir()
+	newer := t.TempDir()
+	plant := func(cwd, id, updated string) {
+		t.Helper()
+		dir := filepath.Join(sessionGroupDir(cwd), id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sum := []byte(`{"info":{"id":"` + id + `","cwd":"` + cwd + `"},"generated_title":"` + id + `","updated_at":"` + updated + `","num_messages":2}`)
+		if err := os.WriteFile(filepath.Join(dir, "summary.json"), sum, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plant(older, "01oldfocusxxxxxxxxxxxxxxxxx", "2026-08-01T00:00:00Z")
+	plant(newer, "01newfocusxxxxxxxxxxxxxxxxx", "2026-08-20T00:00:00Z")
+	rememberFocus(older, "01oldfocusxxxxxxxxxxxxxxxxx", "kept")
+	cwd, sid, title := lastGrok()
+	if cwd != older || sid != "01oldfocusxxxxxxxxxxxxxxxxx" || title != "kept" {
+		t.Fatalf("focus should beat recency: %s %s %s", cwd, sid, title)
+	}
+}
+
+// TestHandleFocusRoundTrip is the other #59 gate: POST /v1/focus is what
+// lastGrok and GET /v1/focus then return.
+func TestHandleFocusRoundTrip(t *testing.T) {
+	t.Setenv("GROK_HOME", t.TempDir())
+	cwd := t.TempDir()
+	sid := "01focusroundtripxxxxxxxxxxx"
+	dir := filepath.Join(sessionGroupDir(cwd), sid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"cwd":"` + cwd + `","sid":"` + sid + `","title":"LL"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/focus", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handleFocus(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST focus %d %s", rec.Code, rec.Body.String())
+	}
+	got, sid2, title := lastGrok()
+	if got != cwd || sid2 != sid || title != "LL" {
+		t.Fatalf("after POST: %s %s %s", got, sid2, title)
+	}
+	rec = httptest.NewRecorder()
+	handleFocus(rec, httptest.NewRequest(http.MethodGet, "/v1/focus", nil))
+	if rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	var out paneFocus
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Cwd != cwd || out.Sid != sid || out.Title != "LL" {
+		t.Fatalf("%+v", out)
+	}
+}
+
 func TestListGrokProjectsCaching(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("GROK_HOME", root)

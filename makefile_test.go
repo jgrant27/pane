@@ -11,6 +11,23 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// TestPaneStopDoesNotKillAgent is the gate for #57: pane stop used to
+// SIGTERM grok agent serve (and SIGHUP it as a child), so the next pane
+// minted another agent on :2419.
+func TestPaneStopDoesNotKillAgent(t *testing.T) {
+	b, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	if !strings.Contains(src, "Setpgid: true") {
+		t.Fatal("startGrok must detach the agent so stopping pane does not SIGHUP it")
+	}
+	if strings.Count(src, "agentCmd.Process.Signal") != 1 {
+		t.Fatal("only a spawn that failed to bind may be killed; pane stop must leave grok agent serve")
+	}
+}
+
 func TestMakefileRemoteTarget(t *testing.T) {
 	b, err := os.ReadFile("Makefile")
 	if err != nil {

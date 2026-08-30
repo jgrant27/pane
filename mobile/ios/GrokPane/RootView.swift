@@ -8,11 +8,13 @@ struct RootView: View {
     #endif
     @State private var draft = ""
     @State private var askURL = false
+    @State private var resumeToken = 0
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             if let url = paneURL {
-                PaneWebView(url: url)
+                PaneWebView(url: url, resumeToken: resumeToken)
                     .ignoresSafeArea()
             } else {
                 VStack(spacing: 16) {
@@ -44,6 +46,10 @@ struct RootView: View {
             Text("Tailscale or LAN address of pane. Examples: beelz.tailnet.ts.net or 192.168.1.5:7420")
         }
         .onAppear { seedURL() }
+        .onChange(of: scenePhase) { _, phase in
+            // #58: foreground bump so PaneWebView fires pageshow and term.js catch-up runs.
+            if phase == .active { resumeToken += 1 }
+        }
     }
 
     /// Simulator shares the Mac loopback, so an empty URL still loads pane.

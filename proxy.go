@@ -456,6 +456,9 @@ func (s *session) handshake() error {
 	if s.hub != nil && s.id != "" {
 		s.hub.attach(s.id, s)
 	}
+	if s.id != "" && s.cwd != "" {
+		rememberFocus(s.cwd, s.id, "") // #59
+	}
 	if s.resumeID != "" && s.replay {
 		s.replayHistory()
 	}
