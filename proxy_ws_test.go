@@ -941,6 +941,240 @@ func TestFollowDiskDoesNotEchoOurOwnAsk(t *testing.T) {
 	}
 }
 
+func TestFollowDiskShowsTUIWhileHubThinksItOwnsTheTurn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	oldW, oldE := diskTurnWindow, diskFollowEvery
+	t.Cleanup(func() { diskTurnWindow, diskFollowEvery = oldW, oldE })
+	diskTurnWindow = time.Second
+	diskFollowEvery = 15 * time.Millisecond
+
+	secret, sid := "tui-own", "01tuiownxxxxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	path := plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+	row := []map[string]any{{"session_id": sid, "pid": os.Getpid(), "cwd": cwd}}
+	b, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "active_sessions.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var prompts atomic.Int32
+	p := &proxy{agentBase: startHangingPromptAgent(t, secret, sid, &prompts), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	c, _ := dialReadyFrame(t, u)
+	if err := c.WriteJSON(map[string]any{"type": "in", "text": "from phone"}); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"method":"session/update","params":{"sessionId":"` + sid + `","update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"from-tui"}}}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	got := waitFrame(t, c, "thought")
+	if got == nil || !strings.Contains(fmt.Sprint(got["text"]), "from-tui") {
+		t.Fatalf("live TUI disk must still paint when the hub claimed a turn: %v", got)
+	}
+}
+
+func TestHandshakeDoesNotLoadALiveTUI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	secret, sid := "watch", "01tuiwatchxxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	_ = plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+	row := []map[string]any{{"session_id": sid, "pid": os.Getpid(), "cwd": cwd}}
+	b, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "active_sessions.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var loads atomic.Int32
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			for {
+				_, data, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var env struct {
+					ID     *int64 `json:"id"`
+					Method string `json:"method"`
+				}
+				if json.Unmarshal(data, &env) != nil || env.ID == nil {
+					continue
+				}
+				if env.Method == "session/load" || env.Method == "session/new" {
+					loads.Add(1)
+				}
+				res := map[string]any{}
+				if env.Method == "initialize" {
+					res = map[string]any{"agentCapabilities": map[string]any{"promptCapabilities": map[string]any{"image": true}}}
+				}
+				_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": res})
+			}
+		}()
+	}))
+	t.Cleanup(srvA.Close)
+	p := &proxy{agentBase: "ws" + strings.TrimPrefix(srvA.URL, "http"), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	_, ready := dialReadyFrame(t, u)
+	if loads.Load() != 0 {
+		t.Fatalf("session/load on a live TUI pauses the terminal; got %d loads", loads.Load())
+	}
+	if ready["session"] != sid {
+		t.Fatalf("watch-only must keep the TUI session id, got %v", ready["session"])
+	}
+}
+
+func TestHandshakeWatchesWhenAgentDoesNotKnowTheSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	secret, sid := "unknown", "01unknownsidxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	_ = plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			for {
+				_, data, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var env struct {
+					ID     *int64 `json:"id"`
+					Method string `json:"method"`
+				}
+				if json.Unmarshal(data, &env) != nil || env.ID == nil {
+					continue
+				}
+				if env.Method == "session/load" {
+					_ = c.WriteJSON(map[string]any{
+						"jsonrpc": "2.0",
+						"id":      *env.ID,
+						"error":   map[string]any{"code": -32602, "message": "Invalid params", "data": "unknown session id"},
+					})
+					continue
+				}
+				res := map[string]any{}
+				if env.Method == "initialize" {
+					res = map[string]any{"agentCapabilities": map[string]any{"promptCapabilities": map[string]any{"image": true}}}
+				}
+				_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": res})
+			}
+		}()
+	}))
+	t.Cleanup(srvA.Close)
+	p := &proxy{agentBase: "ws" + strings.TrimPrefix(srvA.URL, "http"), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	c, ready := dialReadyFrame(t, u)
+	if ready["session"] != sid {
+		t.Fatalf("unknown session id must fall back to watch, got %v", ready)
+	}
+	if got := waitFrame(t, c, "err"); got != nil && strings.Contains(fmt.Sprint(got["text"]), "unknown session") {
+		t.Fatalf("must not show unknown session id on the phone: %v", got)
+	}
+}
+
+func TestWatchDoesNotRPCTheAgent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	secret, sid := "norpc", "01tuinorpcxxxxxxxxxxxxxxxxxx"
+	cwd := t.TempDir()
+	_ = plantSessionUpdates(t, cwd, sid, "{}\n", time.Hour)
+	row := []map[string]any{{"session_id": sid, "pid": os.Getpid(), "cwd": cwd}}
+	b, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "active_sessions.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var rpcs atomic.Int32
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("server-key") != secret {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			for {
+				_, data, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var env struct {
+					ID     *int64 `json:"id"`
+					Method string `json:"method"`
+				}
+				if json.Unmarshal(data, &env) != nil {
+					continue
+				}
+				if env.Method != "initialize" && env.Method != "" {
+					if strings.HasPrefix(env.Method, "session/") {
+						rpcs.Add(1)
+					}
+				}
+				if env.ID == nil {
+					continue
+				}
+				res := map[string]any{}
+				if env.Method == "initialize" {
+					res = map[string]any{"agentCapabilities": map[string]any{"promptCapabilities": map[string]any{"image": true}}}
+				}
+				_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": res})
+			}
+		}()
+	}))
+	t.Cleanup(srvA.Close)
+	p := &proxy{agentBase: "ws" + strings.TrimPrefix(srvA.URL, "http"), secret: secret, cwd: cwd}
+	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
+	t.Cleanup(srv.Close)
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + cwd + "&sid=" + sid
+	c, _ := dialReadyFrame(t, u)
+	_ = c.WriteJSON(map[string]any{"type": "in", "text": "from phone"})
+	_ = c.WriteJSON(map[string]any{"type": "model", "id": "m1"})
+	time.Sleep(200 * time.Millisecond)
+	if rpcs.Load() != 0 {
+		t.Fatalf("watch-only must not send session/* to agent serve, got %d", rpcs.Load())
+	}
+}
+
 // waitFrame reads until a frame of the given type arrives.
 func waitFrame(t *testing.T, c *websocket.Conn, want string) map[string]any {
 	t.Helper()

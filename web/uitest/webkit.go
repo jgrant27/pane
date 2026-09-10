@@ -187,6 +187,51 @@ func sendText(t *testing.T, pg playwright.Page, text string) {
 	}
 }
 
+func assertHealthy(t *testing.T, pg playwright.Page) {
+	t.Helper()
+	waitSel(t, pg, "#in", 15*time.Second)
+	v := eval(t, pg, `(() => {
+      var shell = document.getElementById('shell');
+      var inn = document.getElementById('in');
+      var log = document.getElementById('log');
+      var vvh = document.documentElement.style.getPropertyValue('--vvh');
+      return {
+        body: document.body.innerText || '',
+        shellH: shell ? shell.clientHeight : 0,
+        inH: inn ? inn.getBoundingClientRect().height : 0,
+        logH: log ? log.clientHeight : 0,
+        vvh: vvh,
+        status: (document.getElementById('status') && document.getElementById('status').textContent) || ''
+      };
+    })()`)
+	m, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("healthy %T %v", v, v)
+	}
+	body, _ := m["body"].(string)
+	if strings.Contains(body, "unknown session") || strings.Contains(body, "Invalid params") {
+		t.Fatalf("agent error on screen: %q", body)
+	}
+	num := func(k string) float64 {
+		switch n := m[k].(type) {
+		case float64:
+			return n
+		case int:
+			return float64(n)
+		case int64:
+			return float64(n)
+		default:
+			return 0
+		}
+	}
+	if num("shellH") < 200 || num("inH") < 10 || num("logH") < 20 {
+		t.Fatalf("layout collapsed (blank page): %+v", m)
+	}
+	if vvh, _ := m["vvh"].(string); strings.TrimSpace(vvh) == "0px" {
+		t.Fatal("--vvh is 0px; that blanks WKWebView")
+	}
+}
+
 func countSel(t *testing.T, pg playwright.Page, sel string) int {
 	t.Helper()
 	v := eval(t, pg, fmt.Sprintf("document.querySelectorAll(%q).length", sel))

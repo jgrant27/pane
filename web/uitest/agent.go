@@ -17,6 +17,8 @@ type mockACP struct {
 	mu       sync.Mutex
 	prompts  []string
 	sessions int
+	loads    int
+	failLoad bool
 }
 
 func startMockACP(t *testing.T, secret string, m *mockACP) string {
@@ -59,7 +61,21 @@ func (m *mockACP) serve(c *websocket.Conn) {
 			_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": map[string]any{
 				"agentCapabilities": map[string]any{"promptCapabilities": map[string]any{"image": true}},
 			}})
-		case "session/new", "session/load":
+		case "session/load":
+			m.mu.Lock()
+			m.loads++
+			fail := m.failLoad
+			m.mu.Unlock()
+			if fail {
+				_ = c.WriteJSON(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      *env.ID,
+					"error":   map[string]any{"code": -32602, "message": "Invalid params", "data": "unknown session id"},
+				})
+				continue
+			}
+			fallthrough
+		case "session/new":
 			m.mu.Lock()
 			m.sessions++
 			n := m.sessions

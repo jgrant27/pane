@@ -186,6 +186,45 @@ func TestUIPhoneHasNoHorizontalScroll(t *testing.T) {
 	}
 }
 
+func TestUIUnknownSessionIdDoesNotBlankThePage(t *testing.T) {
+	const id = "01uiunknownxxxxxxxxxxxxxxxxxx"
+	s := startStackOpts(t, func(home, cwd string) {
+		plantSession(t, home, cwd, id, "Disk Only")
+	}, true)
+	pg := s.Page
+	waitSel(t, pg, "#in", 15*time.Second)
+	body, err := pg.InnerText("body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body, "unknown session") || strings.Contains(body, "Invalid params") {
+		t.Fatalf("phone must not show agent unknown session id: %q", body)
+	}
+	if _, err := pg.QuerySelector("#in"); err != nil {
+		t.Fatal("composer gone after unknown session id")
+	}
+}
+
+func TestUILiveTUIDoesNotHitSessionLoad(t *testing.T) {
+	const id = "01uiliveloadxxxxxxxxxxxxxxxxx"
+	s := startStackWith(t, func(home, cwd string) {
+		plantSession(t, home, cwd, id, "Live TUI")
+		plantLiveTUI(t, home, cwd, id)
+	})
+	pg := s.Page
+	waitSel(t, pg, "#in", 15*time.Second)
+	s.Mock.mu.Lock()
+	loads := s.Mock.loads
+	s.Mock.mu.Unlock()
+	if loads != 0 {
+		t.Fatalf("live TUI must not session/load onto agent serve, loads=%d", loads)
+	}
+	body, _ := pg.InnerText("body")
+	if strings.Contains(body, "unknown session") {
+		t.Fatalf("live TUI watch showed unknown session id: %q", body)
+	}
+}
+
 func TestUISendEnablesAfterReady(t *testing.T) {
 	s := startStack(t)
 	pg := s.Page

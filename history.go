@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -562,7 +563,76 @@ func focusTitle(cwd, sid, title string) string {
 // pane-last.json wins when that sid is a live grok TUI — otherwise a
 // different TUI that happens to be writing (this pane session) steals
 // the phone. If pane-last is stale, a live TUI wins. Else recency.
+func tailHasUserMessage(cwd, id string) bool {
+	path := filepath.Join(sessionGroupDir(cwd), id, "updates.jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	const tail = 64 << 10
+	off := st.Size() - tail
+	if off < 0 {
+		off = 0
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return false
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(b, []byte(`"sessionUpdate":"user_message_chunk"`))
+}
+
+// liveTUIByUser is the live grok TUI the human just typed in. Agent
+// writes (this pane session) must not steal the phone from that TUI.
+func liveTUIByUser() (cwd, sid, title string) {
+	b, err := os.ReadFile(filepath.Join(grokHome(), "active_sessions.json"))
+	if err != nil {
+		return "", "", ""
+	}
+	var rows []grokActiveSession
+	if json.Unmarshal(b, &rows) != nil {
+		return "", "", ""
+	}
+	var best time.Time
+	for _, r := range rows {
+		if !pidAlive(r.PID) || !validSessionID(r.SessionID) || strings.TrimSpace(r.Cwd) == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(r.Cwd); err == nil {
+			r.Cwd = abs
+		}
+		if !tailHasUserMessage(r.Cwd, r.SessionID) {
+			continue
+		}
+		dir, ok := sessionDir(r.Cwd, r.SessionID)
+		if !ok {
+			continue
+		}
+		st, err := os.Stat(filepath.Join(dir, "updates.jsonl"))
+		if err != nil {
+			continue
+		}
+		if cwd == "" || st.ModTime().After(best) {
+			cwd, sid, best = r.Cwd, r.SessionID, st.ModTime()
+		}
+	}
+	if cwd == "" {
+		return "", "", ""
+	}
+	return cwd, sid, focusTitle(cwd, sid, "")
+}
+
 func lastGrok() (cwd, sid, title string) {
+	if cwd, sid, title = liveTUIByUser(); cwd != "" {
+		return cwd, sid, title
+	}
 	fcwd, fsid, ftitle := readFocus()
 	if fsid != "" && liveSID(fsid) {
 		return fcwd, fsid, focusTitle(fcwd, fsid, ftitle)

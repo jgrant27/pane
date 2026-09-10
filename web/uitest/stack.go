@@ -47,6 +47,17 @@ func plantSession(t *testing.T, home, cwd, id, title string) {
 	}
 }
 
+func plantTranscript(t *testing.T, home, cwd, id, user, agent string) {
+	t.Helper()
+	plantSession(t, home, cwd, id, "Transcript")
+	dir := filepath.Join(home, "sessions", url.PathEscape(cwd), id)
+	userLine := `{"method":"session/update","params":{"sessionId":"` + id + `","update":{"sessionUpdate":"user_message_chunk","content":{"text":"` + user + `"}}}}` + "\n"
+	agentLine := `{"method":"session/update","params":{"sessionId":"` + id + `","update":{"sessionUpdate":"agent_message_chunk","content":{"text":"` + agent + `"}}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "updates.jsonl"), []byte(userLine+agentLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func plantLiveTUI(t *testing.T, home, cwd, id string) {
 	t.Helper()
 	row := []map[string]any{{
@@ -68,6 +79,10 @@ func startStack(t *testing.T) *stack {
 }
 
 func startStackWith(t *testing.T, setup func(home, cwd string)) *stack {
+	return startStackOpts(t, setup, false)
+}
+
+func startStackOpts(t *testing.T, setup func(home, cwd string), failLoad bool) *stack {
 	t.Helper()
 	home := t.TempDir()
 	cwd := filepath.Join(home, "proj")
@@ -78,7 +93,7 @@ func startStackWith(t *testing.T, setup func(home, cwd string)) *stack {
 		setup(home, cwd)
 	}
 	secret := "ui-secret"
-	mock := &mockACP{}
+	mock := &mockACP{failLoad: failLoad}
 	agent := startMockACP(t, secret, mock)
 	listen := freeAddr(t)
 	bin := buildPane(t)

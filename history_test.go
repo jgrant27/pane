@@ -737,6 +737,41 @@ func TestLastGrokKeepsLiveFocusWhenAnotherTUIIsWriting(t *testing.T) {
 	}
 }
 
+func TestLastGrokFollowsTheTUITheUserTypedIn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	legend := t.TempDir()
+	other := t.TempDir()
+	plantSession(t, legend, "01legendfocusxxxxxxxxxxxxxxxx", "2026-09-10T00:00:00Z", "legend")
+	plantSession(t, other, "01othertypedxxxxxxxxxxxxxxxx", "2026-09-10T00:00:00Z", "typed")
+	legUpd := filepath.Join(sessionGroupDir(legend), "01legendfocusxxxxxxxxxxxxxxxx", "updates.jsonl")
+	othUpd := filepath.Join(sessionGroupDir(other), "01othertypedxxxxxxxxxxxxxxxx", "updates.jsonl")
+	if err := os.WriteFile(legUpd, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	user := `{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hi"}}}}` + "\n"
+	if err := os.WriteFile(othUpd, []byte(user), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rememberFocus(legend, "01legendfocusxxxxxxxxxxxxxxxx", "legend")
+	rows := []map[string]any{
+		{"session_id": "01legendfocusxxxxxxxxxxxxxxxx", "pid": os.Getpid(), "cwd": legend},
+		{"session_id": "01othertypedxxxxxxxxxxxxxxxx", "pid": os.Getpid(), "cwd": other},
+	}
+	b, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "active_sessions.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, sid, title := lastGrok()
+	if cwd != other || sid != "01othertypedxxxxxxxxxxxxxxxx" || title != "typed" {
+		t.Fatalf("phone must follow the TUI the user typed in: %s %s %s", cwd, sid, title)
+	}
+}
+
 // TestDeleteSessionDoesNotCallGrokCLI is the other #62 gate: grok sessions
 // delete talks to the leader and pauses sibling live sessions.
 func TestDeleteSessionDoesNotCallGrokCLI(t *testing.T) {

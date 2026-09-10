@@ -225,11 +225,14 @@ type session struct {
 	replay     bool
 	wantModel  string
 	wantEffort string
-	model      string
-	effort     string
-	contextN   int
-	models     []modelInfo
-	imageCap   bool
+	// watch: grok TUI owns this session. Do not session/load it onto
+	// agent serve (unknown session id) and do not send session/* RPCs.
+	watch    bool
+	model    string
+	effort   string
+	contextN int
+	models   []modelInfo
+	imageCap bool
 
 	// Frames for the browser go through a bounded queue drained by one
 	// writer goroutine, so whoever produced the frame — including the single
@@ -420,6 +423,11 @@ func (s *session) handshake() error {
 		s.hub.attach(s.resumeID, s)
 	}
 
+	if s.resumeID != "" && liveSID(s.resumeID) {
+		s.watchOnly()
+		return nil
+	}
+
 	meta := map[string]any{
 		"yoloMode":       false,
 		"permissionMode": "default",
@@ -440,6 +448,10 @@ func (s *session) handshake() error {
 		return err
 	}
 	if err := rpcError(res); err != nil {
+		if s.resumeID != "" && unknownSession(err) {
+			s.watchOnly()
+			return nil
+		}
 		return err
 	}
 	var out struct {
@@ -462,6 +474,26 @@ func (s *session) handshake() error {
 	s.applyModelState(res)
 	s.applyWantedModel()
 	return nil
+}
+
+func (s *session) watchOnly() {
+	s.watch = true
+	if s.resumeID != "" {
+		s.id = s.resumeID
+	}
+	if s.hub != nil && s.id != "" {
+		s.hub.attach(s.id, s)
+	}
+	if s.replay {
+		s.replayHistory()
+	}
+}
+
+func unknownSession(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "unknown session")
 }
 
 func (s *session) applyModelState(res json.RawMessage) {
@@ -612,7 +644,7 @@ func (s *session) followDisk(path string, off int64, stop <-chan struct{}, every
 				}
 				off += int64(len(chunk))
 				lastGrow = time.Now()
-				own := s.hub.turnActive(s.id)
+				own := s.hub.turnActive(s.id) && !liveSID(s.id)
 				if !own && !announced {
 					announced = true
 					s.busy.Store(true)
@@ -734,6 +766,9 @@ func (s *session) loop() {
 }
 
 func (s *session) setModel(id string) {
+	if s.watch {
+		return
+	}
 	raw, err := s.rpc("session/set_model", map[string]any{"sessionId": s.id, "modelId": id})
 	if err != nil {
 		_ = s.toBrowser(map[string]string{"type": "err", "text": err.Error()})
@@ -753,6 +788,9 @@ func (s *session) setModel(id string) {
 }
 
 func (s *session) setEffort(id string) {
+	if s.watch {
+		return
+	}
 	if _, err := s.rpc("session/set_mode", map[string]any{"sessionId": s.id, "modeId": id}); err != nil {
 		return
 	}
@@ -763,6 +801,12 @@ func (s *session) setEffort(id string) {
 }
 
 func (s *session) prompt(text string, files []promptFile) {
+	if s.watch {
+		s.hub.releaseTurn(s.id)
+		s.busy.Store(false)
+		_ = s.toBrowser(map[string]string{"type": "idle"})
+		return
+	}
 	s.prompted.Store(true)
 	// Start clean: a leftover answer or question list from the last turn
 	// must not be applied to this one.
@@ -798,7 +842,7 @@ func (s *session) rpc(method string, params any) (json.RawMessage, error) {
 }
 
 func (s *session) notify(method string, params any) {
-	if s == nil || s.hub == nil {
+	if s == nil || s.hub == nil || s.watch {
 		return
 	}
 	s.hub.notify(method, params)
