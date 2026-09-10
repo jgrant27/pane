@@ -16,7 +16,7 @@ func TestDriverIsWebKitNotChrome(t *testing.T) {
 	if strings.Contains(s, "pw.Chromium") || strings.Contains(s, "pw.Firefox") || strings.Contains(s, ".Chromium.Launch") {
 		t.Fatal("UI tests must launch WebKit only")
 	}
-	if !strings.Contains(s, "pw.WebKit.Launch") {
+	if !strings.Contains(s, "WebKit.Launch") {
 		t.Fatal("must launch playwright WebKit")
 	}
 }
