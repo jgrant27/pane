@@ -18,6 +18,13 @@ struct PaneWebView: UIViewRepresentable {
         view.allowsBackForwardNavigationGestures = false
         view.scrollView.keyboardDismissMode = .interactive
         view.scrollView.contentInsetAdjustmentBehavior = .never
+        // The page scrolls .log-slot itself. If WKWebView's UIScrollView
+        // pans when the keyboard opens, the chat is replaced by blank.
+        view.scrollView.isScrollEnabled = false
+        view.scrollView.bounces = false
+        view.scrollView.alwaysBounceHorizontal = false
+        view.scrollView.showsHorizontalScrollIndicator = false
+        view.scrollView.delegate = context.coordinator
         view.isOpaque = false
         view.backgroundColor = .clear
         view.load(URLRequest(url: url))
@@ -37,7 +44,12 @@ struct PaneWebView: UIViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, UIScrollViewDelegate {
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            if scrollView.contentOffset.x != 0 {
+                scrollView.contentOffset.x = 0
+            }
+        }
         var lastResume = 0
         /// WebKit blocks the page until a JS panel answers and traps if it answers
         /// twice, so every way out of a panel goes through one of these.

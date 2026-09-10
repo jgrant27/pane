@@ -67,9 +67,9 @@ func (m *mockACP) serve(c *websocket.Conn) {
 			_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": *env.ID, "result": map[string]any{
 				"sessionId": "01uitestsessionxxxxxxxxxxxxxxx" + itoa(n),
 				"models": map[string]any{
-					"currentModelId": "grok-4.6",
+					"currentModelId": "m1",
 					"availableModels": []any{
-						map[string]any{"modelId": "grok-4.6", "name": "Grok"},
+						map[string]any{"modelId": "m1", "name": "Grok"},
 					},
 				},
 			}})

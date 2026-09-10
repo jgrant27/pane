@@ -128,6 +128,64 @@ func TestUIFocusAndPageshowKeepOneTranscript(t *testing.T) {
 	}
 }
 
+func TestUIPhoneHasNoHorizontalScroll(t *testing.T) {
+	s := startStack(t)
+	pg := s.Page
+	if err := pg.SetViewportSize(390, 844); err != nil {
+		t.Fatal(err)
+	}
+	got := eval(t, pg, `(() => {
+      var slot = document.querySelector('.log-slot.active') || document.querySelector('.log-slot');
+      if (!slot) return { err: 'no slot' };
+      slot.classList.add('active');
+      var d = document.createElement('div');
+      d.className = 'msg agent';
+      var body = document.createElement('div');
+      body.className = 'body md';
+      var pre = document.createElement('pre');
+      var code = document.createElement('code');
+      code.textContent = Array(80).join('WIDEWORD');
+      pre.appendChild(code);
+      body.appendChild(pre);
+      d.appendChild(body);
+      slot.appendChild(d);
+      return {
+        inner: window.innerWidth,
+        doc: document.documentElement.scrollWidth,
+        body: document.body.scrollWidth,
+        slot: slot.scrollWidth,
+        slotClient: slot.clientWidth
+      };
+    })()`)
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("eval %T %v", got, got)
+	}
+	if _, bad := m["err"]; bad {
+		t.Fatalf("%v", m)
+	}
+	num := func(k string) float64 {
+		switch n := m[k].(type) {
+		case float64:
+			return n
+		case int:
+			return float64(n)
+		case int64:
+			return float64(n)
+		default:
+			t.Fatalf("%s: %T %v", k, m[k], m[k])
+			return 0
+		}
+	}
+	inner := num("inner")
+	if inner < 300 {
+		t.Fatalf("viewport not phone-sized: %v", m)
+	}
+	if num("doc") > inner+1 || num("body") > inner+1 || num("slot") > inner+1 {
+		t.Fatalf("horizontal overflow on a 390px phone: %+v", m)
+	}
+}
+
 func TestUISendEnablesAfterReady(t *testing.T) {
 	s := startStack(t)
 	pg := s.Page

@@ -251,6 +251,24 @@ func TestIOSSimulatorLoadsLoopbackPane(t *testing.T) {
 	}
 }
 
+func TestIOSKeyboardDoesNotBlankTheChat(t *testing.T) {
+	pw := read(t, paneWebView)
+	want(t, pw, "view.scrollView.isScrollEnabled = false",
+		"WKWebView must not pan the page when the keyboard opens")
+	want(t, pw, "view.scrollView.bounces = false",
+		"bounce would still slide the chat off into blank")
+	want(t, pw, "view.scrollView.alwaysBounceHorizontal = false",
+		"WKWebView must not rubber-band sideways")
+	want(t, pw, "scrollView.contentOffset.x = 0",
+		"any horizontal pan of the webview must be pinned back")
+	sw := read(t, rootView)
+	want(t, sw, ".ignoresSafeArea(.container)",
+		"ignore notch/home indicator, but let SwiftUI shrink for the keyboard")
+	if strings.Contains(sw, ".ignoresSafeArea()") {
+		t.Error(".ignoresSafeArea() also ignores the keyboard and blanks the chat")
+	}
+}
+
 // TestIOSForegroundReplaysTheLiveTail is the iOS half of #58: WKWebView
 // keeps the socket OPEN after freeze, so foreground must fire pageshow
 // or term.js never redials.

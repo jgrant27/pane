@@ -15,7 +15,7 @@ struct RootView: View {
         ZStack(alignment: .topTrailing) {
             if let url = paneURL {
                 PaneWebView(url: url, resumeToken: resumeToken)
-                    .ignoresSafeArea()
+                    .ignoresSafeArea(.container)
             } else {
                 VStack(spacing: 16) {
                     Text("Grok Pane")

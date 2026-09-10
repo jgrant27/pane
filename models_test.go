@@ -14,10 +14,10 @@ func TestParseSessionModels(t *testing.T) {
 	raw := []byte(`{
 		"sessionId":"abc",
 		"models":{
-			"currentModelId":"grok-4.6",
+			"currentModelId":"m1",
 			"availableModels":[
 				{
-					"modelId":"grok-4.6",
+					"modelId":"m1",
 					"name":"Grok 4.6",
 					"_meta":{
 						"reasoningEffort":"xhigh",
@@ -30,7 +30,7 @@ func TestParseSessionModels(t *testing.T) {
 		"_meta":{"x.ai/sessionConfig":{"options":[{"category":"mode","id":"xhigh","selected":true}]}}
 	}`)
 	st := parseSessionModels(raw)
-	if st.Current != "grok-4.6" || st.Effort != "xhigh" || st.Context != 500000 || len(st.Models) != 1 {
+	if st.Current != "m1" || st.Effort != "xhigh" || st.Context != 500000 || len(st.Models) != 1 {
 		t.Fatalf("%+v", st)
 	}
 	if st.Models[0].Efforts[0].ID != "xhigh" {
@@ -50,7 +50,7 @@ func TestReadSessionUsage(t *testing.T) {
 		"contextTokensUsed":18912,
 		"contextWindowTokens":500000,
 		"contextWindowUsage":3,
-		"primaryModelId":"grok-4.6",
+		"primaryModelId":"m1",
 		"turnCount":2,
 		"toolCallCount":4,
 		"sessionDurationSeconds":50,
@@ -60,7 +60,7 @@ func TestReadSessionUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := readSessionUsage(cwd, "01use")
-	if u.Used != 18912 || u.Size != 500000 || u.Model != "grok-4.6" || u.Turns != 2 {
+	if u.Used != 18912 || u.Size != 500000 || u.Model != "m1" || u.Turns != 2 {
 		t.Fatalf("%+v", u)
 	}
 	if len(u.Tools) != 2 {

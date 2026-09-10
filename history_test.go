@@ -703,6 +703,40 @@ func TestLastGrokPrefersLiveTUIOverPaneFocus(t *testing.T) {
 	}
 }
 
+func TestLastGrokKeepsLiveFocusWhenAnotherTUIIsWriting(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	legend := t.TempDir()
+	other := t.TempDir()
+	plantSession(t, legend, "01legendfocusxxxxxxxxxxxxxxxx", "2026-09-10T00:00:00Z", "legend")
+	plantSession(t, other, "01otherwritexxxxxxxxxxxxxxxx", "2026-09-10T00:00:00Z", "other")
+	legUpd := filepath.Join(sessionGroupDir(legend), "01legendfocusxxxxxxxxxxxxxxxx", "updates.jsonl")
+	othUpd := filepath.Join(sessionGroupDir(other), "01otherwritexxxxxxxxxxxxxxxx", "updates.jsonl")
+	if err := os.WriteFile(legUpd, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := os.WriteFile(othUpd, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rememberFocus(legend, "01legendfocusxxxxxxxxxxxxxxxx", "legend")
+	rows := []map[string]any{
+		{"session_id": "01legendfocusxxxxxxxxxxxxxxxx", "pid": os.Getpid(), "cwd": legend},
+		{"session_id": "01otherwritexxxxxxxxxxxxxxxx", "pid": os.Getpid(), "cwd": other},
+	}
+	b, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "active_sessions.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, sid, title := lastGrok()
+	if cwd != legend || sid != "01legendfocusxxxxxxxxxxxxxxxx" || title != "legend" {
+		t.Fatalf("live pane-last must not lose to a noisier TUI: %s %s %s", cwd, sid, title)
+	}
+}
+
 // TestDeleteSessionDoesNotCallGrokCLI is the other #62 gate: grok sessions
 // delete talks to the leader and pauses sibling live sessions.
 func TestDeleteSessionDoesNotCallGrokCLI(t *testing.T) {

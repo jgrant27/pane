@@ -679,11 +679,11 @@ func TestSetModelReportsFailure(t *testing.T) {
 	s.browser = browser
 	s.hub.dead.Store(true)
 
-	s.setModel("grok-4.6")
+	s.setModel("m1")
 	if m := bsink.next(t); m["type"] != "err" {
 		t.Fatalf("a failed model change said %v", m)
 	}
-	if s.model == "grok-4.6" {
+	if s.model == "m1" {
 		t.Fatal("the model was never actually set")
 	}
 

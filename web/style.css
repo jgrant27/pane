@@ -56,9 +56,12 @@ html, body {
   margin: 0;
   height: 100%;
   height: 100dvh;
-  height: var(--vvh, 100dvh);
   width: 100%;
   overflow: hidden;
+  overflow-x: hidden;
+  overflow-x: clip;
+  overscroll-behavior-x: none;
+  touch-action: pan-y;
   --wails-drop-target: drop;
   background: var(--bg);
   color: var(--fg);
@@ -80,7 +83,10 @@ body {
   grid-template-rows: minmax(0, 1fr);
   grid-template-areas: "rail workspace";
   height: 100%;
+  height: var(--vvh, 100%);
   width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
   min-height: 0;
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   box-sizing: border-box;
@@ -177,7 +183,8 @@ body.rail-drag #workspace {
   padding: 0.55rem 0.2rem 0.15rem;
 }
 #sessions, #remote, #projects {
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   min-height: 0;
   padding-right: 1rem; /* overlay scrollbar must not cover × */
 }
@@ -382,13 +389,18 @@ header > button[aria-pressed="false"] {
 }
 #log {
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 4rem;
   position: relative;
 }
 .log-slot {
   position: absolute;
   inset: 0;
+  overflow-x: hidden;
+  overflow-x: clip;
   overflow-y: auto;
+  overscroll-behavior-x: none;
+  touch-action: pan-y;
+  max-width: 100%;
   padding: 1rem 1.35rem 1.4rem;
   box-sizing: border-box;
   display: none;
@@ -414,7 +426,13 @@ header > button[aria-pressed="false"] {
 }
 #jump-bottom:hover { border-color: var(--fg); }
 #jump-bottom[hidden] { display: none; }
-.msg { margin: 0 0 0.7rem; max-width: 46rem; }
+.msg {
+  margin: 0 0 0.7rem;
+  max-width: min(46rem, 100%);
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .msg .who {
   display: flex;
   align-items: baseline;
@@ -437,7 +455,7 @@ header > button[aria-pressed="false"] {
 .msg.you {
   margin-left: auto;
   width: fit-content;
-  max-width: min(46rem, 92%);
+  max-width: min(46rem, 100%);
   text-align: right;
 }
 .msg.you .body {
@@ -501,14 +519,14 @@ header > button[aria-pressed="false"] {
   border: 1px solid var(--warn);
   border-radius: 10px;
   padding: 0.5rem 0.65rem;
-  max-width: 36rem;
+  max-width: min(36rem, 100%);
 }
 .msg.ask {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 0.7rem 0.8rem 0.65rem;
   background: var(--rail);
-  max-width: 36rem;
+  max-width: min(36rem, 100%);
 }
 .msg.ask.done { opacity: 0.78; }
 .ask-q { margin: 0.15rem 0 0.45rem; }
@@ -595,9 +613,12 @@ header > button[aria-pressed="false"] {
   font: inherit;
   font-size: 12.5px;
   white-space: pre-wrap;
-  overflow-x: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow-x: hidden;
 }
-.md { font-size: 15px; line-height: 1.35; }
+.md { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; word-break: break-word; max-width: 100%; }
+.md img { max-width: 100%; height: auto; }
 .md p { margin: 0 0 0.4rem; }
 .md p:last-child { margin-bottom: 0; }
 .md h1, .md h2, .md h3, .md h4 {
@@ -622,7 +643,10 @@ header > button[aria-pressed="false"] {
   background: var(--rail);
   border: 1px solid var(--line);
   padding: 0.65rem 0.75rem;
-  overflow-x: auto;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   border-radius: 4px;
   margin: 0.3rem 0 0.5rem;
 }
@@ -631,6 +655,9 @@ header > button[aria-pressed="false"] {
   border-collapse: collapse;
   margin: 0.3rem 0 0.5rem;
   font-size: 14.5px;
+  max-width: 100%;
+  display: block;
+  overflow-x: hidden;
 }
 .md th, .md td {
   border: 1px solid var(--line);
@@ -659,7 +686,8 @@ footer {
   flex-direction: column;
   gap: 0.2rem;
   max-height: 7.5rem;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 #queue[hidden] { display: none; }
 .q-row {
@@ -990,7 +1018,7 @@ html.drop .composer,
     left: 0;
     bottom: 0;
     width: min(20rem, 86vw);
-    max-width: none;
+    max-width: 100%;
     padding-top: max(0.7rem, env(safe-area-inset-top));
     padding-left: max(0.65rem, env(safe-area-inset-left));
     padding-bottom: max(0.8rem, env(safe-area-inset-bottom));

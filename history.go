@@ -525,23 +525,53 @@ func liveTUI() (cwd, sid, title string) {
 	return cwd, sid, title
 }
 
-// lastGrok is the project and session pane should show. A live grok TUI
-// wins: that is what is happening in the terminal. Else #59 pane-last.json
-// (switch on desktop, phone follows). Else grok's most recently written session.
+func liveSID(sid string) bool {
+	sid = strings.TrimSpace(sid)
+	if sid == "" {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(grokHome(), "active_sessions.json"))
+	if err != nil {
+		return false
+	}
+	var rows []grokActiveSession
+	if json.Unmarshal(b, &rows) != nil {
+		return false
+	}
+	for _, r := range rows {
+		if r.SessionID == sid && pidAlive(r.PID) {
+			return true
+		}
+	}
+	return false
+}
+
+func focusTitle(cwd, sid, title string) string {
+	if title != "" {
+		return title
+	}
+	for _, s := range listGrokSessions(cwd, 40) {
+		if s.ID == sid {
+			return s.Title
+		}
+	}
+	return title
+}
+
+// lastGrok is the project and session pane should show.
+// pane-last.json wins when that sid is a live grok TUI — otherwise a
+// different TUI that happens to be writing (this pane session) steals
+// the phone. If pane-last is stale, a live TUI wins. Else recency.
 func lastGrok() (cwd, sid, title string) {
+	fcwd, fsid, ftitle := readFocus()
+	if fsid != "" && liveSID(fsid) {
+		return fcwd, fsid, focusTitle(fcwd, fsid, ftitle)
+	}
 	if cwd, sid, title = liveTUI(); cwd != "" {
 		return cwd, sid, title
 	}
-	if cwd, sid, title = readFocus(); cwd != "" {
-		if title == "" {
-			for _, s := range listGrokSessions(cwd, 40) {
-				if s.ID == sid {
-					title = s.Title
-					break
-				}
-			}
-		}
-		return cwd, sid, title
+	if fcwd != "" {
+		return fcwd, fsid, focusTitle(fcwd, fsid, ftitle)
 	}
 	projs := listGrokProjects()
 	if len(projs) == 0 {

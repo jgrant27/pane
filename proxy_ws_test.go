@@ -69,9 +69,9 @@ func mockACP(c *websocket.Conn) {
 				"result": map[string]any{
 					"sessionId": "01mocksessionxxxxxxxxxxxxxxxx",
 					"models": map[string]any{
-						"currentModelId": "grok-4.6",
+						"currentModelId": "m1",
 						"availableModels": []any{
-							map[string]any{"modelId": "grok-4.6", "name": "Grok", "_meta": map[string]any{"totalContextTokens": 1000}},
+							map[string]any{"modelId": "m1", "name": "Grok", "_meta": map[string]any{"totalContextTokens": 1000}},
 						},
 					},
 				},
@@ -124,7 +124,7 @@ func TestHandleWSPrompt(t *testing.T) {
 	p := &proxy{agentBase: agent, secret: secret, cwd: dir}
 	srv := httptest.NewServer(http.HandlerFunc(p.handleWS))
 	t.Cleanup(srv.Close)
-	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + dir + "&model=grok-4.6&effort=xhigh"
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?cwd=" + dir + "&model=m1&effort=xhigh"
 	c, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +161,7 @@ func TestHandleWSPrompt(t *testing.T) {
 	if !sawBusy || !sawOut || !sawIdle {
 		t.Fatalf("busy=%v out=%v idle=%v", sawBusy, sawOut, sawIdle)
 	}
-	_ = c.WriteJSON(map[string]any{"type": "model", "id": "grok-4.6"})
+	_ = c.WriteJSON(map[string]any{"type": "model", "id": "m1"})
 	_ = c.WriteJSON(map[string]any{"type": "effort", "id": "low"})
 	_ = c.WriteJSON(map[string]any{"type": "cancel"})
 	_ = c.WriteJSON(map[string]any{"type": "in"})
@@ -1163,7 +1163,7 @@ func TestModelRPCDoesNotStallTheReader(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c, _ := dialPaneSession(t, srv.URL, dir)
 
-	if err := c.WriteJSON(map[string]any{"type": "model", "id": "grok-4.6"}); err != nil {
+	if err := c.WriteJSON(map[string]any{"type": "model", "id": "m1"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.WriteJSON(map[string]any{"type": "cancel"}); err != nil {

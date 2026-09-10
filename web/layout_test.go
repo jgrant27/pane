@@ -10,6 +10,82 @@ import (
 	"testing"
 )
 
+func TestKeyboardKeepsChatVisible(t *testing.T) {
+	htmlb, err := FS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlb)
+	if !strings.Contains(html, "interactive-widget=resizes-content") {
+		t.Fatal("viewport must resize with the keyboard, not overlay the chat")
+	}
+	cssb, err := FS.ReadFile("style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssb)
+	if strings.Contains(css, "html, body") && strings.Contains(css[strings.Index(css, "html, body"):strings.Index(css, "html, body")+400], "position: fixed") {
+		t.Fatal("position:fixed on html/body blanks WKWebView when --vvh is 0")
+	}
+	if !strings.Contains(css, "height: var(--vvh, 100%)") {
+		t.Fatal("#shell must use --vvh only as a fallback, not html/body")
+	}
+	if !strings.Contains(css, "min-height: 4rem") {
+		t.Fatal("#log must keep a min-height so the keyboard cannot collapse the transcript to blank")
+	}
+	jsb, err := FS.ReadFile("term.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(jsb)
+	if !strings.Contains(js, "if (h < 80) return") {
+		t.Fatal("must not write --vvh:0px; that blanks the phone app")
+	}
+	if !strings.Contains(js, "removeProperty('--vvh')") {
+		t.Fatal("closing the keyboard must drop --vvh so the layout is 100% again")
+	}
+	if !strings.Contains(js, "focusin") || !strings.Contains(js, "syncViewport") {
+		t.Fatal("focusing the composer must re-sync the visual viewport")
+	}
+	if strings.Contains(css, "overflow-x: auto") {
+		t.Fatal("nothing may opt into horizontal scrolling")
+	}
+	if !strings.Contains(css, "overflow-x: hidden") {
+		t.Fatal("the page must clip sideways overflow, not pan")
+	}
+	if !strings.Contains(css, "max-width: min(46rem, 100%)") {
+		t.Fatal("messages must not be 46rem on a phone; that is wider than the viewport")
+	}
+	if !strings.Contains(js, "window.scrollTo(0, 0)") {
+		t.Fatal("keyboard viewport sync must pin the page; iOS pans it and blanks the chat")
+	}
+	if strings.Contains(css, ".msg { margin: 0 0 0.7rem; max-width: 46rem; }") {
+		t.Fatal("bare 46rem messages are wider than a phone")
+	}
+}
+
+func TestPhoneResumeKeepsThisWebViewSession(t *testing.T) {
+	jsb, err := FS.ReadFile("term.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(jsb)
+	kick := chunk(t, src, "function kickReconnects", "function activate")
+	if strings.Contains(kick, "applyServerFocus") {
+		t.Fatal("app switch must redial this WebView's tabs, not apply /meta lastSid")
+	}
+	if !strings.Contains(kick, "redialAll()") {
+		t.Fatal("app switch must still redial")
+	}
+	boot := chunk(t, src, "function boot()", "(function bindRailResize")
+	if !strings.Contains(boot, "!saved && meta && meta.lastCwd") {
+		t.Fatal("boot must keep pane-project; /meta lastCwd is only the empty-storage fallback")
+	}
+	if strings.Contains(boot, "if (!qCwd && !qSid && meta && meta.lastCwd)") {
+		t.Fatal("boot must not overwrite this WebView's stored project with /meta lastCwd")
+	}
+}
+
 func TestWorkspaceIsSiblingOfRail(t *testing.T) {
 	b, err := FS.ReadFile("index.html")
 	if err != nil {
@@ -288,14 +364,11 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 		t.Fatal("term.js must reopen the last session for the last project")
 	}
 	boot := chunk(t, src, "function boot()", "(function bindRailResize")
-	if !strings.Contains(boot, "if (!qCwd && !qSid && meta && meta.lastCwd)") {
-		t.Fatal("boot must resume grok's last session unless the URL named one")
+	if !strings.Contains(boot, "!saved && meta && meta.lastCwd") {
+		t.Fatal("empty storage may resume grok's last session; a stored project must stick")
 	}
-	if !strings.Contains(boot, "saved = meta.lastCwd") {
-		t.Fatal("boot must take lastCwd even when this WebView already stored a project")
-	}
-	if !strings.Contains(boot, "qSid = meta.lastSid") {
-		t.Fatal("boot must reopen grok's last session id, not mint a blank one")
+	if !strings.Contains(boot, "localStorage.getItem('pane-project')") {
+		t.Fatal("boot must read this WebView's last project")
 	}
 	if !strings.Contains(src, "function cycleSession") || !strings.Contains(src, "function cycleProject") {
 		t.Fatal("term.js must cycle sessions and projects from the keyboard")
@@ -354,19 +427,16 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "s.ws.readyState === 0") {
 		t.Fatal("connect() must not kill a CONNECTING socket or pageshow leaves the tab handshaking")
 	}
-	if !strings.Contains(src, "if (!uiReady)") {
-		t.Fatal("kickReconnects must not apply /meta focus before the first ready")
-	}
-	// #59 shared focus: POST /v1/focus on switch; resume applies /meta lastCwd/lastSid.
+	// #59 shared focus: POST /v1/focus on switch. App switch must NOT apply it.
 	kick := chunk(t, src, "function kickReconnects", "function activate")
 	if !strings.Contains(src, "function applyServerFocus") || !strings.Contains(src, "function reportFocus") {
-		t.Fatal("#59: clients must publish and follow the shared pane focus")
+		t.Fatal("#59: clients must publish the shared pane focus")
 	}
 	if !strings.Contains(src, "'/v1/focus'") {
 		t.Fatal("#59: switching sessions must POST /v1/focus so other clients can follow")
 	}
-	if !strings.Contains(kick, "applyServerFocus") {
-		t.Fatal("#59: resume must apply /meta lastCwd/lastSid, not stay on this WebView's tab")
+	if strings.Contains(kick, "applyServerFocus") {
+		t.Fatal("app switch must not apply /meta lastCwd/lastSid or the phone forgets its tab")
 	}
 	// #58: iPhone resume left the socket OPEN and skipped replay after the first handshake.
 	redial := chunk(t, src, "function redialAll", "function kickReconnects")

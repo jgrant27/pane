@@ -12,7 +12,7 @@
        stays wide because a pane can be reached at any tailnet or LAN
        origin the user points the UI at. -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; img-src 'self' data: blob:; font-src 'self'; style-src 'self'; script-src 'self' 'sha256-bfOhHb3O+cl91lK58sV9xqzHFAMgOmUgZSgnFHF2NW8=' 'sha256-cLXj8kQk6Fr6BhYbPqy/BCeBGWh3swZBh8Zx92+f3k8='; connect-src 'self' http: https: ws: wss:">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <title>Grok Pane</title>
   <meta name="color-scheme" content="light">
   <!-- pane fills this in when it serves the page; only a same-origin
@@ -34,7 +34,7 @@
   </script>
   <link rel="icon" href="favicon.png">
   <link rel="preload" href="fonts/iosevka-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css?v=56">
+  <link rel="stylesheet" href="style.css?v=59">
 </head>
 <body>
   <div id="shell">
@@ -114,6 +114,6 @@
   </div>
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="term.js?v=70"></script>
+  <script src="term.js?v=72"></script>
 </body>
 </html>

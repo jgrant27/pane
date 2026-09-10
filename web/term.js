@@ -692,19 +692,11 @@
     });
   }
 
-  var uiReady = false;
-
   function kickReconnects() {
-    // pageshow fires on first load, before the boot handshake. Fetching
-    // /meta then would mint a second session and kill the CONNECTING
-    // socket, leaving the tab on handshaking…
-    if (!uiReady) {
-      redialAll();
-      return;
-    }
-    fetchJSON(paneHTTP() + '/meta')
-      .then(function (meta) { applyServerFocus(meta, redialAll); })
-      .catch(function () { redialAll(); });
+    // #63: app switch must redial THIS WebView's tabs. Applying /meta
+    // lastCwd/lastSid here is the desk or a live TUI and forgets the
+    // project/session the phone was in.
+    redialAll();
   }
 
   function activate(s) {
@@ -1344,7 +1336,6 @@
           s.reconnects = 0;
           s.handshakeSince = 0;
           s.seenReady = true;
-          uiReady = true;
           s.live = true;
           s.id = msg.session || s.id;
           if (s.id) s.resumeID = s.id;
@@ -3244,11 +3235,10 @@
     function start() {
       fetchJSON(paneHTTP() + '/meta')
         .then(function (meta) {
-          // The phone is a window onto this pane, not its own last-project.
-          // URL/pending sid still wins; otherwise grok's last session does,
-          // including over this WebView's localStorage (a prior sim boot
-          // that landed on HOME or another project would otherwise stick).
-          if (!qCwd && !qSid && meta && meta.lastCwd) {
+          // URL/pending wins. This WebView's pane-project wins next — a
+          // phone that already had a project must not be yanked to /meta
+          // lastCwd (the desk or a live TUI) on every app switch reload.
+          if (!qCwd && !qSid && !saved && meta && meta.lastCwd) {
             saved = meta.lastCwd;
             if (meta.lastSid) qSid = meta.lastSid;
             if (!qTitle && meta.lastTitle) qTitle = meta.lastTitle;
@@ -3418,13 +3408,33 @@
     function syncViewport() {
       var vv = window.visualViewport;
       if (!vv) return;
-      document.documentElement.style.setProperty('--vvh', Math.round(vv.height) + 'px');
+      var h = Math.round(vv.height);
+      // WKWebView reports 0 on first paint; writing --vvh:0px blanks the app.
+      if (h < 80) return;
+      var kb = (window.innerHeight - h) > 80;
+      if (kb) {
+        document.documentElement.style.setProperty('--vvh', h + 'px');
+      } else {
+        document.documentElement.style.removeProperty('--vvh');
+      }
+      if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+      var slot = document.querySelector('.log-slot.active');
+      if (slot && slot.scrollHeight - slot.scrollTop - slot.clientHeight < 80) {
+        slot.scrollTop = slot.scrollHeight;
+      }
     }
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', syncViewport);
       window.visualViewport.addEventListener('scroll', syncViewport);
       syncViewport();
     }
+    document.addEventListener('focusin', function (e) {
+      if (e.target && e.target.id === 'in') {
+        syncViewport();
+        setTimeout(syncViewport, 50);
+        setTimeout(syncViewport, 300);
+      }
+    });
   })();
 
   document.addEventListener('visibilitychange', function () {
