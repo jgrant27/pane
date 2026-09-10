@@ -177,6 +177,61 @@ func processCmd(pid string) string {
 
 // isGrokAgent recognises the only process pane is entitled to stop: the grok
 // agent it would otherwise be starting itself.
+// listenerExe is the on-disk binary of pid. A leftover `grok agent serve`
+// from an older grok download still answers the secret, so probe alone
+// cannot tell it is stale.
+func listenerExe(pid string) string {
+	if pid == "" {
+		return ""
+	}
+	if p, err := os.Readlink("/proc/" + pid + "/exe"); err == nil && p != "" {
+		return p
+	}
+	out, err := exec.Command("lsof", "-a", "-p", pid, "-d", "txt", "-Fn").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "n") {
+			continue
+		}
+		p := line[1:]
+		if p == "" || strings.Contains(p, "/dyld") {
+			continue
+		}
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+func resolvedPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	got, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	return got
+}
+
+// sameGrokBinary reports whether pid is the grok binary we would start now.
+// Unknown (empty pid/path/exe) is treated as a match so we do not kill a
+// listener we cannot name.
+func sameGrokBinary(pid, grokPath string) bool {
+	if pid == "" || grokPath == "" {
+		return true
+	}
+	exe := listenerExe(pid)
+	if exe == "" {
+		return true
+	}
+	return resolvedPath(exe) == resolvedPath(grokPath)
+}
+
 func isGrokAgent(cmd string) bool {
 	fields := strings.Fields(cmd)
 	if len(fields) < 3 {

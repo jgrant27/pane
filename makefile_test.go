@@ -39,6 +39,19 @@ func TestPaneStopDoesNotKillAgent(t *testing.T) {
 	}
 }
 
+// TestPaneReplacesStaleGrokAgent: a leftover grok agent on :2419 still
+// answered the secret after grok updated, so Send hung.
+func TestPaneReplacesStaleGrokAgent(t *testing.T) {
+	mainSrc := readFile(t, "main.go")
+	agentSrc := readFile(t, "agent.go")
+	if !strings.Contains(mainSrc, "sameGrokBinary(pid, grokPath)") {
+		t.Fatal("pane start must replace a leftover grok agent that is not today's grok binary")
+	}
+	if !strings.Contains(agentSrc, "func sameGrokBinary") || !strings.Contains(agentSrc, "func listenerExe") {
+		t.Fatal("stale-agent compare needs the running exe and today's grok path")
+	}
+}
+
 // TestWindowsPaneCompiles is the #61 gate: PR #60 put Setpgid in main.go
 // and the Windows native job was the first compile that saw it.
 func TestWindowsPaneCompiles(t *testing.T) {
@@ -71,6 +84,26 @@ func TestMakefileRemoteTarget(t *testing.T) {
 	src := string(b)
 	if strings.Contains(src, "\nphone:") {
 		t.Fatal("Makefile target is remote, not phone")
+	}
+	if !strings.Contains(src, "\ntest-ui:") {
+		t.Fatal("Makefile must have test-ui")
+	}
+	if !strings.Contains(src, "$(MAKE) test-ui") {
+		t.Fatal("make test must run the WebKit UI suite")
+	}
+	if !strings.Contains(src, "PW_WEBKIT := install --with-deps webkit") {
+		t.Fatal("Linux test-ui must install Playwright WebKit with system libs")
+	}
+	if !strings.Contains(src, "PW_WEBKIT := install webkit") {
+		t.Fatal("test-ui must install playwright WebKit")
+	}
+	ci, err := os.ReadFile(".github/workflows/build.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	yml := string(ci)
+	if !strings.Contains(yml, "ubuntu-24.04") || !strings.Contains(yml, "run: make test") {
+		t.Fatal("Ubuntu CI must run make test, which includes the WebKit UI suite")
 	}
 	i := strings.Index(src, "\nremote:")
 	if i < 0 {

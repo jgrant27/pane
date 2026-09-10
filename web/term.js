@@ -692,7 +692,16 @@
     });
   }
 
+  var uiReady = false;
+
   function kickReconnects() {
+    // pageshow fires on first load, before the boot handshake. Fetching
+    // /meta then would mint a second session and kill the CONNECTING
+    // socket, leaving the tab on handshaking…
+    if (!uiReady) {
+      redialAll();
+      return;
+    }
     fetchJSON(paneHTTP() + '/meta')
       .then(function (meta) { applyServerFocus(meta, redialAll); })
       .catch(function () { redialAll(); });
@@ -1287,6 +1296,9 @@
     var s = this;
     // A retry timer armed before shutdown() must not resurrect the tab.
     if (s.dead) return;
+    // CONNECTING is a live dial. pageshow/focus always call connect()
+    // (#58); killing that socket left the tab on handshaking… forever.
+    if (s.ws && s.ws.readyState === 0) return;
     if (s.retry) {
       clearTimeout(s.retry);
       s.retry = 0;
@@ -1332,6 +1344,7 @@
           s.reconnects = 0;
           s.handshakeSince = 0;
           s.seenReady = true;
+          uiReady = true;
           s.live = true;
           s.id = msg.session || s.id;
           if (s.id) s.resumeID = s.id;
@@ -1584,7 +1597,7 @@
         paintSessions();
         if (opts.resume) {
           resumeLatest(cwd, diskSessions, diskSessions.length < sessionListCap);
-          if (!liveSessionFor(cwd)) newSession(cwd);
+          if (!liveSessionFor(cwd) && !blankSession(cwd)) newSession(cwd);
         }
         loadProjects();
       })
@@ -3417,6 +3430,7 @@
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden) kickReconnects();
   });
+  window.addEventListener('focus', kickReconnects);
   window.addEventListener('online', kickReconnects);
   window.addEventListener('pageshow', kickReconnects);
 })();

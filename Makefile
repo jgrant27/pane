@@ -23,7 +23,7 @@ ifeq ($(UNAME),Linux)
   endif
 endif
 
-.PHONY: all build install run agent agent-restart app open remote desktop desktop-app icon test clean deploy desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt ios android
+.PHONY: all build install run agent agent-restart app open remote desktop desktop-app icon test test-ui clean deploy desktop-linux desktop-linux-amd64 desktop-linux-arm64 qemu-binfmt ios android
 
 # make run            pane on :7420 — no agent spawn, no browser tab
 # make agent          grok agent serve on :2419 (same secret as pane)
@@ -31,6 +31,7 @@ endif
 # make app            desktop window
 # make open           browser tab → http://127.0.0.1:7420
 # make remote         install/start Tailscale, serve pane, open the remote URL
+# make test-ui        WebKit integration: real pane + real page (never Chrome)
 # make deploy         bump patch, commit, tag, push (BUMP=minor|major)
 # make ios            boot Simulator, install Grok Pane, load http://127.0.0.1:7420
 # make android        print how to build the Android app
@@ -144,6 +145,20 @@ endif
 	go test -count=1 -race -covermode=atomic -coverprofile=$(COVER_OUT) $(COVER_PKG)
 	@go tool cover -func=$(COVER_OUT)
 	@go run ./cmd/covercheck -min=$(COVER_MIN) $(COVER_OUT)
+	$(MAKE) test-ui
+
+# WebKit only. Linux `install --with-deps webkit` pulls system libs for
+# Playwright's WebKit — never a bare `install` (that also fetches Chromium).
+PW_GO := github.com/playwright-community/playwright-go/cmd/playwright@v0.5001.0
+ifeq ($(UNAME),Linux)
+PW_WEBKIT := install --with-deps webkit
+else
+PW_WEBKIT := install webkit
+endif
+
+test-ui:
+	cd web/uitest && go run $(PW_GO) $(PW_WEBKIT)
+	cd web/uitest && go test -count=1 -race -timeout 3m .
 
 # The files cmd/bump stamps. Listed once so the gate's rollback and the
 # release commit cannot drift apart.

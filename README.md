@@ -165,6 +165,8 @@ Windows WebView apps cannot be built that way (no licensed Windows image in the 
 
 Pushes and PRs to `main` run `.github/workflows/build.yml`. Each job uploads a `grok-pane-<os>-<arch>` artifact (`pane` + `grok-pane`; macOS also packs `Grok-Pane.app.zip`).
 
+`make test` ends with `make test-ui` on every OS: a real `pane` binary plus the real page, driven in **WebKit** (never Chrome). CI runs that on **ubuntu-24.04** and **macos-14**. Linux installs Playwright WebKit (`install --with-deps webkit`). The UI tests type in the composer, follow a live grok TUI session, delete one session without wiping the others, and fire `focus`/`pageshow` without doubling the transcript.
+
 | Artifact | Runner |
 | --- | --- |
 | `darwin-arm64` | macos-14 |
@@ -192,7 +194,7 @@ The app looks for `pane` on `http://127.0.0.1:7420`. If nothing is listening, it
 
 1. **Open a project** — File → Open Project (⌘O / Ctrl+O), or the **Open project** button. After a folder is chosen, the left rail shows its name. Click the name (or the path in the header) to copy it. **File → Show Project** (⇧⌘O) opens the folder in Finder / Explorer / your file manager. **Change project…** switches trees.
 2. **Talk** — type in the box at the bottom. **Enter** sends, **Shift+Enter** is a newline, **Esc** cancels the turn. While Grok is working, Enter **queues** a follow-up.
-3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder. **History** lists Grok’s saved sessions for this folder; click one to resume it (transcript + context). Switching a session writes `~/.grok/pane-last.json`; a phone or another browser follows that focus instead of grok’s newest write.
+3. **New session** — File → New Session (⌘N / Ctrl+N), or the button. Each session is its own chat against the current (or another) folder. **History** lists Grok’s saved sessions for this folder; click one to resume it (transcript + context). A live grok TUI (`~/.grok/active_sessions.json`) is what the app follows. If no TUI is running, switching a session writes `~/.grok/pane-last.json` so a phone or another browser can follow. Deleting a session wipes its directory; it does not call `grok sessions delete`, which paused every other live session.
 4. **Delete a session** — the **×** on a session or history row, then confirm. That wipes it from Grok’s on-disk history. **⌘W** / File → Close Session only closes the tab.
 5. **Thoughts** — off by default. Click **Thoughts** so it reads **Thoughts on**; the current turn’s reasoning appears above the reply. Click again to hide it.
 6. Replies render as markdown (headings, lists, tables, code).

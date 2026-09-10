@@ -656,6 +656,84 @@ func TestLastGrokPrefersPaneFocusOverNewest(t *testing.T) {
 	}
 }
 
+func plantSession(t *testing.T, cwd, id, updated, title string) {
+	t.Helper()
+	dir := filepath.Join(sessionGroupDir(cwd), id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if title == "" {
+		title = id
+	}
+	sum := []byte(`{"info":{"id":"` + id + `","cwd":"` + cwd + `"},"generated_title":"` + title + `","updated_at":"` + updated + `","num_messages":2}`)
+	if err := os.WriteFile(filepath.Join(dir, "summary.json"), sum, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLastGrokPrefersLiveTUIOverPaneFocus is the #62 gate: pane-last.json
+// named a deleted tab while the grok TUI was writing a different session.
+func TestLastGrokPrefersLiveTUIOverPaneFocus(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	stale := t.TempDir()
+	live := t.TempDir()
+	plantSession(t, stale, "01staleuixxxxxxxxxxxxxxxxxx", "2026-09-10T00:00:00Z", "stale")
+	plantSession(t, live, "01livetuixxxxxxxxxxxxxxxxxxx", "2026-09-01T00:00:00Z", "terminal")
+	upd := filepath.Join(sessionGroupDir(live), "01livetuixxxxxxxxxxxxxxxxxxx", "updates.jsonl")
+	if err := os.WriteFile(upd, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rememberFocus(stale, "01staleuixxxxxxxxxxxxxxxxxx", "stale")
+	row := []map[string]any{{
+		"session_id": "01livetuixxxxxxxxxxxxxxxxxxx",
+		"pid":        os.Getpid(),
+		"cwd":        live,
+	}}
+	b, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "active_sessions.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, sid, title := lastGrok()
+	if cwd != live || sid != "01livetuixxxxxxxxxxxxxxxxxxx" || title != "terminal" {
+		t.Fatalf("live TUI should beat pane-last: %s %s %s", cwd, sid, title)
+	}
+}
+
+// TestDeleteSessionDoesNotCallGrokCLI is the other #62 gate: grok sessions
+// delete talks to the leader and pauses sibling live sessions.
+func TestDeleteSessionDoesNotCallGrokCLI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	binDir := t.TempDir()
+	marker := filepath.Join(binDir, "called")
+	stub := filepath.Join(binDir, "grok")
+	script := "#!/bin/sh\necho called >" + marker + "\nexit 0\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_BIN", stub)
+	cwd := t.TempDir()
+	id := "01delclixxxxxxxxxxxxxxxxxxx"
+	plantSession(t, cwd, id, "2026-09-10T00:00:00Z", "gone")
+	rememberFocus(cwd, id, "gone")
+	if err := deleteGrokSession(cwd, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("grok sessions delete must not run; the leader pauses sibling sessions")
+	}
+	if _, err := os.Stat(filepath.Join(sessionGroupDir(cwd), id)); !os.IsNotExist(err) {
+		t.Fatal("session dir should be gone")
+	}
+	if c, s, _ := readFocus(); c != "" || s != "" {
+		t.Fatalf("deleted session must leave pane-last: %s %s", c, s)
+	}
+}
+
 // TestHandleFocusRoundTrip is the other #59 gate: POST /v1/focus is what
 // lastGrok and GET /v1/focus then return.
 func TestHandleFocusRoundTrip(t *testing.T) {

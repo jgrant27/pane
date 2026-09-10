@@ -178,6 +178,16 @@ func servePane(cfg paneCfg, stop <-chan struct{}) error {
 	var agentCmd *exec.Cmd
 	if !cfg.noAgent {
 		if tcpBusy(cfg.agentBind) {
+			grokPath, _ := lookPath("grok")
+			pid, cmd := listenerInfo(cfg.agentBind)
+			if isGrokAgent(cmd) && grokPath != "" && !sameGrokBinary(pid, grokPath) {
+				log.Printf("replacing stale grok agent pid=%s exe=%s want=%s", pid, listenerExe(pid), grokPath)
+				if err := killListener(cfg.agentBind); err != nil {
+					return fmt.Errorf("replace stale grok agent: %w", err)
+				}
+			}
+		}
+		if tcpBusy(cfg.agentBind) {
 			if err := probeAgent(agentBase, sec); err != nil {
 				log.Printf("%v", err)
 			} else {

@@ -339,14 +339,23 @@ func TestNewSessionStartsDisabled(t *testing.T) {
 	if !strings.Contains(src, "function ensureConnected") {
 		t.Fatal("switching projects must dial if that project's socket is down")
 	}
-	if !strings.Contains(src, "if (!liveSessionFor(cwd)) newSession(cwd)") {
-		t.Fatal("opening a project with no live tab must create a connection")
+	if !strings.Contains(src, "if (!liveSessionFor(cwd) && !blankSession(cwd)) newSession(cwd)") {
+		t.Fatal("opening a project with no live tab must create a connection, without minting a second over a connecting one")
 	}
 	if !strings.Contains(src, "if (project && !samePath(cwd, project)) return") {
 		t.Fatal("a late history fetch must not clobber the project you just switched to")
 	}
 	if !strings.Contains(src, "function kickReconnects") || !strings.Contains(src, "visibilitychange") {
 		t.Fatal("the page must redial when it becomes visible after pane/agent restart")
+	}
+	if !strings.Contains(src, "window.addEventListener('focus', kickReconnects)") {
+		t.Fatal("the desktop app must redial on window focus so it follows the grok TUI")
+	}
+	if !strings.Contains(src, "s.ws.readyState === 0") {
+		t.Fatal("connect() must not kill a CONNECTING socket or pageshow leaves the tab handshaking")
+	}
+	if !strings.Contains(src, "if (!uiReady)") {
+		t.Fatal("kickReconnects must not apply /meta focus before the first ready")
 	}
 	// #59 shared focus: POST /v1/focus on switch; resume applies /meta lastCwd/lastSid.
 	kick := chunk(t, src, "function kickReconnects", "function activate")

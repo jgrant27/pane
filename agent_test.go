@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -215,6 +216,30 @@ func startListener(t *testing.T, bin, addr string, args ...string) *exec.Cmd {
 		t.Fatal(err)
 	}
 	return proc
+}
+
+func TestSameGrokBinaryUnknownIsMatch(t *testing.T) {
+	if !sameGrokBinary("", "/bin/sh") || !sameGrokBinary("1", "") {
+		t.Fatal("unknown pid or path must not look stale")
+	}
+}
+
+func TestSameGrokBinarySelfMatchesSelf(t *testing.T) {
+	pid := strconv.Itoa(os.Getpid())
+	exe := listenerExe(pid)
+	if exe == "" {
+		t.Skip("cannot resolve this process exe")
+	}
+	if !sameGrokBinary(pid, exe) {
+		t.Fatalf("pid %s exe %s should match itself", pid, exe)
+	}
+	other := "/bin/sh"
+	if resolvedPath(exe) == resolvedPath(other) {
+		t.Skip("test binary is /bin/sh")
+	}
+	if sameGrokBinary(pid, other) {
+		t.Fatalf("pid %s exe %s must not match %s", pid, exe, other)
+	}
 }
 
 func TestIsGrokAgent(t *testing.T) {

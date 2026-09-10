@@ -262,6 +262,9 @@ func TestReleaseGateIsOneGate(t *testing.T) {
 	if !strings.Contains(string(ci), "run: make test") {
 		t.Error("CI does not run make test, so it is not running the developer's gate")
 	}
+	if !strings.Contains(string(ci), "ubuntu-24.04") {
+		t.Error("CI must run make test on Ubuntu, including the WebKit UI suite")
+	}
 	if strings.Contains(string(ci), "grep -v '/desktop$'") {
 		t.Error("CI still drops the desktop package's tests on the floor")
 	}

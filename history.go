@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -185,12 +186,9 @@ func deleteGrokSession(cwd, id string) error {
 	if !ok {
 		return os.ErrInvalid
 	}
-	// Official path talks to the grok leader + FTS index. Filesystem
-	// remove is the fallback when grok is missing or the session is
-	// only a leftover directory.
-	if err := grokSessionsDelete(cwd, id); err != nil {
-		log.Printf("grok sessions delete %s: %v", id, err)
-	}
+	// #62: do not exec `grok sessions delete`. That talks to grok's leader
+	// and pauses every other live session on this machine (TUI and pane
+	// tabs share the store). Wipe the directory and the FTS row instead.
 	if st, err := os.Stat(dir); err == nil {
 		if !st.IsDir() {
 			return os.ErrInvalid
@@ -202,6 +200,7 @@ func deleteGrokSession(cwd, id string) error {
 		return err
 	}
 	purgeSessionSearch(id)
+	forgetFocus(id)
 	invalidateProjects()
 	if _, err := os.Stat(dir); err == nil {
 		return fmt.Errorf("session %s still on disk", id)
@@ -383,6 +382,24 @@ func paneLastPath() string {
 	return filepath.Join(grokHome(), "pane-last.json")
 }
 
+func forgetFocus(sid string) {
+	sid = strings.TrimSpace(sid)
+	if sid == "" {
+		return
+	}
+	focusMu.Lock()
+	defer focusMu.Unlock()
+	b, err := os.ReadFile(paneLastPath())
+	if err != nil {
+		return
+	}
+	var f paneFocus
+	if json.Unmarshal(b, &f) != nil || f.Sid != sid {
+		return
+	}
+	_ = os.Remove(paneLastPath())
+}
+
 func rememberFocus(cwd, sid, title string) {
 	cwd = strings.TrimSpace(cwd)
 	sid = strings.TrimSpace(sid)
@@ -444,10 +461,77 @@ func handleFocus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// lastGrok is the project and session pane is looking at. #59: pane-last.json
-// is the shared focus (switch on desktop, phone follows). If that file is
-// missing or stale, fall back to grok's most recently written session.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
+}
+
+type grokActiveSession struct {
+	SessionID string `json:"session_id"`
+	PID       int    `json:"pid"`
+	Cwd       string `json:"cwd"`
+}
+
+// liveTUI is the grok terminal session that is actually running. #62:
+// pane-last.json is what a pane window last looked at, which can be a
+// deleted tab. The Grok App has to follow the TUI, not that stale file.
+func liveTUI() (cwd, sid, title string) {
+	b, err := os.ReadFile(filepath.Join(grokHome(), "active_sessions.json"))
+	if err != nil {
+		return "", "", ""
+	}
+	var rows []grokActiveSession
+	if json.Unmarshal(b, &rows) != nil {
+		return "", "", ""
+	}
+	var best time.Time
+	for _, r := range rows {
+		if !pidAlive(r.PID) || !validSessionID(r.SessionID) || strings.TrimSpace(r.Cwd) == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(r.Cwd); err == nil {
+			r.Cwd = abs
+		}
+		dir, ok := sessionDir(r.Cwd, r.SessionID)
+		if !ok {
+			continue
+		}
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+		mt := time.Time{}
+		if st, err := os.Stat(filepath.Join(dir, "updates.jsonl")); err == nil {
+			mt = st.ModTime()
+		}
+		if cwd == "" || mt.After(best) {
+			cwd, sid, best = r.Cwd, r.SessionID, mt
+		}
+	}
+	if cwd == "" {
+		return "", "", ""
+	}
+	for _, s := range listGrokSessions(cwd, 40) {
+		if s.ID == sid {
+			title = s.Title
+			break
+		}
+	}
+	return cwd, sid, title
+}
+
+// lastGrok is the project and session pane should show. A live grok TUI
+// wins: that is what is happening in the terminal. Else #59 pane-last.json
+// (switch on desktop, phone follows). Else grok's most recently written session.
 func lastGrok() (cwd, sid, title string) {
+	if cwd, sid, title = liveTUI(); cwd != "" {
+		return cwd, sid, title
+	}
 	if cwd, sid, title = readFocus(); cwd != "" {
 		if title == "" {
 			for _, s := range listGrokSessions(cwd, 40) {
