@@ -47,8 +47,8 @@ func TestPaneReplacesStaleGrokAgent(t *testing.T) {
 	if !strings.Contains(mainSrc, "sameGrokBinary(pid, grokPath)") {
 		t.Fatal("pane start must replace a leftover grok agent that is not today's grok binary")
 	}
-	if !strings.Contains(mainSrc, "dead := probeAgent(agentBase, sec) != nil") {
-		t.Fatal("a listener that fails the websocket probe must be replaced, not reused")
+	if !strings.Contains(mainSrc, "grok && (stale || dead)") {
+		t.Fatal("a grok agent that fails the websocket probe must be replaced, not reused")
 	}
 	if !strings.Contains(agentSrc, "func sameGrokBinary") || !strings.Contains(agentSrc, "func listenerExe") {
 		t.Fatal("stale-agent compare needs the running exe and today's grok path")
