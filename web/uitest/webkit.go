@@ -10,11 +10,51 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mxschmitt/playwright-go"
 )
+
+var (
+	wkOnce sync.Once
+	wkPW   *playwright.Playwright
+	wkBr   playwright.Browser
+	wkErr  error
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if wkBr != nil {
+		_ = wkBr.Close()
+	}
+	if wkPW != nil {
+		_ = wkPW.Stop()
+	}
+	os.Exit(code)
+}
+
+func webKitBrowser(t *testing.T) playwright.Browser {
+	t.Helper()
+	wkOnce.Do(func() {
+		wkPW, wkErr = playwright.Run()
+		if wkErr != nil {
+			return
+		}
+		wkBr, wkErr = wkPW.WebKit.Launch(playwright.BrowserTypeLaunchOptions{
+			Headless: playwright.Bool(true),
+			Timeout:  playwright.Float(60000),
+		})
+	})
+	if wkErr != nil {
+		t.Fatalf("launch webkit: %v (install WebKit with: make test-ui)", wkErr)
+	}
+	if wkBr.BrowserType().Name() != "webkit" {
+		t.Fatalf("browser is %q; UI tests must use WebKit", wkBr.BrowserType().Name())
+	}
+	return wkBr
+}
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
@@ -42,44 +82,31 @@ func buildPane(t *testing.T) string {
 
 func mustWebKit(t *testing.T, token string) (playwright.Page, func()) {
 	t.Helper()
-	pw, err := playwright.Run()
-	if err != nil {
-		t.Fatalf("playwright: %v (install WebKit with: make test-ui)", err)
+	br := webKitBrowser(t)
+	var last error
+	for i := 0; i < 3; i++ {
+		ctx, err := br.NewContext(playwright.BrowserNewContextOptions{
+			ExtraHttpHeaders: map[string]string{"X-Pane-Token": token},
+		})
+		if err != nil {
+			last = err
+			time.Sleep(time.Second)
+			continue
+		}
+		pg, err := ctx.NewPage()
+		if err != nil {
+			_ = ctx.Close()
+			last = err
+			time.Sleep(time.Second)
+			continue
+		}
+		return pg, func() {
+			_ = pg.Close()
+			_ = ctx.Close()
+		}
 	}
-	br, err := pw.WebKit.Launch(playwright.BrowserTypeLaunchOptions{
-		Headless: playwright.Bool(true),
-	})
-	if err != nil {
-		_ = pw.Stop()
-		t.Fatalf("launch webkit: %v", err)
-	}
-	if br.BrowserType().Name() != "webkit" {
-		_ = br.Close()
-		_ = pw.Stop()
-		t.Fatalf("browser is %q; UI tests must use WebKit", br.BrowserType().Name())
-	}
-	ctx, err := br.NewContext(playwright.BrowserNewContextOptions{
-		ExtraHttpHeaders: map[string]string{"X-Pane-Token": token},
-	})
-	if err != nil {
-		_ = br.Close()
-		_ = pw.Stop()
-		t.Fatal(err)
-	}
-	pg, err := ctx.NewPage()
-	if err != nil {
-		_ = ctx.Close()
-		_ = br.Close()
-		_ = pw.Stop()
-		t.Fatal(err)
-	}
-	stop := func() {
-		_ = pg.Close()
-		_ = ctx.Close()
-		_ = br.Close()
-		_ = pw.Stop()
-	}
-	return pg, stop
+	t.Fatalf("webkit NewPage: %v", last)
+	return nil, func() {}
 }
 
 func waitSel(t *testing.T, pg playwright.Page, sel string, timeout time.Duration) {

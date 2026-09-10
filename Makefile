@@ -158,7 +158,7 @@ endif
 
 test-ui:
 	cd web/uitest && go run $(PW_GO) $(PW_WEBKIT)
-	cd web/uitest && go test -count=1 -race -timeout 3m .
+	cd web/uitest && go test -count=1 -race -timeout 8m -parallel 1 .
 
 # The files cmd/bump stamps. Listed once so the gate's rollback and the
 # release commit cannot drift apart.

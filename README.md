@@ -165,7 +165,7 @@ Windows WebView apps cannot be built that way (no licensed Windows image in the 
 
 Pushes and PRs to `main` run `.github/workflows/build.yml`. Each job uploads a `grok-pane-<os>-<arch>` artifact (`pane` + `grok-pane`; macOS also packs `Grok-Pane.app.zip`).
 
-`make test` ends with `make test-ui` on every OS: a real `pane` binary plus the real page, driven in **WebKit** (never Chrome). CI runs that on **ubuntu-24.04** and **macos-14**. Linux installs Playwright WebKit (`install --with-deps webkit`). The UI tests type in the composer, follow a live grok TUI session, delete one session without wiping the others, and fire `focus`/`pageshow` without doubling the transcript.
+`make test` ends with `make test-ui` on every OS: a real `pane` binary plus the real page, driven in **WebKit** (never Chrome). CI runs that on **ubuntu-24.04** and **macos-15**. Linux installs Playwright WebKit (`install --with-deps webkit`). The UI tests type in the composer, follow a live grok TUI session, delete one session without wiping the others, and fire `focus`/`pageshow` without doubling the transcript.
 
 | Artifact | Runner |
 | --- | --- |
