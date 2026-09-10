@@ -12,8 +12,8 @@ android {
         targetSdk = 35
         // both are stamped by cmd/bump: versionName from VERSION, versionCode from
         // it as major*1000000 + minor*1000 + patch so Play always sees it climb.
-        versionCode = 2016
-        versionName = "0.2.16"
+        versionCode = 2017
+        versionName = "0.2.17"
     }
     buildTypes {
         release {
