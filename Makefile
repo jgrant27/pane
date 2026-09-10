@@ -149,7 +149,7 @@ endif
 
 # WebKit only. Linux `install --with-deps webkit` pulls system libs for
 # Playwright's WebKit — never a bare `install` (that also fetches Chromium).
-PW_GO := github.com/playwright-community/playwright-go/cmd/playwright@v0.5001.0
+PW_GO := github.com/mxschmitt/playwright-go/cmd/playwright@v0.6201.1
 ifeq ($(UNAME),Linux)
 PW_WEBKIT := install --with-deps webkit
 else

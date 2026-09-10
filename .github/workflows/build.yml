@@ -36,7 +36,7 @@ jobs:
           path: |
             ~/.cache/ms-playwright
             ~/Library/Caches/ms-playwright
-          key: ${{ runner.os }}-playwright-webkit-0.5001.0
+          key: ${{ runner.os }}-playwright-webkit-0.6201.1
       # Same command as a developer: make test, including test-ui, on
       # Ubuntu and macOS. WebKit only — never Chrome.
       - name: Test
