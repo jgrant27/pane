@@ -265,6 +265,12 @@ func TestReleaseGateIsOneGate(t *testing.T) {
 	if !strings.Contains(string(ci), "ubuntu-24.04") {
 		t.Error("CI must run make test on Ubuntu, including the WebKit UI suite")
 	}
+	if strings.Contains(string(ci), "macos-14") {
+		t.Error("CI still asks for the macOS 14 image GitHub retires on 2026-11-02")
+	}
+	if !strings.Contains(string(ci), "macos-15") {
+		t.Error("the Mac jobs must run on macos-15, the image the tests already use")
+	}
 	if strings.Contains(string(ci), "grep -v '/desktop$'") {
 		t.Error("CI still drops the desktop package's tests on the floor")
 	}

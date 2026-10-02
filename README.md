@@ -169,7 +169,7 @@ Pushes and PRs to `main` run `.github/workflows/build.yml`. Each job uploads a `
 
 | Artifact | Runner |
 | --- | --- |
-| `darwin-arm64` | macos-14 |
+| `darwin-arm64` | macos-15 |
 | `linux-amd64` / `linux-arm64` | ubuntu-24.04 / ubuntu-24.04-arm |
 | `windows-amd64` / `windows-arm64` | windows-latest / windows-11-arm |
 | QEMU Linux amd64 + arm64 | ubuntu-24.04 + `docker/setup-qemu-action` |
